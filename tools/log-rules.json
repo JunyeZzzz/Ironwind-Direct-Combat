@@ -52,9 +52,9 @@
   ],
   "dynamicPrefixes": [
     { "id": "auto_attack", "pattern": "^attack_" },
-    { "id": "auto_guard", "pattern": "^(block_|guard_|perfect_block)" },
+    { "id": "auto_guard", "pattern": "^(block_|guard_|perfect_block|incoming_attack_)" },
     { "id": "auto_control", "pattern": "^(dc_|wasd_|manual_ai_|combat_|stale_movement|snap_)" },
-    { "id": "auto_interface", "pattern": "^(aim_|bars_|glint_|direction_|hit_marker_hud_)" },
+    { "id": "auto_interface", "pattern": "^(aim_|bars_|direction_|hit_marker_hud_)" },
     { "id": "auto_weapon", "pattern": "^weapon_" },
     { "id": "auto_lifecycle", "pattern": "^(settings_|human_|anchor_)" }
   ],

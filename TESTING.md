@@ -53,7 +53,7 @@
 
 启动 Kenshi 后检查 `RE_Kenshi_log.txt`：
 
-- 出现兼容启动标记 `Ironwind Combat vNN`；这是 v120 DLL 内的诊断字符串，不是当前发布名称。
+- 出现兼容启动标记 `Ironwind Combat vNN`；这是 DLL 内的诊断字符串，不是当前发布名称。
 - 没有 `ANOTHER COPY of Direct Control`。
 - 所有预期钩子为 `hook OK`。
 - 新增的 `WASDCombatPlugin: _getHit hook OK` 必须出现；失败时不得验证受击时序。
@@ -107,7 +107,7 @@
 | 任一格挡模式按住右键再按 WASD | 整个已接受格挡请求期间角色位置不变；原版格挡／失败受击动作继续推进；松开右键后移动立即恢复 | 按住期间有节流后的 `guard_wasd_blocked`，不得有 `combat_move block=1`；松开后下一次 WASD 正常注入 |
 | BLOCK 被破／防御反应结束后仍按住右键 | 原版 REACTION_BLOCK/STUMBLE 完整；结束后回到普通持械防御待机，不停在格挡尾帧或怪姿势 | 反应期间输入仍按原版锁定；随后 `ai_guard_ready_pose neutral_combat_idle`，不得固定毫秒强退 |
 | 自动格挡按住右键并 WASD（无真实 BLOCK） | 仍保持原地防御待机，不因 WASD 清掉下次自动格挡资格 | 有 `guard_wasd_blocked`；下一次来袭仍至多一次 `ai_block_attempt` |
-| 自动格挡且关闭武器闪光 | 画面不显示 glint，但按住右键后的自动防御仍工作 | `attackingYou_hook` 仍建立独立来袭事件，HUD 无 glint；可见 `ai_block_attempt` 或原版失败受击，不得因关闭视觉而失去防御请求 |
+| 自动格挡且敌人攻击 | 敌人手部／武器上不出现铁风自制发光；按住右键后的自动防御仍工作 | `attackingYou_hook` 仍建立独立来袭事件，可见 `incoming_attack_impact`、`ai_block_attempt` 或原版失败受击；不得出现 `dc_glow_tex`、`dc_glint`、`glint_created`、`glint_impact`。原版 `HIT_SWORD` 碰撞火花不属于本条删除范围 |
 | 自动模式长按右键 | 无论时长都只维持自动防御请求，不打开菜单或对话 | `interact_rmb_block mode=automatic_ai ... social_armed=0`；不得有旧 `interact_rmb_hold_trigger` |
 
 ### C. 攻击与目标
@@ -256,7 +256,7 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 空处或红名 | 白准星 |
 | 有玩家对话包 | 自动候选的准星可换成对话气泡；按 E 打开其原版菜单后选择对话 |
 | Esc／点击外部 | 关闭菜单 |
-| 设置页 | 只显示 11 个铁风按键和 13 个常用设置；保留准星目标夹角、越肩高度、第一人称眼位高低／前后。不得重复原版移动档位，也不得显示攻击／格挡毫秒、实验颜色或动作眼位等 INI-only 参数；中文无乱码、无截断，“恢复本页默认设置”不覆盖高级 INI 值 |
+| 设置页 | 只显示 11 个铁风按键和 11 个常用设置；保留准星目标夹角、越肩高度、第一人称眼位高低／前后。不得重复原版移动档位，也不得显示攻击／格挡毫秒、敌人武器发光、实验颜色或动作眼位等已删除／INI-only 参数；中文无乱码、无截断，“恢复本页默认设置”不覆盖高级 INI 值 |
 
 ### H. 读档与异常状态
 

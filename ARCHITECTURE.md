@@ -1,6 +1,6 @@
 # 铁风执刃架构
 
-本文描述 v120 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
+本文描述 v121 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
 
 ## 1. 产物链
 
@@ -163,7 +163,7 @@ v83 为 `VISUAL_RECOVERY → FREE_BLOCK` 增加排他交接。右键在 impact �
 
 `AiBlocksInManual=false` 是方向手动格挡：右键按下记录当前方向并立即维持相应格挡片段。攻击方向保存的是刀刃运动方向，因此 v56 在进入格挡时只交换 `CUT_LEFT/CUT_RIGHT`，把鼠标右移转换为原版右侧格挡、鼠标左移转换为原版左侧格挡；上下不交换。v120 删除额外的完美格挡计时与奖励：只要本次请求已接受、RMB 仍按住、来袭位于可防御前方且方向匹配，就立即返回原版 `HIT_SWORD`，不以可见姿势是否完全抬起作为第二道时间门。原版调用方继续负责格挡火花、声音和经验；方向不匹配时不返回武器格挡结果。
 
-`AiBlocksInManual=true` 只把防御方向选择交给原版 AI，不交出输入时机：玩家仍须按住 RMB，`manualBlockTick` 只接受本次权限请求，不写方向、手动姿势或站立订单；松开即撤销。`manualBlockArmed`/`manualBlockInject` 不成立，`chooseBlock_hook` 仅在本次 RMB 请求仍有效时转发原版选择器。v111 起 `attackingYou_hook` 始终写入独立的 `IncomingAttackSlot` 来袭事件流；自动格挡读取该事件流，武器闪光仅按 `WeaponGlint` 决定是否渲染。`combatGo_hook` 只在“RMB 正在按住且该攻击仍处于 STARTUP/CHOP”时放行原版防御决策，其他帧仍压制自动防御、攻击、追击和连击。v102 中 RMB 仍不承载交互语义。
+`AiBlocksInManual=true` 只把防御方向选择交给原版 AI，不交出输入时机：玩家仍须按住 RMB，`manualBlockTick` 只接受本次权限请求，不写方向、手动姿势或站立订单；松开即撤销。`manualBlockArmed`/`manualBlockInject` 不成立，`chooseBlock_hook` 仅在本次 RMB 请求仍有效时转发原版选择器。`attackingYou_hook` 写入独立的 `IncomingAttackSlot` 来袭事件流，自动格挡读取该事件流；v121 删除了原先读取同一事件流的视觉消费者，但保留事件到期清理与首个 impact 诊断。`combatGo_hook` 只在“RMB 正在按住且该攻击仍处于 STARTUP/CHOP”时放行原版防御决策，其他帧仍压制自动防御、攻击、追击和连击。v102 中 RMB 仍不承载交互语义。
 
 v98 进一步删除自动模式按压时的防守订单和主动 combat-idle 写入：RMB 只建立权限并由格挡锁位门禁止移动。`manualAutoBlockInject` 仅在真实来袭且原版 chooser 返回具体 technique 后开启战斗动画层并进入 BLOCK，因此无来袭按压保持原姿势。手动模式仍保留即时姿势和 DEFENSIVE_COMBAT 订单。
 
@@ -195,7 +195,7 @@ v116 不存在铁风主动闪避状态。Shift+方向是普通移动，Q 没有�
 
 ## 8. UI 与交互
 
-- 准星模式可显示目标姓名、两行生命面板和来袭武器闪光。面板上排为血／头／胸／腹，下排为左臂／右臂／左腿／右腿；不生成总 HP。v119 将单条视觉尺寸改为 `38×5 px`，缩小标签留白、列隙和行距，使条更长更细但两行更紧凑。标准身体使用稳定 FCS `stringID`（28～32、100、101 的 gamedata.quack 记录），自定义种族四肢以 `PART_ARM/PART_LEG + side` 回退。`focusHealthStates` 以 `_maxHealth * age * HPMult` 为原始容量，并按 `flesh - fleshStun`、`flesh`、`flesh + bandaging`、扣除 `wearDamage` 的有效上限和 `juryRigging` 计算原版医疗分段；`isRobotic()` 逐部位决定健康段使用原版绿皮肤还是骨人蓝皮肤。渲染直接复用 `Kenshi_LifeBarSkin/Robot/Stunned/Hurt/Healed/Crushed/Splint`，不存在的部位不绘制。
+- 准星模式可显示目标姓名和两行生命面板。面板上排为血／头／胸／腹，下排为左臂／右臂／左腿／右腿；不生成总 HP。v119 将单条视觉尺寸改为 `38×5 px`，缩小标签留白、列隙和行距，使条更长更细但两行更紧凑。标准身体使用稳定 FCS `stringID`（28～32、100、101 的 gamedata.quack 记录），自定义种族四肢以 `PART_ARM/PART_LEG + side` 回退。`focusHealthStates` 以 `_maxHealth * age * HPMult` 为原始容量，并按 `flesh - fleshStun`、`flesh`、`flesh + bandaging`、扣除 `wearDamage` 的有效上限和 `juryRigging` 计算原版医疗分段；`isRobotic()` 逐部位决定健康段使用原版绿皮肤还是骨人蓝皮肤。渲染直接复用 `Kenshi_LifeBarSkin/Robot/Stunned/Hurt/Healed/Crushed/Splint`，不存在的部位不绘制。敌人攻击不再生成铁风自制的手部／武器发光 widget；原版碰撞特效不属于该 HUD 模块。
 - 四个方向箭头位于准星上下左右并朝向中心，但任一时刻只显示当前选中的一个；四个方向都允许出现。四向由同一程序几何旋转生成独立 RGBA 纹理并通过 `ImageBox::setImageTexture()` 绑定；保持 64×64 外框、箭头长度和约 3 px 笔画，v73 的统一中心半径为 258 px。`s_dirMoveAvailable == 1` 的所选方向为绿色，其余和未知方向为白色；格挡输入不改变箭头颜色。
 - 真正命中时，四个斜线文本控件紧贴准星四个对角形成断开的红色 X，字形不放大，并在 1000 ms 内淡出；显示时间在加载清理中归零。
 - v102 每帧从 40 单位内的已加载角色筛选交互候选，距离优先、屏幕偏移次之；活着的敌对角色不抢交互提示，昏迷／死亡角色仍可选。候选显示黄色 `交互：名字`，有玩家对话包时仍显示对话气泡。
@@ -205,7 +205,7 @@ v116 不存在铁风主动闪避状态。Shift+方向是普通移动，Q 没有�
 - 空格暂停与 UI 菜单必须分开：世界暂停不进入 `dcUiWantsCursor`，所以 OTS／FP 继续读取鼠标与滚轮；`controlEnabled=false` 的真实菜单仍停止相机并释放光标。
 - 默认保持准星：中立黄、友方绿、空处/红名白。只有确认存在玩家对话包时才显示对话气泡，不显示原版黄/绿箭头。
 - V 模式库存打开时保留控制与镜头距离，自动释放鼠标；未按 WASD 时原地保持。
-- v120 将游戏内设置页收束为 11 个铁风按键和 13 个常用设置；原版移动档位不重复展示。仍有运行价值的攻击缓冲、键盘格挡、特殊种族和镜头裁剪参数只保留在 INI，页面“恢复默认”不覆盖这些个人 DIY 值。
+- v121 的游戏内设置页为 11 个铁风按键和 11 个常用设置；原版移动档位不重复展示。仍有运行价值的攻击缓冲、键盘格挡、特殊种族和镜头裁剪参数只保留在 INI，页面“恢复默认”不覆盖这些个人 DIY 值。
 - `Settings.zh-CN.tsv` 只翻译显示文本。INI 节名、键名和代码查找用的英文原文不得改名。
 
 ## 9. 加载与生命周期安全

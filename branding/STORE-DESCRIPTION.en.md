@@ -14,7 +14,7 @@ Ironwind does not replace Kenshi with a custom damage system. Your input decides
 - Vanilla melee state, attack area, weapon reach, skills, block/dodge rolls, armour, damage and XP.
 - Complete hit and miss animations, native stagger ownership, and no fixed-duration reaction overrides.
 - Compact two-row, eight-part health display using Kenshi's real medical states and colours.
-- Confirmed-hit red X feedback, directional availability arrows and optional incoming-weapon glint.
+- Confirmed-hit red X feedback and directional availability arrows, without custom hand/weapon attack glows.
 - Nearby character interaction through `E`, using the original context menu.
 - Character-centred audio while direct control is active.
 - In-game Chinese settings page plus advanced INI calibration.

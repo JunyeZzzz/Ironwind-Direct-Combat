@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "120"
+#define IRONWIND_VERSION "121"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -60,7 +60,7 @@
 #include <map>
 #include <mygui/MyGUI.h>
 #include <mygui/MyGUI_TextBox.h>       // "Manual Attack" HUD label
-#include <mygui/MyGUI_ImageBox.h>      // lock-on dot + weapon glints (GUI-space markers)
+#include <mygui/MyGUI_ImageBox.h>      // directional HUD atlas
 #include <mygui/MyGUI_EditBox.h>        // vanilla speech text = an EditBox in a bubble layout (the bars step over it)
 
 // Minimal forward declaration for ManagementScreen (world map / faction / tech /
@@ -577,7 +577,7 @@ static Character*        s_autoBlockAttemptWho = nullptr;
 static ULONGLONG         s_autoBlockAttemptStartMs = 0;
 // Exact ownership token for the one native BLOCK selected by automatic guard.
 // It remains valid only while the original BLOCK state is still playing; this
-// lets the native state finish even after the incoming-glint edge has ended.
+// lets the native state finish even after the incoming-attack edge has ended.
 static CombatTechniqueData* s_autoBlockActiveTech = nullptr;
 // Timed block (user 2026-09-18: no unlimited hold).  A press opens a block for
 // at most BlockHoldMs (the vanilla order + pose), then it drops even if the key
@@ -752,19 +752,9 @@ static Character*        s_aimLogged           = nullptr;// edge log
 static volatile ULONGLONG s_rmbAimPressMs      = 0;      // poll thread: RMB press edge
 static ULONGLONG         s_rmbAimSeenMs        = 0;
 static bool              s_aimClicked          = false;  // the current focus came from a click
-// Markers are GUI-space (Kenshi's DX11 renderer needs shader materials for raw
-// 3D geometry).  ONE shared 64x64 soft-glow texture for every marker: the DX11
-// backend pads texture rows, so the old 24 px dot texture (96-byte rows) was
-// written with the wrong pitch and showed as a garbled white square (builds
-// 32-45) while the 64 px ring (256-byte rows) drew fine.  The ring itself is
-// gone (user 2026-09-21).
-static const int         GLOW_TEX_PX           = 64;
-static bool              s_glowTexTried        = false;
-static bool              s_glowTexOk           = false;
 static bool              s_settingAimName      = true;   // [Settings] AimNameTag
 // Aim-focus marker (user 2026-09-22): the enemy's NAME above their head, in the
-// game's own small text skin with a shadow - like the vanilla name tag - instead
-// of the glowing dot (the glow texture stays for the weapon glints).
+// game's own small text skin with a shadow - like the vanilla name tag.
 static MyGUI::TextBox*   s_nameTag             = nullptr;
 static bool              s_nameTagTried        = false;
 static Character*        s_nameTagFor          = nullptr;// identity: whose name the caption holds
@@ -805,33 +795,13 @@ static const int         HB_RAISE = 36;                   // both rows stay clea
 // see left a dangling pointer read every frame - an access violation inside
 // the game's main loop that another plugin's handler swallowed, so the rest of
 // the game update was skipped each frame = "toggling Z pauses the game".
-// WEAPON GLINT (user concept 2026-09-21): an enemy's weapon glints while their
-// swing is coming at you - the visual cue for a guard or counter.
-// Signal = Character::attackingYou, the game's own "I am swinging at you"
-// notification sent to the victim at swing start (the AI blocks off the same
-// signal).  The glint ramps from swing start to GlintLeadMs, holds bright, and
-// flashes out at impact (the block verdict) or when the swing ends.
-static bool              s_settingGlint        = true;   // [Settings] WeaponGlint
-static float             s_glintLeadMs         = 700.0f; // [Settings] GlintLeadMs (ramp to full brightness; log 2026-09-21: swing start -> impact median 844 ms)
-static float             s_glintPx             = 22.0f;  // [Settings] GlintPx (on-screen size at full)
+// NATIVE INCOMING-ATTACK TRACKER. Character::attackingYou is the game's own
+// "I am swinging at you" notification. Automatic guard consumes this event
+// stream; v121 removed the old hand/weapon glow renderer entirely.
 static const int         INCOMING_ATTACK_MAX   = 4;      // attackers tracked at once
 struct IncomingAttackSlot { Character* who; ULONGLONG startMs; ULONGLONG chopMs; ULONGLONG impactMs; };
-// Glint COLOUR = the defence that works (user 2026-10-01, "honest arc rule"):
-//   tier 0 WHITE  = the hit lands inside the front arc -> a Block tap stops it
-//   tier 1 ORANGE = outside the defendable arc (side / rear) -> a manual guard is
-//                   refused by design; turn and use the normal skill defence
-//   tier 2 RED    = heavy tier (heavy weapon, or impact power >= GlintHeavyPower)
-//                   -> especially dangerous incoming strike
-// Re-evaluated every frame with the SAME test the block verdict applies, so
-// turning to face the attacker flips orange -> white live.
-static bool              s_glintColourTiers    = false;  // [Settings] GlintColourTiers (OFF for the v1.5 release, user 2026-10-03: all glints white; colours = next update)
-static bool              s_glintHeavyTier      = true;   // [Settings] GlintHeavyTier (heavy = the technique's skill list says SKILL_HEAVY; log 2026-10-01: the attacker's currentWeaponType read 0 for everyone and ImpactPoint power is a flat 1)
-// Native incoming-attack state is independent of the optional glint renderer.
-// Automatic guard may consume these events even
-// when WeaponGlint is disabled. who is identity only, validated before use.
+// who is identity only and must be validated before every use.
 static IncomingAttackSlot s_incomingAttack[INCOMING_ATTACK_MAX] = {};
-static MyGUI::ImageBox*  s_glintBox[INCOMING_ATTACK_MAX] = {};
-static bool              s_glintTried          = false;
 static CombatTechniqueData* s_dcBlock[8];                  // mod-owned copies of the BLOCK techniques
 static int               s_dcBlockCount        = 0;
 static CombatTechniqueData* s_dcAttack[256];
@@ -1670,11 +1640,6 @@ static void writeDefaultConfig(const char* path)
         "AimHoverPx             = 70\r\n"
         "; Aim focus marker: the name of the enemy you are pointing at, above their head.\r\n"
         "AimNameTag             = true\r\n"
-        "; Weapon glint: an enemy's weapon glints while their swing is coming at you\r\n"
-        "; (brightens over GlintLeadMs, flashes at impact). Size in px.\r\n"
-        "WeaponGlint            = true\r\n"
-        "GlintLeadMs            = 700\r\n"
-        "GlintPx                = 22\r\n"
         "; Detailed log for bug reports (writes every combat/movement event).\r\n"
         "VerboseLog             = false\r\n"
         "; V-mode third-person camera: distance / height / shoulder offset.\r\n"
@@ -2003,20 +1968,6 @@ static void loadKeybinds()
             s_blockCooldownMs = bc;
             GetPrivateProfileStringA("Settings", "AimNameTag", "true", pbuf, sizeof(pbuf), path);
             s_settingAimName = parseBool(pbuf, true);
-            GetPrivateProfileStringA("Settings", "WeaponGlint", "true", pbuf, sizeof(pbuf), path);
-            s_settingGlint = parseBool(pbuf, true);
-            GetPrivateProfileStringA("Settings", "GlintLeadMs", "700", pbuf, sizeof(pbuf), path);
-            float gl = (float)atof(pbuf);
-            if (gl < 50.0f) gl = 50.0f;    if (gl > 2000.0f) gl = 2000.0f;
-            s_glintLeadMs = gl;
-            GetPrivateProfileStringA("Settings", "GlintPx", "22", pbuf, sizeof(pbuf), path);
-            float gp = (float)atof(pbuf);
-            if (gp < 6.0f) gp = 6.0f;      if (gp > 96.0f) gp = 96.0f;
-            s_glintPx = gp;
-            GetPrivateProfileStringA("Settings", "GlintColourTiers", "false", pbuf, sizeof(pbuf), path);
-            s_glintColourTiers = parseBool(pbuf, false);
-            GetPrivateProfileStringA("Settings", "GlintHeavyTier", "true", pbuf, sizeof(pbuf), path);
-            s_glintHeavyTier = parseBool(pbuf, true);
             GetPrivateProfileStringA("Settings", "AimConeDeg", "35", pbuf, sizeof(pbuf), path);
             float ac = (float)atof(pbuf);
             if (ac < 5.0f) ac = 5.0f;      if (ac > 90.0f) ac = 90.0f;
@@ -2152,12 +2103,6 @@ static DcOptRow s_dcOptRows[] =
     { "Settings", "AimNameTag", &s_settingAimName, NULL, 0, 0, 0, 1,
       "Show target's name and health",
       "The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head." },
-    { "Settings", "WeaponGlint", &s_settingGlint, NULL, 0, 0, 0, 1,
-      "Glint on weapons swinging at you",
-      "An enemy's weapon lights up while their attack is coming at you, brightest just before it lands - your cue to guard or counter." },
-    { "Settings", "GlintPx", NULL, &s_glintPx, 6.0f, 96.0f, 0, 22.0f,
-      "Glint size (pixels)",
-      NULL },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "THIRD PERSON CAMERA (V)", NULL },
     { "Settings", "OtsHeight", NULL, &s_otsCamHeight, -5.0f, 28.0f, 1, 18.0f,
@@ -3295,7 +3240,7 @@ static void clearAllState()
     s_aimLogged                   = nullptr;
     s_aimClicked                  = false;
     s_rmbAimSeenMs                = 0;
-    for (int gi = 0; gi < INCOMING_ATTACK_MAX; ++gi) s_incomingAttack[gi].who = nullptr; // widgets stay; hidden by the update
+    for (int gi = 0; gi < INCOMING_ATTACK_MAX; ++gi) s_incomingAttack[gi].who = nullptr;
     s_wasdDownedMovementActive    = false;
     s_slaveOrderActive            = false;
     s_slaveModeLogged             = false;
@@ -6028,50 +5973,6 @@ static bool focusBonePos(Character* t, const char* bone, float fallbackUp, Ogre:
     return true;
 }
 
-// The glowing dot: a soft radial white glow, gently pulsing.
-// The shared 64x64 soft white glow (solid core, squared falloff halo).
-static bool focusGlowTexCreate()
-{
-    if (s_glowTexTried) return s_glowTexOk;
-    s_glowTexTried = true;
-    try
-    {
-        MyGUI::ITexture* tex = MyGUI::RenderManager::getInstance().createTexture("dc_glow_tex");
-        if (!tex) return false;
-        tex->createManual(GLOW_TEX_PX, GLOW_TEX_PX, MyGUI::TextureUsage::Static | MyGUI::TextureUsage::Write, MyGUI::PixelFormat::R8G8B8A8);
-        unsigned char* px = (unsigned char*)tex->lock(MyGUI::TextureUsage::Write);
-        if (!px) { tex->unlock(); return false; }
-        const float c = GLOW_TEX_PX * 0.5f - 0.5f, R = GLOW_TEX_PX * 0.5f;
-        for (int y = 0; y < GLOW_TEX_PX; ++y)
-        for (int x = 0; x < GLOW_TEX_PX; ++x)
-        {
-            float r = sqrtf((x - c) * (x - c) + (y - c) * (y - c)) / R;   // 0 centre .. 1 edge
-            float a;
-            if (r < 0.22f)      a = 1.0f;                                   // solid core
-            else if (r < 1.0f)  { float t = (1.0f - r) / 0.78f; a = t * t * t; }   // soft halo
-            else                a = 0.0f;
-            unsigned char* o = px + ((size_t)y * GLOW_TEX_PX + x) * 4;
-            o[0] = 255; o[1] = 255; o[2] = 255; o[3] = (unsigned char)(a * 255.0f + 0.5f);
-        }
-        tex->unlock();
-        s_glowTexOk = true;
-        DebugLog("[WASDCombat] glow_tex_created");
-        return true;
-    }
-    catch (...) { DebugLog("[WASDCombat] glow_tex_create_failed"); return false; }
-}
-static MyGUI::ImageBox* focusGlowBox(const char* name)
-{
-    MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
-    if (!g || !focusGlowTexCreate()) return nullptr;
-    MyGUI::ImageBox* b = g->createWidget<MyGUI::ImageBox>("ImageBox", 0, 0, GLOW_TEX_PX, GLOW_TEX_PX,
-                                                          MyGUI::Align::Default, "Top", name);
-    if (!b) return nullptr;
-    b->setImageTexture("dc_glow_tex");
-    b->setNeedMouseFocus(false);
-    b->setVisible(false);
-    return b;
-}
 static bool focusHealthBarsCreate()
 {
     if (s_hbTried) return s_hbLayer[0][0] != nullptr;
@@ -6273,24 +6174,6 @@ static bool focusNameTagCreate()
     }
     catch (...) { s_nameTag = nullptr; DebugLog("[WASDCombat] aim_name_tag_create_failed"); return false; }
 }
-static bool focusGlintCreate()
-{
-    if (s_glintTried) return s_glintBox[0] != nullptr;
-    s_glintTried = true;
-    try
-    {
-        for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
-        {
-            char nm[32]; sprintf_s(nm, sizeof(nm), "dc_glint_%d", i);
-            s_glintBox[i] = focusGlowBox(nm);
-            if (!s_glintBox[i]) { for (int j = 0; j < i; ++j) { s_glintBox[j]->setVisible(false); } DebugLog("[WASDCombat] glint_create_failed"); return false; }
-        }
-    }
-    catch (...) { DebugLog("[WASDCombat] glint_create_failed"); return false; }
-    DebugLog("[WASDCombat] glint_created");
-    return true;
-}
-
 // Character::attackingYou - the victim is told at swing start.  Track the
 // attacker (identity only) when WE are the victim.
 static void (*s_attackingYouOrig)(Character* self, Character* attacker, bool so, bool doAwarenessCheck);
@@ -6314,9 +6197,8 @@ static void attackingYou_hook(Character* self, Character* attacker, bool so, boo
     }
 
     s_attackingYouOrig(self, attacker, so, doAwarenessCheck);
-    // Record native incoming attacks independently of visual settings. The
-    // optional weapon glint and player-authorised automatic guard are separate
-    // consumers of this event stream.
+    // Record native incoming attacks for player-authorised automatic guard.
+    // v121 deliberately has no visual consumer: the tracker is game-state only.
     if (!self || self != s_freeMoveAnchor || !attacker || attacker == self
         || s_mode != MODE_FREE_MOVE || s_dcShutdownInProgress || s_loadGuardActive) return;
     ULONGLONG now = GetTickCount64();
@@ -6328,43 +6210,6 @@ static void attackingYou_hook(Character* self, Character* attacker, bool so, boo
     s_incomingAttack[slot].startMs = now;
     s_incomingAttack[slot].chopMs = 0;
     s_incomingAttack[slot].impactMs = 0;
-}
-// Which defence works against this attacker's current swing. This classification
-// is visual-only and is not stored in the native incoming-attack tracker.
-static int glintTier(Character* me, Character* who, float* powerOut, int* catOut)
-{
-    if (powerOut) *powerOut = 0.0f;
-    if (catOut)   *catOut   = -1;
-    if (!me || !who || !me->movement || !who->movement) return 0;
-    CombatClass* fc = who->getCombatClass();
-    CombatTechniqueData* ft = fc ? fc->currentTechnique : nullptr;
-    bool rearCut = false; float power = 0.0f;
-    bool heavyTech = ft && (int)SKILL_HEAVY < 0x16 && ft->skillTypes[(int)SKILL_HEAVY];   // the technique belongs to the heavy-weapon skill
-    if (ft && !ft->isBlock && ft->numImpactPoints() > 0)
-    {
-        int n = ft->numImpactPoints();
-        int sec = fc->currentComboSection; if (sec < 0) sec = 0; if (sec >= n) sec = n - 1;
-        CombatTechniqueData::ImpactPoint* ip = ft->impactPoint(sec);
-        if (ip)
-        {
-            CutDirection d = me->convertCutDirection(ip->direction, who);   // the direction the verdict will see
-            rearCut = (d == CUT_REAR_DOWNWARD || d == CUT_REAR_LEFT || d == CUT_REAR_RIGHT);
-            power = ip->power;
-        }
-    }
-    Ogre::Vector3 f  = me->movement->direction;  f.y  = 0.0f;
-    Ogre::Vector3 to = who->movement->pos - me->movement->pos; to.y = 0.0f;
-    bool front = !rearCut;
-    if (front && f.squaredLength() > 1e-6f && to.squaredLength() > 1e-6f)
-        front = f.normalisedCopy().dotProduct(to.normalisedCopy()) > 0.34f;   // the verdict's ~140 deg arc
-    int cat = -1;
-    CharStats* ws = who->getStats();
-    if (ws) cat = (int)ws->currentWeaponType;
-    if (powerOut) *powerOut = power;
-    if (catOut)   *catOut   = cat;
-    if (!front) return 1;
-    if (s_glintHeavyTier && (heavyTech || cat == (int)SKILL_HEAVY)) return 2;
-    return 0;
 }
 // Is any tracked swing still coming at us?  (Used by the idle pin so the AI's
 // own block logic is never suppressed while a hit is on the way.)
@@ -6442,8 +6287,8 @@ static int bubbleTopNear(int sx, int sy)
     catch (...) { return -1; }
     return best;
 }
-// The hit landed (or was blocked): flash the glint out.  Logged for tuning
-// GlintLeadMs (swing start -> impact, per attacker technique).
+// The tracked swing resolved (hit or block). Keep this event for automatic
+// guard lifecycle diagnostics; it has no visual side effect.
 static void incomingAttackImpact(Character* who)
 {
     if (!who) return;
@@ -6454,24 +6299,19 @@ static void incomingAttackImpact(Character* who)
             IncomingAttackSlot& incoming = s_incomingAttack[i];
             bool first = incoming.impactMs == 0;
             if (first) incoming.impactMs = now;
-            float pw = 0.0f; int cat = -1;
-            int tier = glintTier(s_freeMoveAnchor, who, &pw, &cat);
-            char b[160];
-            unsigned skills = 0;
+            if (first)
             {
-                CombatClass* ac = who->getCombatClass();
-                CombatTechniqueData* at = ac ? ac->currentTechnique : nullptr;
-                if (at) for (int k = 0; k < 0x16; ++k) if (at->skillTypes[k]) skills |= (1u << k);
+                char b[128];
+                sprintf_s(b, sizeof(b), "[WASDCombat] incoming_attack_impact ms=%llu chop_ms=%llu",
+                          now - incoming.startMs, incoming.chopMs ? now - incoming.chopMs : 0ULL);
+                VerbLog(b);
             }
-            sprintf_s(b, sizeof(b), "[WASDCombat] glint_impact ms=%llu chop_ms=%llu followup=%d tier=%d power=%.0f cat=%d skills=0x%X",
-                      now - incoming.startMs, incoming.chopMs ? now - incoming.chopMs : 0ULL, first ? 0 : 1,
-                      tier, pw, cat, skills);
-            VerbLog(b);
         }
 }
 
 // Per frame (camera hook, post-orig): the aim focus's name above their head
-// (any view) and a glint on every weapon swinging at us.
+// and compact native-colour health bars. Incoming attacks are only expired here;
+// no hand/weapon marker is rendered.
 static void focusMarkersUpdate(CameraClass* thisptr)
 {
     bool live = s_mode == MODE_FREE_MOVE && !s_loadGuardActive && !s_dcShutdownInProgress
@@ -6574,11 +6414,12 @@ static void focusMarkersUpdate(CameraClass* thisptr)
         }
     }
 
-    // weapon glints
+    // Expire incoming-attack state without rendering it. Automatic guard reads
+    // the same slots, so this lifecycle must remain even though the old visual
+    // cue and all of its texture/widgets/configuration were removed in v121.
     for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
     {
         IncomingAttackSlot& g = s_incomingAttack[i];
-        bool on = false;
         bool drop = false;
         if (g.who)
         {
@@ -6589,42 +6430,12 @@ static void focusMarkersUpdate(CameraClass* thisptr)
                 swordStateEnum st = cc ? cc->getCombatState() : COMBAT_FINISHED;
                 bool swinging = cc && cc->combatModeActive && (st == STARTUP_STATE || st == CHOP_WEAPON);
                 if (st == CHOP_WEAPON && g.chopMs == 0) g.chopMs = now;
-                if (g.impactMs == 0 && !swinging && now - g.startMs > 150) g.impactMs = now;   // swing over, no hit on us: fade
+                if (g.impactMs == 0 && !swinging && now - g.startMs > 150) g.impactMs = now;
                 if (g.impactMs != 0 && now - g.impactMs > 180) drop = true;
-                if (now - g.startMs > 4000) drop = true;                                         // bounded
+                if (now - g.startMs > 4000) drop = true;
             }
         }
         if (drop) g.who = nullptr;
-        if (live && s_settingGlint && g.who && (s_glintBox[i] || focusGlintCreate()))
-        {
-            Ogre::Vector3 wp;
-            if (focusBonePos(g.who, "Bip01 Prop2", 12.0f, wp) && focusProject(cam, wp, 1.0f, sx, sy))
-            {
-                float k;                                                            // 0..1 intensity
-                if (g.impactMs != 0) k = 1.0f - (float)(now - g.impactMs) / 180.0f; // flash out
-                else
-                {
-                    float lead = s_glintLeadMs > 1.0f ? s_glintLeadMs : 1.0f;
-                    k = 0.30f + 0.70f * (float)(now - g.startMs) / lead;            // ramp up, hold
-                    if (k > 1.0f) k = 1.0f;
-                }
-                if (k < 0.0f) k = 0.0f;
-                float shimmer = 0.85f + 0.15f * sinf((float)(now % 160) / 160.0f * 6.2831853f);
-                int tier = (g.impactMs == 0 && s_glintColourTiers)
-                         ? glintTier(s_freeMoveAnchor, g.who, nullptr, nullptr) : 0;
-                static const MyGUI::Colour TIER_COL[3] = {
-                    MyGUI::Colour(1.00f, 1.00f, 1.00f),     // block  - white
-                    MyGUI::Colour(1.00f, 0.58f, 0.12f),     // side/rear threat - orange
-                    MyGUI::Colour(0.95f, 0.18f, 0.18f) };   // heavy  - red
-                s_glintBox[i]->setColour(TIER_COL[tier < 0 ? 0 : (tier > 2 ? 2 : tier)]);
-                int px = (int)(s_glintPx * (0.6f + 0.7f * k));
-                if (px < 4) px = 4;
-                s_glintBox[i]->setCoord(sx - px / 2, sy - px / 2, px, px);
-                s_glintBox[i]->setAlpha(k * shimmer);
-                on = true;
-            }
-        }
-        if (s_glintBox[i] && s_glintBox[i]->getVisible() != on) s_glintBox[i]->setVisible(on);
     }
 
 }
@@ -7235,7 +7046,7 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
 
     s_cameraUpdateOrig(thisptr, ctlEnabled);
     manualAttackHudUpdate();    // "Manual Attack" label (self-gated)
-    focusMarkersUpdate(thisptr);   // lock dot + weapon glints (self-gated)
+    focusMarkersUpdate(thisptr);   // target name + health bars (self-gated)
 
     // SCENE-FREEING — the Ogre scene is actively being torn down: only `!ou`
     // (world gone) and a save-load in progress qualify.  Touching the camera
@@ -11984,7 +11795,7 @@ static void getHit_hook(CombatClass* cc, CutDirection dir,
 static HitMaterialType iHitYouAreYouHit_inner(CombatClass* cc, CutDirection dir, Damages& damage, Character* who)
 {
     Character* self = cc ? cc->me : nullptr;
-    if (self && self == s_freeMoveAnchor) incomingAttackImpact(who); // close native incoming event; glint may flash out
+    if (self && self == s_freeMoveAnchor) incomingAttackImpact(who); // close native incoming event
     // DIAG (build 56): every hit on the controlled character, with the attacker's
     // technique - to find the two-strike moves and tune the block windows.
     if (self && self == s_freeMoveAnchor)
@@ -15748,7 +15559,7 @@ __declspec(dllexport) void startPlugin()
         }
         // (handle intentionally kept for the life of the process)
     }
-    DebugLog("Ironwind Combat v" IRONWIND_VERSION " (Direct Control base v" DIRECT_CONTROL_BASE_VERSION ") — manual combat, aim focus, weapon glint, realistic first person");
+    DebugLog("Ironwind Combat v" IRONWIND_VERSION " (Direct Control base v" DIRECT_CONTROL_BASE_VERSION ") — manual combat, aim focus, realistic first person");
 
     // Resolve the non-virtual CombatClass base update explicitly. Calling
     // cc->update() would dispatch to CombatClassAI::update and restore the AI
@@ -15996,7 +15807,7 @@ __declspec(dllexport) void startPlugin()
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&Character::attackingYou),
             &attackingYou_hook, &s_attackingYouOrig))
-        ErrorLog("WASDCombatPlugin: attackingYou hook FAILED - weapon glint off");
+        ErrorLog("WASDCombatPlugin: attackingYou hook FAILED - automatic guard incoming-attack tracking unavailable");
     else
         DebugLog("WASDCombatPlugin: attackingYou hook OK");
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(

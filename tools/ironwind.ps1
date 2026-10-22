@@ -281,7 +281,7 @@ function Invoke-IwCheck {
         'WasdSpeedCap', 'EnemyPursuit', 'InventoryFaceCam',
         'AttackWindowMs', 'AttackRecoveryMs', 'ManualBlock', 'DirectionalCombat',
         'BlockHoldMs', 'BlockCooldownMs', 'AimHoverPx', 'InputRepeatGuardMs',
-        'GlintLeadMs', 'GlintColourTiers', 'OtsDistance', 'OtsSide', 'OtsNearClip',
+        'OtsDistance', 'OtsSide', 'OtsNearClip',
         'NeckLimit', 'LookSmooth', 'HideHead', 'HideHeadgear', 'HideHair',
         'HideInjuryOverlay', 'FloorRevealBelow', 'EyeUpAdjust', 'JogForward',
         'RunForward', 'SideLookForward', 'ActionClearForward', 'NearClip',
@@ -296,8 +296,27 @@ function Invoke-IwCheck {
     $visibleSettingCount = [regex]::Matches(
         $visibleOptions, '\{\s*"(?:Settings|FirstPerson)"\s*,'
     ).Count
-    if ($visibleSettingCount -gt 13) {
-        throw "Ironwind options page regrew beyond the v120 compact limit: $visibleSettingCount visible settings."
+    if ($visibleSettingCount -gt 11) {
+        throw "Ironwind options page regrew beyond the v121 compact limit: $visibleSettingCount visible settings."
+    }
+    foreach ($symbol in @('s_settingGlint', 's_glint', 's_glowTex', 'focusGlowTexCreate',
+                           'focusGlowBox', 'focusGlintCreate', 'glintTier', 'dc_glow_tex',
+                           'dc_glint_', 'glint_impact')) {
+        if ($sourceText -match [regex]::Escape($symbol)) {
+            throw "Removed custom incoming-attack visual returned: $symbol"
+        }
+    }
+    foreach ($key in @('WeaponGlint', 'GlintLeadMs', 'GlintPx', 'GlintColourTiers', 'GlintHeavyTier')) {
+        if ($defaultIniText -match "(?m)^\s*$key\s*=") {
+            throw "Removed custom incoming-attack setting returned: $key"
+        }
+    }
+    $settingsTsvText = Get-Content -LiteralPath (Join-Path $projectDir 'runtime\Settings.zh-CN.tsv') -Raw
+    foreach ($text in @('Glint on weapons swinging at you', 'Glint peaks after swing start',
+                         'Glint size', 'Colour glints by defence')) {
+        if ($settingsTsvText -match [regex]::Escape($text)) {
+            throw "Removed custom incoming-attack translation returned: $text"
+        }
     }
     if ($sourceText -notmatch 'en\s*==\s*"focus_char"\s*&&\s*viewDown') {
         throw 'V-mode FirstPerson=F must suppress the colliding vanilla focus_char event.'

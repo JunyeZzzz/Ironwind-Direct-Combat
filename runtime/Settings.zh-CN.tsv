@@ -66,13 +66,6 @@ A second press of the same combat key this soon after the first is ignored, so a
 MANUAL COMBAT - ON-SCREEN CUES	手动战斗：画面提示
 Show target's name and health	显示目标名称与生命状态
 The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head.	在目标头顶显示名称，以及血量、头部、胸部和腹部状态条。
-Glint on weapons swinging at you	来袭武器闪光提示
-An enemy's weapon lights up while their attack is coming at you, brightest just before it lands - your cue to guard or counter.	敌人挥刀时武器会发光，命中前最亮，可据此格挡或反击。
-Glint peaks after swing start (ms)	武器闪光达到峰值时间（毫秒）
-The glint reaches full brightness this long after the enemy starts their swing. Most swings land around 850 ms, so 700 peaks just before the hit.	敌人开始挥刀后，经过这段时间闪光达到最亮；多数攻击约在 850 毫秒命中。
-Glint size (pixels)	武器闪光大小（像素）
-Colour glints by defence (experimental)	按应对方式区分闪光颜色（实验）
-Off: every glint is white. On: white = a Block tap stops it (front arc), orange = a side or rear threat, red = a heavy-weapon threat.	关闭时全部显示白光；开启后白色提示可格挡，橙色提示侧后方威胁，红色提示重武器威胁。
 THIRD PERSON CAMERA (V)	越肩镜头（V）
 Distance behind your character	镜头与角色距离
 How far back the shoulder camera sits. The mouse wheel zooms while it is active.	越肩镜头距离角色多远；在该视角中可用滚轮缩放。
