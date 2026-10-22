@@ -2,7 +2,7 @@
 
 铁风执刃是由 **cjy233** 维护、面向 Kenshi 1.0.65 与 RE_Kenshi 0.3.5 的自由控制战斗 Mod。当前项目、发布包和维护流程均以“铁风执刃 / Ironwind: Hands-On Combat”为正式身份。
 
-![Ironwind: Hands-On Combat cover](branding/ironwind-hands-on-combat-cover-concept-v1.png)
+![Ironwind: Hands-On Combat cover](branding/ironwind-hands-on-combat-cover-concept-v2.png)
 
 按下 `V` 直接接管角色：WASD 移动、越肩／第一人称镜头、四向攻击与格挡、原版近战结算、八部位生命面板和近距 E 交互。玩家决定何时与向哪里出手，Kenshi 继续决定招式、范围、命中、格挡、闪避、护甲、伤害和经验。
 
