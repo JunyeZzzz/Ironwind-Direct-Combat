@@ -308,6 +308,7 @@ $summary = [ordered]@{
     verdicts = $nativeVerdicts.Count
     hitCandidates = $hitCandidates
     blocks = $blocked
+    manualDirectionalBlocks = Count-Event 'directional_guard_block'
     dodges = $dodged
     confirmedHits = $confirmedHits
     hitMarkers = $markers
@@ -355,6 +356,7 @@ foreach ($row in @(
     @('未闭合攻击链', $summary.incompleteAttackRows),
     @('命中候选', $summary.hitCandidates),
     @('敌人格挡', $summary.blocks),
+    @('玩家手动方向格挡', $summary.manualDirectionalBlocks),
     @('敌人闪避', $summary.dodges),
     @('真实 `_getHit`', $summary.confirmedHits),
     @('红色命中标记', $summary.hitMarkers)
@@ -439,7 +441,7 @@ if (-not $NoFiles) {
 Write-Output "Ironwind log analysis: v$version"
 Write-Output "Lines: $($summary.firstLine)-$($summary.lastLine); plugin events: $($summary.pluginEvents); event types: $($summary.discoveredEventTypes)"
 Write-Output "Attacks: releases=$($summary.releases) native_starts=$($summary.nativeStarts) impacts=$($summary.impacts) completed=$($summary.completedAttackRows) incomplete=$($summary.incompleteAttackRows)"
-Write-Output "Outcomes: candidates=$($summary.hitCandidates) blocks=$($summary.blocks) dodges=$($summary.dodges) hits=$($summary.confirmedHits) markers=$($summary.hitMarkers)"
+Write-Output "Outcomes: candidates=$($summary.hitCandidates) enemy_blocks=$($summary.blocks) manual_blocks=$($summary.manualDirectionalBlocks) dodges=$($summary.dodges) hits=$($summary.confirmedHits) markers=$($summary.hitMarkers)"
 Write-Output "Risks: errors=$($summary.riskErrors) warnings=$($summary.riskWarnings) duration_outliers=$($summary.durationOutliers) unknown_event_types=$($summary.unknownEventTypes)"
 if (-not $NoFiles) {
     Write-Output "Markdown: $markdownPath"

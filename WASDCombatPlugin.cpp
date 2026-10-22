@@ -48,7 +48,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "130"
+#define IRONWIND_VERSION "131"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -12344,9 +12344,16 @@ static HitMaterialType iHitYouAreYouHit_inner(CombatClass* cc, CutDirection dir,
     {
         ULONGLONG now   = GetTickCount64();
         ULONGLONG origin = s_blockHoldStartMs;
+        CutDirection wanted = (CutDirection)s_blockDesired;
+        bool directionMatched = combatDirectionMatches(wanted, dir);
+        // A held upper guard is already an explicit answer to a downward cut.
+        // Do not let CharMovement::direction (which can still contain the last
+        // movement tangent) randomly veto that correct manual input.  Rear
+        // downward is the same native attack direction for this purpose.
+        bool overheadArcBypass = wanted == CUT_DOWNWARD && directionMatched;
         bool rear = (dir == CUT_REAR_DOWNWARD || dir == CUT_REAR_LEFT || dir == CUT_REAR_RIGHT);
         bool front = !rear;
-        if (front && who && who->movement && self->movement)
+        if (!overheadArcBypass && front && who && who->movement && self->movement)
         {
             Ogre::Vector3 f  = self->movement->direction;  f.y  = 0.0f;
             Ogre::Vector3 to = who->movement->pos - self->movement->pos; to.y = 0.0f;
@@ -12363,14 +12370,15 @@ static HitMaterialType iHitYouAreYouHit_inner(CombatClass* cc, CutDirection dir,
         // Match that semantic: an accepted held directional request is ready
         // immediately; the pose is feedback, not a second hidden timing gate.
         if ((directionalReady || keyboardReady) && !s_freeAttackTech
-            && front && !swinging && !reacting
+            && (overheadArcBypass || front) && !swinging && !reacting
             && (!s_directionalCombat
-                || combatDirectionMatches((CutDirection)s_blockDesired, dir)))
+                || directionMatched))
         {
-            char b[96];
-            sprintf_s(b, sizeof(b), "[Ironwind] directional_guard_block dir=%d press_age=%llu pose=%d",
+            char b[128];
+            sprintf_s(b, sizeof(b), "[Ironwind] directional_guard_block dir=%d press_age=%llu pose=%d overhead_arc_bypass=%d",
                       (int)dir, now - origin,
-                      (s_freeGuardUpperIdle && s_freeBlockTech) ? 1 : 0);
+                      (s_freeGuardUpperIdle && s_freeBlockTech) ? 1 : 0,
+                      overheadArcBypass ? 1 : 0);
             VerbLog(b);
             return HIT_SWORD;   // native caller still owns sound, spark and XP
         }

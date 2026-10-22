@@ -365,6 +365,15 @@ function Invoke-IwCheck {
             throw "v130 readable compact health-panel contract is incomplete: $required"
         }
     }
+    foreach ($required in @(
+        'bool overheadArcBypass = wanted == CUT_DOWNWARD && directionMatched;',
+        '(overheadArcBypass || front)',
+        'overhead_arc_bypass=%d'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v131 overhead manual-guard guarantee is incomplete: $required"
+        }
+    }
     foreach ($removed in @('s_interactionAutoTarget', 'dc_manual_interaction_hud')) {
         if ($sourceText -match [regex]::Escape($removed)) {
             throw "Removed character-only interaction HUD path returned: $removed"

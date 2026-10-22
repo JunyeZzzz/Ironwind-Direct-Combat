@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v130**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v131**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,13 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v131
+
+- 手动上格挡匹配原版 `CUT_DOWNWARD`／`CUT_REAR_DOWNWARD` 下劈时，取消额外的角色朝向夹角判定。只要本次 RMB 请求仍有效、方向匹配、玩家没有正在挥刀且不在原版受击反应中，就直接返回原版 `HIT_SWORD`；格挡姿势是否完全抬起仍不是隐藏时间门。
+- 这项修复针对实机中“同一敌人、同一 `bigchopv2`、同一上格挡偶尔成功偶尔受伤”的证据：失败前 `combat_target_lost`，而旧判定读取了可能仍保存绕圈切向的 `CharMovement::direction`。左右及下方格挡暂时保留既有前方夹角边界，避免在没有对应实机证据时扩大规则。
+- `directional_guard_block` 新增 `overhead_arc_bypass=0/1`，动态日志报告另列玩家手动格挡数量，便于把玩家防御与“敌人格挡玩家攻击”区分开。
+- 已通过静态回归门、Visual C++ 2010 x64 编译、开发通道部署和三处 DLL 一致性验证；DLL SHA256 为 `025191A4C422A348BA9C4309131ACF38AA033E3D786BF5DA7DF12E65B07D4AB8`，PDB SHA256 为 `9937281BDCD617FE2775066F4ACEEBCAE3BBD9630A6027AC27120B85D4B347CA`。游戏内结果仍待 v131 实测。
 
 ## v130
 

@@ -99,7 +99,7 @@
 
 | 场景 | 画面预期 | 关键日志 |
 | --- | --- | --- |
-| 关闭“自动格挡” | 右键按鼠标方向出现对应姿势；请求已接受且仍按住时，来自可防御前方的匹配来袭立即可挡，即使姿势尚未完全抬起；不匹配不得误挡 | `block_mode mode=manual_directional`、`free_block_play`；匹配时只有 `directional_guard_block ... pose=0/1`，不得出现旧 `perfect_block` 或奖励蓝光 |
+| 关闭“自动格挡” | 右键按鼠标方向出现对应姿势；请求已接受且仍按住时，匹配来袭立即可挡，即使姿势尚未完全抬起；上格挡对下劈不受人物朝向影响，其他方向仍受既有前方弧约束；不匹配不得误挡 | `block_mode mode=manual_directional`、`free_block_play`；上挡下劈为 `directional_guard_block ... pose=0/1 overhead_arc_bypass=1`，其他成功为 `overhead_arc_bypass=0`；不得出现旧 `perfect_block` 或奖励蓝光 |
 | 开启“自动格挡”并按住右键 | 右键立即成为防御请求，方向由原版 AI 按技能/概率选择，也允许失败受击；松开立即停止 | `block_press_accepted mode=automatic_ai`，来袭时可有 `ai_block_choice`；不得出现本次按压对应的 `free_block_play` 或 `directional_guard_block` |
 | 新安装／本页恢复默认 | “自动格挡”复选框默认关闭，右键使用手动方向格挡；已有安装升级时不覆盖玩家已经保存的选择 | 默认 INI 为 `AiBlocksInManual=false`，设置行默认值为 0；手动请求出现 `block_mode mode=manual_directional` |
 | 自动格挡空地按压 | 当前自然姿势完全不变，不因按压进入防御站姿／combat idle；仍保持原地且等待真实来袭 | `ai_guard_request armed=1 pose=unchanged`；不得出现 `ai_guard_ready_pose` 或 `block_hold vanilla_order=applied` |
@@ -177,10 +177,11 @@
 | --- | --- |
 | 四方向右键 | 鼠标右移显示右侧 `←` 并播放右格挡，左移显示左侧 `→` 并播放左格挡；上移为上挡、下移为突刺/下方挡。日志的 `gesture_dir` 与 `guard_dir` 只在左右方向互换 |
 | 格挡期间方向 HUD | 当前所选箭头仍只按攻击可用性显示绿/白，不出现蓝色箭头 |
-| 匹配方向来袭 | 持续格挡返回原生武器格挡 |
+| 上格挡对正面、侧面或后向下劈 | 只要 RMB 请求仍有效、未挥刀且不在原版受击反应中，三种方位都返回原生武器格挡；不读取角色上一次移动朝向 | `directional_guard_block dir=1/7 ... overhead_arc_bypass=1`，不得进入 `hit_on_me` |
+| 其他匹配方向来袭 | 持续格挡且满足既有前方弧时返回原生武器格挡 | `directional_guard_block ... overhead_arc_bypass=0` |
 | 不匹配方向来袭 | 不得错误判为武器格挡 |
 | 姿势入场期间的匹配来袭 | 只要有效 RMB 请求仍按住且方向匹配，即使日志为 `directional_guard_block ... pose=0` 也应走原版声音、火花和经验分支；不等待固定毫秒窗 |
-| 连续多段来袭 | 每次命中都按当时仍有效的 RMB 请求、前方资格和方向匹配独立判定；不依赖额外固定时间窗 |
+| 连续多段来袭 | 每次命中都按当时仍有效的 RMB 请求和方向匹配独立判定；上挡下劈不查前方资格，其他方向仍查；不依赖额外固定时间窗 |
 | 挥刀命中前右键 | 不取消攻击，不产生假命中 |
 | 挥刀命中后右键 | 取消后摇并进入方向格挡 |
 | 真实命中红 X | 每次 `_getHit` 只触发一次；四段位置不变，笔画较 v83 略粗、初始有轻微透明度并在约 1000 ms 内淡出，不遮住准星目标 |
