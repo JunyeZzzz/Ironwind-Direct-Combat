@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "122"
+#define IRONWIND_VERSION "123"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -753,9 +753,8 @@ static volatile ULONGLONG s_rmbAimPressMs      = 0;      // poll thread: RMB pre
 static ULONGLONG         s_rmbAimSeenMs        = 0;
 static bool              s_aimClicked          = false;  // the current focus came from a click
 static bool              s_settingAimName      = true;   // [Settings] AimNameTag
-static bool              s_settingFriendlyHealth = true; // [Settings] ShowFriendlyHealth
-// Aim-focus marker (user 2026-09-22): the enemy's NAME above their head, in the
-// game's own small text skin with a shadow - like the vanilla name tag.
+// Observation marker: the NPC's name above their head, in the game's own small
+// text skin with a shadow, like the vanilla name tag.
 static MyGUI::TextBox*   s_nameTag             = nullptr;
 static bool              s_nameTagTried        = false;
 static Character*        s_nameTagFor          = nullptr;// identity: whose name the caption holds
@@ -1639,10 +1638,8 @@ static void writeDefaultConfig(const char* path)
         "AimConeDeg             = 35\r\n"
         "; Aim focus with a free cursor: an enemy this many pixels from the cursor counts as pointed at.\r\n"
         "AimHoverPx             = 70\r\n"
-        "; Aim focus marker: the name of the enemy you are pointing at, above their head.\r\n"
+        "; Observation marker: the name and health of the NPC directly under the crosshair.\r\n"
         "AimNameTag             = true\r\n"
-        "; Also show the same detailed panel when the crosshair is directly over an ally or squad member.\r\n"
-        "ShowFriendlyHealth     = true\r\n"
         "; Detailed log for bug reports (writes every combat/movement event).\r\n"
         "VerboseLog             = false\r\n"
         "; V-mode third-person camera: distance / height / shoulder offset.\r\n"
@@ -1971,8 +1968,6 @@ static void loadKeybinds()
             s_blockCooldownMs = bc;
             GetPrivateProfileStringA("Settings", "AimNameTag", "true", pbuf, sizeof(pbuf), path);
             s_settingAimName = parseBool(pbuf, true);
-            GetPrivateProfileStringA("Settings", "ShowFriendlyHealth", "true", pbuf, sizeof(pbuf), path);
-            s_settingFriendlyHealth = parseBool(pbuf, true);
             GetPrivateProfileStringA("Settings", "AimConeDeg", "35", pbuf, sizeof(pbuf), path);
             float ac = (float)atof(pbuf);
             if (ac < 5.0f) ac = 5.0f;      if (ac > 90.0f) ac = 90.0f;
@@ -2106,12 +2101,8 @@ static DcOptRow s_dcOptRows[] =
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - ON-SCREEN CUES", NULL },
     { "Settings", "AimNameTag", &s_settingAimName, NULL, 0, 0, 0, 1,
-      "Show target's name and health",
-      "The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head." },
-    { "Settings", "ShowFriendlyHealth", &s_settingFriendlyHealth, NULL, 0, 0, 0, 1,
-      "Show friendly and squad health",
-      "Also shows the full detailed panel when the crosshair is directly over an allied NPC or one of your squad members." },
-
+      "Show NPC name and health",
+      "The NPC directly under the crosshair gets their name and full two-row, eight-part health panel." },
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "THIRD PERSON CAMERA (V)", NULL },
     { "Settings", "OtsHeight", NULL, &s_otsCamHeight, -5.0f, 28.0f, 1, 18.0f,
       "Camera focus height",
@@ -5910,55 +5901,22 @@ static void manualAttackHudUpdate()
 static bool focusTargetLoaded(Character* t);   // fwd decl (manual combat, below)
 static bool focusTargetValid(Character* t);    // fwd decl (manual combat, below)
 static bool manualVPlayerTeamMember(Character* target);
-static Character* focusFriendlyTargetUnderCrosshair();
+static Character* focusNpcTargetUnderCrosshair();
 
-// Whose name + health bars to show: the aim focus, else (manual combat, in a
-// fight) whoever the character's AI is fighting - user 2026-10-08: the bars
-// appeared only while pointing at an enemy.
-// Build 80 (test 2026-10-08: no bars until hovered): the build-79 version gated
-// on isInCombatMode + currentTarget only, and neither is reliably set while the
-// manual-combat AI is held back - use the same chain the Attack key resolves a
-// foe with (AI target, biggest threat, attack target), no combat-flag gate,
-// within twice the aim range.
-static Character* s_barsFoeLogged = nullptr;
-static Character* s_barsFriendlyLogged = nullptr;
+// Observation UI deliberately has its own read-only target. Every relationship
+// uses the same strict projected-body overlap test; combat focus, AI targets and
+// interaction candidates are neither consumed nor mutated here.
+static Character* s_barsObservedLogged = nullptr;
 static Character* focusDisplayTarget()
 {
-    Character* friendly = s_settingFriendlyHealth
-        ? focusFriendlyTargetUnderCrosshair() : nullptr;
-    if (friendly != s_barsFriendlyLogged)
+    Character* observed = focusNpcTargetUnderCrosshair();
+    if (observed != s_barsObservedLogged)
     {
-        s_barsFriendlyLogged = friendly;
-        VerbLog(friendly ? "[WASDCombat] bars_friendly_target set"
-                         : "[WASDCombat] bars_friendly_target none");
+        s_barsObservedLogged = observed;
+        VerbLog(observed ? "[WASDCombat] bars_observed_target set"
+                         : "[WASDCombat] bars_observed_target none");
     }
-    if (friendly) return friendly;
-    if (s_lockTarget && focusTargetLoaded(s_lockTarget)) return s_lockTarget;
-    Character* found = nullptr;
-    if (s_manualAttackOn && s_freeMoveAnchor && s_freeMoveAnchor->movement)
-    {
-        CombatClass* cc = s_freeMoveAnchor->getCombatClass();
-        if (cc)
-        {
-            Character* cand[3] = { cc->currentTarget, cc->getBiggestThreat(cc->threats, 0.0f),
-                                   cc->_getAttackTarget().getCharacter() };
-            const float lim = s_aimRange * 2.0f;
-            for (int i = 0; i < 3 && !found; ++i)
-            {
-                Character* t = cand[i];
-                if (!t || !focusTargetValid(t) || !t->movement) continue;
-                float dx = t->movement->pos.x - s_freeMoveAnchor->movement->pos.x;
-                float dz = t->movement->pos.z - s_freeMoveAnchor->movement->pos.z;
-                if (dx * dx + dz * dz <= lim * lim) found = t;
-            }
-        }
-    }
-    if (found != s_barsFoeLogged)
-    {
-        s_barsFoeLogged = found;
-        VerbLog(found ? "[WASDCombat] bars_auto_foe set" : "[WASDCombat] bars_auto_foe none");
-    }
-    return found;
+    return observed;
 }
 
 
@@ -5993,10 +5951,10 @@ static bool focusBonePos(Character* t, const char* bone, float fallbackUp, Ogre:
     return true;
 }
 
-// Optional observation-only friendly panel. It never assigns combat focus or
-// an interaction target: the crosshair must directly overlap the projected
-// body, and only one closest allied/squad character can win.
-static Character* focusFriendlyTargetUnderCrosshair()
+// Unified observation-only panel for every NPC relationship. It never assigns
+// combat focus or an interaction target: the crosshair must directly overlap
+// the projected body, and only one closest character can win.
+static Character* focusNpcTargetUnderCrosshair()
 {
     Character* me = s_freeMoveAnchor;
     if (!me || !me->movement || !s_gwFrame || !ou || !ou->player
@@ -6015,8 +5973,6 @@ static Character* focusFriendlyTargetUnderCrosshair()
     {
         Character* c = *it;
         if (!c || c == me || !c->movement) continue;
-        bool friendly = manualVPlayerTeamMember(c) || c->isAlly(me, true);
-        if (!friendly || c->isEnemy(me, true) || me->isEnemy(c, true)) continue;
         Ogre::Vector3 delta = c->movement->pos - mp;
         delta.y = 0.0f;
         float d2 = delta.squaredLength();
@@ -6253,7 +6209,7 @@ static bool focusNameTagCreate()
                         0, 0, 220, 18, MyGUI::Align::Default, "Top", "dc_aim_name_tag");
         if (!s_nameTag) return false;
         s_nameTag->setTextAlign(MyGUI::Align::Center);
-        s_nameTag->setTextColour(MyGUI::Colour(0.92f, 0.22f, 0.22f));   // enemy name in red (user 2026-09-29)
+        s_nameTag->setTextColour(MyGUI::Colour::White); // relation colour is assigned per observed NPC
         s_nameTag->setTextShadow(true);
         s_nameTag->setTextShadowColour(MyGUI::Colour::Black);
         s_nameTag->setNeedMouseFocus(false);
@@ -6398,9 +6354,9 @@ static void incomingAttackImpact(Character* who)
         }
 }
 
-// Per frame (camera hook, post-orig): the aim focus's name above their head
-// and compact native-colour health bars. Incoming attacks are only expired here;
-// no hand/weapon marker is rendered.
+// Per frame (camera hook, post-orig): the NPC directly under the crosshair gets
+// a relation-coloured name and compact native-colour health bars. Incoming
+// attacks are only expired here; no hand/weapon marker is rendered.
 static void focusMarkersUpdate(CameraClass* thisptr)
 {
     bool live = s_mode == MODE_FREE_MOVE && !s_loadGuardActive && !s_dcShutdownInProgress
@@ -6409,9 +6365,9 @@ static void focusMarkersUpdate(CameraClass* thisptr)
     ULONGLONG now = GetTickCount64();
     int sx, sy;
 
-    // aim focus (or the AI's current foe) name tag
+    // Read-only observed-NPC name tag and anatomy panel.
     bool tagOn = false;
-    Character* tagTgt = live ? focusDisplayTarget() : nullptr;
+    Character* tagTgt = (live && s_settingAimName) ? focusDisplayTarget() : nullptr;
     if (live && s_settingAimName && tagTgt
         && (s_nameTag || focusNameTagCreate()))
     {
@@ -6425,11 +6381,21 @@ static void focusMarkersUpdate(CameraClass* thisptr)
                 try { s_nameTag->setCaption(tagTgt->getName()); }
                 catch (...) { s_nameTag->setCaption("?"); }
             }
+            // Re-evaluate every frame: a neutral can become hostile while the
+            // crosshair remains on the same character after a confirmed hit.
+            const bool enemy = tagTgt->isEnemy(s_freeMoveAnchor, true)
+                            || s_freeMoveAnchor->isEnemy(tagTgt, true);
+            const bool friendly = !enemy && (manualVPlayerTeamMember(tagTgt)
+                                           || tagTgt->isAlly(s_freeMoveAnchor, true));
+            s_nameTag->setTextColour(enemy
+                ? MyGUI::Colour(0.92f, 0.22f, 0.22f)
+                : (friendly ? MyGUI::Colour(0.30f, 0.95f, 0.38f)
+                            : MyGUI::Colour(1.00f, 0.78f, 0.18f)));
             const int W = 220, H = 18;
             int headY = sy;
             sy -= HB_RAISE;                                       // lift the whole group
             {
-                // vanilla speech text up over this enemy? step the group above it
+                // Vanilla speech text above this NPC? Step the group above it.
                 int bubbleTop = bubbleTopNear(sx, headY);
                 int groupBottom = sy + 1 + (HB_ROWS - 1) * HB_ROW_H + HB_LH;
                 if (bubbleTop >= 0 && groupBottom + 4 > bubbleTop)

@@ -145,7 +145,7 @@
 | 边缘绕圈 poke | 绿色方向在任意距离释放都应选择 `attack_direction_native_random` 并挥刀；远处目标允许 `contacts=0`，靠近后由原版产生 hit_candidate/blocked/dodged。未精确捕获但附近有敌人时应见 `attack_incidental_carrier` 或 `attack_incidental_carrier_anywhere`；不得出现目标距离拒绝、自动转向或 AI 自动靠近 |
 | 出手后切换准星目标 | 姓名/血条可以切换到新的 UI 焦点；在途 AttackState 不动态换载体。刀路实际碰到新角色时仍可由原版产生 `_getHit`，未碰到则正常落空 |
 | 中文／英文原版医疗面板 | 姓名下方只出现两行紧凑细长条：上排“血／头／胸／腹”，下排“左臂／右臂／左腿／右腿”。单条约 `38×5 px`，应明显长于 v118 的 `22×6 px` 色块，同时两行总高度更小、标签与条之间无多余空隙。有机健康必须为原版绿，骨人全身及机械义肢健康段为原版蓝；制造钝伤、未处理切割伤、包扎／机械修理、夹板和机械磨损，分别确认灰、红、黄、白覆盖和原版磨损段来自同一条内的真实比例，而不是整条按阈值换色 | 首次聚焦记录 `aim_health_part ... flesh=... stun=... bandage=... rig=... wear=... max=... robot=...`；28/29/30/31/32/100/101 ID 应解析正确。切换语言不影响识别，缺失部位不显示伪造空条，不得读取本地化显示名、合成总 HP 或重新引入健康阈值色 |
-| 友军／队友详细面板 | 开关关闭时维持敌人焦点行为；开启后准星直接覆盖友军 NPC 或玩家队友身体才显示其姓名与同一套两行八部位面板。移开准星立即回到敌人焦点或隐藏。全场始终只有一套面板，不生成多人轻量条 | 进入／离开覆盖时出现 `bars_friendly_target set/none`；不得改变锁敌、E 交互候选、攻击目标或敌对关系 |
+| 全关系 NPC 精确观察面板 | 依次用准星直接覆盖敌对、中立、友军、玩家队友及倒地角色的身体，均显示姓名与同一套两行八部位面板；重叠时只显示距离最近者，移开准星立即隐藏。姓名应为敌对红、友方绿、中立黄，医疗条保持原版伤势颜色。关闭“显示 NPC 名称与生命状态”后全部隐藏 | 进入／离开覆盖时出现 `bars_observed_target set/none`；全场始终只有一套面板，不得因已有锁敌／AI 目标而在准星移开后继续显示，也不得改变锁敌、E 交互候选、攻击目标、CombatClass 或敌对关系 |
 | 原版 CHOP 完整性 | `attack_direct_native started=1` 后应以 `attack_native_finish_transition` 正常结束，或紧邻真实 `hit_on_me` 并以 `reason=hit_reaction*` 收权。若见 `attack_native_state_recovered`，必须至多一次、带 `source=combat_track/main_lifecycle` 且 progress<0.98，随后仍由原版完成；不得按固定时间重播。`attack_native_early_exit` 需保留为失败证据 |
 | impact 后视觉收招 | `currentTechniqueHasFinished` 后先记录 `attack_native_impact_finished progress<0.98`；此后只允许 `attack_native_recovery_clip`，不得新增 verdict/gethit。最终必须以 `attack_native_finish_transition source=clip_finished` 和 `attack_done` 结束，不能永久停在 CHOP |
 | impact 前按住右键 | 只记录一次 `attack_guard_wait_for_impact`，攻击的原版命中阶段继续；impact 后才允许开始交接 |
@@ -258,7 +258,7 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 空处或红名 | 白准星 |
 | 有玩家对话包 | 自动候选的准星可换成对话气泡；按 E 打开其原版菜单后选择对话 |
 | Esc／点击外部 | 关闭菜单 |
-| 设置页 | 只显示 11 个铁风按键和 12 个常用设置；保留准星目标夹角、友军／队友状态显示、越肩高度、第一人称眼位高低／前后。不得重复原版移动档位，也不得显示攻击／格挡毫秒、敌人武器发光、实验颜色或动作眼位等已删除／INI-only 参数；中文无乱码、无截断，“恢复本页默认设置”不覆盖高级 INI 值 |
+| 设置页 | 只显示 11 个铁风按键和 11 个常用设置；保留准星目标夹角、统一 NPC 姓名／生命状态、越肩高度、第一人称眼位高低／前后。不得重新出现独立友军状态开关，不得重复原版移动档位，也不得显示攻击／格挡毫秒、敌人武器发光、实验颜色或动作眼位等已删除／INI-only 参数；中文无乱码、无截断，“恢复本页默认设置”不覆盖高级 INI 值 |
 
 ### H. 读档与异常状态
 

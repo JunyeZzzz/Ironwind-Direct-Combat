@@ -296,8 +296,8 @@ function Invoke-IwCheck {
     $visibleSettingCount = [regex]::Matches(
         $visibleOptions, '\{\s*"(?:Settings|FirstPerson)"\s*,'
     ).Count
-    if ($visibleSettingCount -gt 12) {
-        throw "Ironwind options page regrew beyond the v122 compact limit: $visibleSettingCount visible settings."
+    if ($visibleSettingCount -gt 11) {
+        throw "Ironwind options page regrew beyond the v123 compact limit: $visibleSettingCount visible settings."
     }
     if ($defaultIniText -notmatch '(?m)^\s*AiBlocksInManual\s*=\s*false\s*$') {
         throw 'Automatic block must ship disabled so the initial guard mode is manual directional.'
@@ -305,11 +305,13 @@ function Invoke-IwCheck {
     if ($visibleOptions -notmatch '\{\s*"Settings"\s*,\s*"AiBlocksInManual"[^\r\n]*,\s*0\s*,') {
         throw 'The settings-page reset default for automatic block must remain off.'
     }
-    if ($defaultIniText -notmatch '(?m)^\s*ShowFriendlyHealth\s*=\s*true\s*$') {
-        throw 'Friendly/squad detailed health display must ship enabled.'
+    if ($defaultIniText -match '(?m)^\s*ShowFriendlyHealth\s*=') {
+        throw 'Removed relationship-specific health-display setting returned.'
     }
-    if ($visibleOptions -notmatch '\{\s*"Settings"\s*,\s*"ShowFriendlyHealth"[^\r\n]*,\s*1\s*,') {
-        throw 'The settings-page reset default for friendly/squad health must remain on.'
+    foreach ($symbol in @('s_settingFriendlyHealth', 'focusFriendlyTargetUnderCrosshair')) {
+        if ($sourceText -match [regex]::Escape($symbol)) {
+            throw "Removed relationship-specific health-display path returned: $symbol"
+        }
     }
     foreach ($symbol in @('s_settingGlint', 's_glint', 's_glowTex', 'focusGlowTexCreate',
                            'focusGlowBox', 'focusGlintCreate', 'glintTier', 'dc_glow_tex',
@@ -324,6 +326,12 @@ function Invoke-IwCheck {
         }
     }
     $settingsTsvText = Get-Content -LiteralPath (Join-Path $projectDir 'runtime\Settings.zh-CN.tsv') -Raw
+    foreach ($text in @('Show friendly and squad health',
+                         'Also shows the full detailed panel when the crosshair')) {
+        if ($settingsTsvText -match [regex]::Escape($text)) {
+            throw "Removed relationship-specific health-display translation returned: $text"
+        }
+    }
     foreach ($text in @('Glint on weapons swinging at you', 'Glint peaks after swing start',
                          'Glint size', 'Colour glints by defence')) {
         if ($settingsTsvText -match [regex]::Escape($text)) {
