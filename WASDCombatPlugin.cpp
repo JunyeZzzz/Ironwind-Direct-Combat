@@ -48,7 +48,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "129"
+#define IRONWIND_VERSION "130"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -795,17 +795,15 @@ static MyGUI::Widget*    s_hbLayer[HB_COUNT][HBL_COUNT] = {};
 static bool              s_hbTried             = false;
 static bool              s_hbNamesLogged       = false;  // DIAG: the body-part names seen, once
 static const int         HB_COLS = 4, HB_ROWS = 2;
-// Readable but compact anatomy strips.  Chinese two-character labels receive
-// a real 12 px line box, while the bar itself is larger in both dimensions.
-// Labels and bars keep their v128 readable sizes. The label box is only as
-// wide as two 12 px Chinese glyphs need, touches its bar directly, and cells
-// touch each other; compactness comes from spacing, never smaller content.
-static const int         HB_LABEL_W = 25, HB_BAR_W = 50, HB_CELL_W = 75;
-static const int         HB_H = 8, HB_GAP = 0, HB_ROW_H = 13;
+// Readable but compact anatomy strips. Chinese two-character labels use a
+// 14 px font and touch the larger bar directly. Cells still touch each other;
+// compactness comes from zero spacing, never undersized text or bars.
+static const int         HB_LABEL_W = 29, HB_BAR_W = 56, HB_CELL_W = 85;
+static const int         HB_H = 10, HB_GAP = 0, HB_ROW_H = 15;
 static const int         HB_PANEL_W = HB_COLS * HB_CELL_W + (HB_COLS - 1) * HB_GAP;
 static MyGUI::TextBox*   s_hbLabel[HB_COUNT]   = {};
-static const int         HB_LH = 13;
-static const int         HB_RAISE = 38;                   // larger rows stay close to, but clear of, the head
+static const int         HB_LH = 15;
+static const int         HB_RAISE = 42;                   // larger rows stay close to, but clear of, the head
 // Vanilla SPEECH TEXT (user 2026-09-30): while the tagged enemy has a speech
 // bubble up, the name+bars group steps ABOVE it by the bubble's real on-screen
 // height and drops back when it is gone.  Build 66: bubbles are found by
@@ -6139,7 +6137,7 @@ static bool focusHealthBarsCreate()
             s_hbLabel[i]->setTextColour(MyGUI::Colour(0.78f, 0.78f, 0.76f));
             s_hbLabel[i]->setTextShadow(true);
             s_hbLabel[i]->setTextShadowColour(MyGUI::Colour::Black);
-            try { s_hbLabel[i]->setFontHeight(12); } catch (...) {}
+            try { s_hbLabel[i]->setFontHeight(14); } catch (...) {}
             s_hbLabel[i]->setNeedMouseFocus(false); s_hbLabel[i]->setVisible(false);
         }
         DebugLog("[WASDCombat] aim_health_bars_created");
