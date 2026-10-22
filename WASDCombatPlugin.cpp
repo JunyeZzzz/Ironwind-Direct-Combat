@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "124"
+#define IRONWIND_VERSION "125"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -562,11 +562,12 @@ static bool              s_interactionMenuByE = false;
 static bool              s_interactionOpenPending = false;
 static hand              s_interactionTargetHandle;
 static hand              s_interactionPendingHandle;
-static ULONGLONG         s_interactionNextScanMs = 0;
 static bool              s_interactionPauseOwned = false;
 static ULONGLONG         s_interactionResumeAfterMs = 0;
+static MyGUI::Widget*    s_interactionHintBg = nullptr;
 static MyGUI::TextBox*   s_interactionHint = nullptr;
 static bool              s_interactionHintTried = false;
+static bool              s_interactionHintWasVisible = false;
 
 // Defence mode inside manual combat. false = directional player guard;
 // true = original Kenshi AI owns both block timing and direction. The two
@@ -921,7 +922,6 @@ static void manualInteractionClearRuntime(bool forgetAutoTarget)
     s_interactionMenuByE = false;
     s_interactionOpenPending = false;
     s_interactionPendingHandle.setNull();
-    s_interactionNextScanMs = 0;
     s_interactionPauseOwned = false;
     s_interactionResumeAfterMs = 0;
     if (forgetAutoTarget)
@@ -6232,22 +6232,30 @@ static bool focusNameTagCreate()
 
 static bool manualInteractionHintCreate()
 {
-    if (s_interactionHint || s_interactionHintTried) return s_interactionHint != nullptr;
+    if ((s_interactionHint && s_interactionHintBg) || s_interactionHintTried)
+        return s_interactionHint && s_interactionHintBg;
     s_interactionHintTried = true;
     try
     {
         MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
         if (!g) return false;
+        s_interactionHintBg = g->createWidget<MyGUI::Widget>(
+            "WhiteSkin", 0, 0, 32, 28,
+            MyGUI::Align::Default, "Top", "ironwind_interaction_hint_bg");
         s_interactionHint = g->createWidget<MyGUI::TextBox>(
-            "Kenshi_TextboxStandardText_Small", 0, 0, 30, 24,
+            "Kenshi_TextboxStandardText_Small", 0, 0, 32, 28,
             MyGUI::Align::Default, "Top", "ironwind_interaction_hint");
-        if (!s_interactionHint) return false;
+        if (!s_interactionHint || !s_interactionHintBg) return false;
+        s_interactionHintBg->setColour(MyGUI::Colour(0.04f, 0.04f, 0.035f));
+        s_interactionHintBg->setAlpha(0.78f);
+        s_interactionHintBg->setNeedMouseFocus(false);
+        s_interactionHintBg->setVisible(false);
         s_interactionHint->setCaption("E");
         s_interactionHint->setTextAlign(MyGUI::Align::Center | MyGUI::Align::VCenter);
         s_interactionHint->setTextColour(MyGUI::Colour(1.00f, 0.84f, 0.22f));
         s_interactionHint->setTextShadow(true);
         s_interactionHint->setTextShadowColour(MyGUI::Colour::Black);
-        try { s_interactionHint->setFontHeight(18); } catch (...) {}
+        try { s_interactionHint->setFontHeight(20); } catch (...) {}
         s_interactionHint->setNeedMouseFocus(false);
         s_interactionHint->setVisible(false);
         DebugLog("[Ironwind] interaction_hint_created");
@@ -6255,6 +6263,7 @@ static bool manualInteractionHintCreate()
     }
     catch (...)
     {
+        s_interactionHintBg = nullptr;
         s_interactionHint = nullptr;
         DebugLog("[Ironwind] interaction_hint_create_failed");
         return false;
@@ -6278,8 +6287,7 @@ static void manualInteractionHintUpdate(Ogre::Camera* cam, bool live)
         if (target->getDataType() == CHARACTER)
         {
             Character* c = static_cast<Character*>(target);
-            show = focusBonePos(c, "Bip01 Head", 18.0f, marker);
-            if (show) marker += Ogre::Vector3(0.0f, 4.0f, 0.0f);
+            show = focusBonePos(c, "Bip01 Spine1", 11.0f, marker);
         }
         else if (target->getDataType() == BUILDING)
         {
@@ -6296,11 +6304,32 @@ static void manualInteractionHintUpdate(Ogre::Camera* cam, bool live)
         {
             MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
             show = sx >= 0 && sy >= 0 && sx < view.width && sy < view.height;
-            if (show) s_interactionHint->setCoord(sx - 15, sy - 12, 30, 24);
+            if (show)
+            {
+                int x = sx + 26, y = sy - 14;
+                if (x + 32 >= view.width) x = sx - 58;
+                if (x < 0) x = 0;
+                if (y < 0) y = 0;
+                if (y + 28 >= view.height) y = view.height - 29;
+                s_interactionHintBg->setCoord(x, y, 32, 28);
+                s_interactionHint->setCoord(x, y, 32, 28);
+                if (!s_interactionHintWasVisible)
+                {
+                    char b[128];
+                    sprintf_s(b, sizeof(b), "[Ironwind] interaction_hint_visible type=%d x=%d y=%d",
+                              (int)target->getDataType(), x, y);
+                    VerbLog(b);
+                }
+            }
         }
     }
+    if (s_interactionHintBg && s_interactionHintBg->getVisible() != show)
+        s_interactionHintBg->setVisible(show);
     if (s_interactionHint && s_interactionHint->getVisible() != show)
         s_interactionHint->setVisible(show);
+    if (!show && s_interactionHintWasVisible)
+        VerbLog("[Ironwind] interaction_hint_hidden");
+    s_interactionHintWasVisible = show;
 }
 // Character::attackingYou - the victim is told at swing start.  Track the
 // attacker (identity only) when WE are the victim.
@@ -10023,6 +10052,42 @@ static bool manualInteractionRootValid(RootObject* target, Character* me)
     return type == ITEM;
 }
 
+static bool manualInteractionAabbScreenMiss(Ogre::Camera* cam, const Ogre::Aabb& box,
+                                            float aimX, float aimY, float& missOut)
+{
+    const Ogre::Vector3& c = box.mCenter;
+    const Ogre::Vector3& h = box.mHalfSize;
+    if (fabsf(c.x) >= 1.0e7f || fabsf(c.y) >= 1.0e7f || fabsf(c.z) >= 1.0e7f
+        || fabsf(h.x) >= 1.0e5f || fabsf(h.y) >= 1.0e5f || fabsf(h.z) >= 1.0e5f)
+        return false;
+    Ogre::Vector3 points[9] = {
+        c,
+        c + Ogre::Vector3(-h.x, -h.y, -h.z), c + Ogre::Vector3(-h.x, -h.y,  h.z),
+        c + Ogre::Vector3(-h.x,  h.y, -h.z), c + Ogre::Vector3(-h.x,  h.y,  h.z),
+        c + Ogre::Vector3( h.x, -h.y, -h.z), c + Ogre::Vector3( h.x, -h.y,  h.z),
+        c + Ogre::Vector3( h.x,  h.y, -h.z), c + Ogre::Vector3( h.x,  h.y,  h.z)
+    };
+    float left = 1.0e9f, right = -1.0e9f, top = 1.0e9f, bottom = -1.0e9f;
+    int projected = 0;
+    for (int i = 0; i < 9; ++i)
+    {
+        int sx, sy;
+        if (!focusProject(cam, points[i], 0.0f, sx, sy)) continue;
+        if (sx < left) left = (float)sx;
+        if (sx > right) right = (float)sx;
+        if (sy < top) top = (float)sy;
+        if (sy > bottom) bottom = (float)sy;
+        ++projected;
+    }
+    if (!projected) return false;
+    const float halo = 18.0f;
+    left -= halo; right += halo; top -= halo; bottom += halo;
+    float dx = aimX < left ? left - aimX : (aimX > right ? aimX - right : 0.0f);
+    float dy = aimY < top ? top - aimY : (aimY > bottom ? aimY - bottom : 0.0f);
+    missOut = dx + dy;
+    return dx <= 24.0f && dy <= 24.0f;
+}
+
 static RootObject* manualInteractionPick(Character* me)
 {
     s_interactionPickSeen = 0;
@@ -10036,92 +10101,46 @@ static RootObject* manualInteractionPick(Character* me)
     if (view.width <= 0 || view.height <= 0) return nullptr;
     const float aimX = view.width * 0.5f, aimY = view.height * 0.5f;
     const Ogre::Vector3 mp = me->movement->pos;
-    const float maxR2 = 40.0f * 40.0f;
+    const float maxR2 = 30.0f * 30.0f;
     RootObject* best = nullptr;
     float bestScore = 1e9f;
-    auto& chars = s_gwFrame->getCharacterUpdateList();
-    for (auto it = chars.begin(); it != chars.end(); ++it)
+
+    // Character interaction uses the exact same projected-body overlap as the
+    // visible name/health panel.  Therefore a person can never receive E merely
+    // for being closer while standing hundreds of pixels away from the reticle.
+    Character* observed = focusNpcTargetUnderCrosshair();
+    if (manualInteractionRootValid(observed, me))
     {
-        Character* c = *it;
-        if (!c || c == me || !c->movement) continue;
-        if (c->isEnemy(me, true) && !c->isDead() && c->getProneState() != PS_KO)
-            continue; // a live hostile remains a combat target, not an E prompt
-        Ogre::Vector3 delta = c->movement->pos - mp;
+        Ogre::Vector3 delta = observed->movement->pos - mp;
         delta.y = 0.0f;
         float d2 = delta.squaredLength();
-        if (d2 >= maxR2) continue;
-        Ogre::Vector3 head, chest, hips;
-        int hx, hy, cx, cy, px, py, feetX, feetY;
-        if (!focusBonePos(c, "Bip01 Head", 18.0f, head)
-            || !focusBonePos(c, "Bip01 Spine1", 11.0f, chest)
-            || !focusBonePos(c, "Bip01 Pelvis", 5.0f, hips)) continue;
-        bool headOk = focusProject(cam, head, 0.0f, hx, hy);
-        bool chestOk = focusProject(cam, chest, 0.0f, cx, cy);
-        bool hipsOk = focusProject(cam, hips, 0.0f, px, py);
-        bool feetOk = focusProject(cam, c->movement->pos + Ogre::Vector3(0.0f, 1.0f, 0.0f),
-                                   0.0f, feetX, feetY);
-        if (!chestOk && !hipsOk && !headOk) continue;
-        ++s_interactionPickSeen;
-        int top = chestOk ? cy : (hipsOk ? py : hy);
-        int bottom = top;
-        if (headOk && hy < top) top = hy;
-        if (hipsOk && py < top) top = py;
-        if (feetOk && feetY < top) top = feetY;
-        if (headOk && hy > bottom) bottom = hy;
-        if (hipsOk && py > bottom) bottom = py;
-        if (feetOk && feetY > bottom) bottom = feetY;
-        float upper = (float)top - 28.0f;
-        float lower = (float)bottom + 32.0f;
-        float halfWidth = (lower - upper) * 0.16f + 8.0f;
-        if (halfWidth < 40.0f) halfWidth = 40.0f;
-        if (halfWidth > 90.0f) halfWidth = 90.0f;
-        float centerX = chestOk ? (float)cx : (hipsOk ? (float)px : (float)hx);
-        if (chestOk && hipsOk) centerX = (cx + px) * 0.5f;
-        if (hipsOk && feetOk && aimY > py && feetY != py)
+        if (d2 < maxR2)
         {
-            float t = (aimY - py) / (float)(feetY - py);
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            centerX = px + (feetX - px) * t;
-        }
-        float missX = fabsf(aimX - centerX) - halfWidth;
-        float missY = aimY < upper ? upper - aimY : (aimY > lower ? aimY - lower : 0.0f);
-        if (missX < 0.0f) missX = 0.0f;
-        float miss = missX + missY;
-        if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
-        {
-            s_interactionPickNearestPx = miss;
-        }
-        // Close proximity provides the selection; the broad view gate only
-        // prevents an NPC behind the camera or at the extreme edge stealing E.
-        if (missX > 280.0f || missY > 240.0f)
-            continue;
-        float score = sqrtf(d2) * 0.20f + miss * 0.012f
-                    + fabsf(aimX - centerX) * 0.002f;
-        if (s_interactionTargetHandle == c) score -= 1.25f; // stable until another target is clearly better
-        if (score < bestScore)
-        {
-            bestScore = score;
-            best = c;
+            ++s_interactionPickSeen;
+            s_interactionPickNearestPx = 0.0f;
+            bestScore = sqrtf(d2) * 0.08f;
+            best = observed;
             s_interactionPickSelectedDist = sqrtf(d2);
         }
     }
+    if (best) return best;
 
-    // Exact native mouse target wins a close contest.  This keeps thin doors,
-    // loose items and other awkward shapes faithful to Kenshi's own picking.
+    // A loose item has no broad fallback scan.  Accept it only when Kenshi's
+    // native picker already resolved that exact item very near the crosshair.
     RootObject* nativeTarget = ou->player->mouseRightTargetSet
         ? ou->player->mouseRightTarget : nullptr;
-    if (manualInteractionRootValid(nativeTarget, me))
+    if (manualInteractionRootValid(nativeTarget, me)
+        && nativeTarget->getDataType() == ITEM)
     {
         Ogre::Vector3 p = nativeTarget->getPosition();
         Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
         float d2 = delta.squaredLength();
         int nx, ny;
-        if (d2 < maxR2 && focusProject(cam, p + Ogre::Vector3(0.0f, 2.0f, 0.0f), 0.0f, nx, ny)
-            && fabsf(nx - aimX) <= 160.0f && fabsf(ny - aimY) <= 140.0f)
+        if (d2 < maxR2 && focusProject(cam, p + Ogre::Vector3(0.0f, 1.0f, 0.0f), 0.0f, nx, ny)
+            && fabsf(nx - aimX) <= 45.0f && fabsf(ny - aimY) <= 45.0f)
         {
             float miss = fabsf(nx - aimX) + fabsf(ny - aimY);
-            float score = sqrtf(d2) * 0.20f + miss * 0.010f - 3.0f;
+            float score = miss + sqrtf(d2) * 0.08f;
             if (score < bestScore)
             {
                 bestScore = score;
@@ -10130,11 +10149,12 @@ static RootObject* manualInteractionPick(Character* me)
             }
         }
     }
+    if (best) return best;
 
     // Buildings are not in the character update list.  Query only a small
     // local sphere while V mode is active, then select by projected AABB centre.
     s_interactionBuildingScratch.clear();
-    s_gwFrame->getObjectsWithinSphere(s_interactionBuildingScratch, mp, 40.0f,
+    s_gwFrame->getObjectsWithinSphere(s_interactionBuildingScratch, mp, 30.0f,
                                       BUILDING, 128, me);
     for (auto it = s_interactionBuildingScratch.begin();
          it != s_interactionBuildingScratch.end(); ++it)
@@ -10142,30 +10162,18 @@ static RootObject* manualInteractionPick(Character* me)
         RootObject* root = *it;
         Building* b = root ? static_cast<Building*>(root) : nullptr;
         if (!manualInteractionBuildingEligible(b)) continue;
-        Ogre::Vector3 p = b->getPosition();
-        Ogre::Vector3 marker = p + Ogre::Vector3(0.0f, 2.5f, 0.0f);
         const Ogre::Aabb& box = b->getAABB();
-        if (fabsf(box.mCenter.x) < 1.0e7f && fabsf(box.mCenter.y) < 1.0e7f
-            && fabsf(box.mCenter.z) < 1.0e7f
-            && (fabsf(box.mCenter.x) + fabsf(box.mCenter.y) + fabsf(box.mCenter.z)) > 0.01f)
-            marker = box.mCenter;
+        Ogre::Vector3 p = box.mCenter;
         Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
         float d2 = delta.squaredLength();
-        int bx, by;
-        if (d2 >= maxR2 || !focusProject(cam, marker, 0.0f, bx, by)) continue;
+        if (d2 >= maxR2) continue;
         ++s_interactionPickSeen;
-        float missX = fabsf(bx - aimX);
-        float missY = fabsf(by - aimY);
-        float miss = missX + missY;
+        float miss = 0.0f;
+        if (!manualInteractionAabbScreenMiss(cam, box, aimX, aimY, miss)) continue;
         if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
-        {
             s_interactionPickNearestPx = miss;
-        }
-        // A structure must actually sit near the reticle.  Character selection
-        // remains more forgiving because moving bodies are much thinner.
-        if (missX > 150.0f || missY > 135.0f) continue;
-        float score = sqrtf(d2) * 0.20f + miss * 0.018f;
-        if (s_interactionTargetHandle == b) score -= 1.25f;
+        float score = miss + sqrtf(d2) * 0.08f;
+        if (s_interactionTargetHandle == b) score -= 0.15f;
         if (score < bestScore)
         {
             bestScore = score;
@@ -10206,15 +10214,7 @@ static void manualInteractionTargetTick()
         && !s_dcShutdownInProgress && !s_loadGuardActive
         && !s_cameraUiOpen && !dcUiWantsCursor() && ou && ou->player)
     {
-        ULONGLONG now = GetTickCount64();
-        RootObject* t = nullptr;
-        if (now < s_interactionNextScanMs && s_interactionTargetHandle.isValid())
-            t = s_interactionTargetHandle.getRootObject();
-        else
-        {
-            s_interactionNextScanMs = now + 75;
-            t = manualInteractionPick(s_freeMoveAnchor);
-        }
+        RootObject* t = manualInteractionPick(s_freeMoveAnchor);
         if (manualInteractionRootValid(t, s_freeMoveAnchor))
         {
             selected = t;
@@ -10352,9 +10352,11 @@ static void manualInteractionActionTick()
         VerbLog("[Ironwind] interact_mode_denied reason=committed_action");
         return;
     }
-    // Key-down gets a fresh spatial pick so the 75 ms HUD scan throttle never
-    // makes E act on the target the player has already moved away from.
-    RootObject* target = manualInteractionPick(s_freeMoveAnchor);
+    // TargetTick ran immediately before this action in the same game frame.
+    // Use exactly the object whose E prompt the player saw; repicking here used
+    // to switch to a different, nearer character between the prompt and press.
+    RootObject* target = s_interactionTargetHandle.isValid()
+        ? s_interactionTargetHandle.getRootObject() : nullptr;
     if (!manualInteractionRootValid(target, s_freeMoveAnchor))
     {
         VerbLog("[Ironwind] interact_no_target");

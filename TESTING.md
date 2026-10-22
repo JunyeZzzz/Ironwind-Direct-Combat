@@ -244,9 +244,9 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 玩家主动暂停后开库存 | 插件不得擅自解除主动暂停 |
 | 搜刮／交易 | 窗口距离与关闭行为保持原版合理性 |
 | 战斗层短按或长按右键 | 无论目标和时长都只格挡；不得打开菜单或对话 |
-| 靠近并面向中立／友方角色 | 目标头部附近出现跟随位置的黄色 `E`；顶部战斗文字保持方向／格挡信息。距离更近者优先，视野边缘或 40 单位外目标不抢提示 | 目标变化时 `interact_target selected=1 type=1 distance=... miss_px=...` |
+| 准星覆盖 30 单位内的中立／友方角色身体 | 胸口侧边出现带深色底、跟随位置的黄色 `E`；顶部战斗文字保持方向／格挡信息。同屏更近但未被准星覆盖的人不得抢提示，30 单位外不得提示 | `interact_target selected=1 type=1 ... miss_px=0.0` 后出现 `interaction_hint_visible type=1 x=... y=...` |
 | 靠近活着的红名敌人 | 不显示 E 交互提示，不影响方向攻击；敌人 KO 或死亡后允许成为搜刮候选 |
-| 准星靠近门、床、工作台／炮台 | 对象 AABB 附近出现同样的黄色 `E`；普通墙体、装饰和无原版任务对象不提示 | `interact_target selected=1 type=0 ...`；不得扫描或生成虚构选项 |
+| 准星覆盖 30 单位内的门、床、工作台／炮台投影范围 | 对象中心侧边出现同样的深色底黄色 `E`；普通墙体、装饰和无原版任务对象不提示 | `interact_target selected=1 type=0 ...` 与 `interaction_hint_visible type=0 ...`；不得生成虚构选项 |
 | Kenshi 精确识别近距地面物品 | 允许显示 `E`；只有原版 `mouseRightTarget` 实际给出该物品时成立，不做全场物品扫描 | `interact_target selected=1 type=4 ...` |
 | 有候选时按 E | 只打开一次该目标的原版上下文菜单，菜单稳定停留且世界暂停、光标释放；V 模式不退出 | `interact_menu_requested ...` 后 `interact_menu_open visible=1 orders=... pause_owned=1`；不得在约一帧内自动执行默认项 |
 | 点击菜单中的对话／急救／搬运／搜刮／使用／开门等选项 | 由原版 MyGUI 回调执行；插件不得直接调用 `optionSelected`。普通世界任务选完后恢复时间、准星和战斗；若进入对话／库存／地图，暂停所有权交给原版 UI | 普通项为 `interact_menu_closed ...` 后 `interact_pause_released`；嵌套 UI 为 `interact_pause_transferred_to_native_ui`，随后原版任务按选项出现 |

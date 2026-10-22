@@ -297,7 +297,7 @@ function Invoke-IwCheck {
         $visibleOptions, '\{\s*"(?:Settings|FirstPerson)"\s*,'
     ).Count
     if ($visibleSettingCount -gt 11) {
-        throw "Ironwind options page regrew beyond the v124 compact limit: $visibleSettingCount visible settings."
+        throw "Ironwind options page regrew beyond the v125 compact limit: $visibleSettingCount visible settings."
     }
     if ($defaultIniText -notmatch '(?m)^\s*AiBlocksInManual\s*=\s*false\s*$') {
         throw 'Automatic block must ship disabled so the initial guard mode is manual directional.'
@@ -342,6 +342,7 @@ function Invoke-IwCheck {
         'static hand              s_interactionTargetHandle',
         'getObjectsWithinSphere(s_interactionBuildingScratch',
         '"ironwind_interaction_hint"',
+        '"ironwind_interaction_hint_bg"',
         'contextMenu.rightMouseActivated = true',
         'manualInteractionPauseTick',
         'interact_pause_released'
