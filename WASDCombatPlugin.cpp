@@ -49,7 +49,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "132"
+#define IRONWIND_VERSION "133"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -10097,18 +10097,16 @@ static void manualAttackAimCaptureTick()
 static int s_interactionPickSeen = 0;
 static float s_interactionPickNearestPx = -1.0f;
 static float s_interactionPickSelectedDist = -1.0f;
+static int s_interactionRayHitType = -1;
 static lektor<RootObject*> s_interactionBuildingScratch;
-static lektor<RootObject*> s_interactionItemScratch;
-static lektor<RootObject*> s_interactionWeaponScratch;
-static lektor<RootObject*> s_interactionArmourScratch;
 
 static bool manualInteractionBuildingEligible(Building* b)
 {
     if (!b || !b->isValid() || !b->getVisible() || b->isDestroyed()) return false;
     // `isFurniture()` alone is not interaction evidence: decorative furniture
-    // produced an E prompt but then an empty native menu. Storage, doors and
-    // furniture with a real cursor/default task remain eligible.
-    return b->isDoor() || b->getFunctionStuff() != nullptr
+    // produced an E prompt but then an empty native menu. Doors, buildings with
+    // a real Inventory, and objects with a cursor/default task remain eligible.
+    return b->isDoor() || b->getInventory() != nullptr
         || b->getMouseCursor() != DEFAULT_CURSOR
         || b->getDefaultTask() != NULL_TASK;
 }
@@ -10145,11 +10143,12 @@ static bool manualInteractionTryDirectBuilding(RootObject* target)
         return true;
     }
 
-    // StorageBuilding::getFunctionStuff() is the engine's virtual class probe.
-    // Use the same public GUI entry as vanilla; item transfer still belongs to
-    // the original Inventory/ownership/theft code. No artificial pause/menu is
-    // created, so the normal inventory cursor and close behaviour stay intact.
-    if (b->getFunctionStuff() && gui)
+    // Kenshi storage furniture is not consistently a StorageBuilding subclass:
+    // the field-tested container exposed LOOT_TARGET but getFunctionStuff()==0.
+    // The virtual inventory pointer is the actual capability used by every
+    // building container. Use the same public GUI entry as vanilla; transfers,
+    // ownership and theft still belong to the original Inventory code.
+    if (b->getInventory() && gui)
     {
         InventoryGUI* window = gui->showInventoryBuilding(b->getHandle());
         bool success = window != nullptr || gui->hasInventoryWindowOpen(b->getHandle());
@@ -10169,6 +10168,25 @@ static bool manualInteractionLooseItemEligible(RootObject* root)
     Item* item = static_cast<Item*>(root);
     return item->onGround() && !item->isInInventory
         && item->getVisible() && !item->isDisabled();
+}
+
+// A loose item's normal right-click is already exactly the desired one-step E
+// action. Let Character::playerMoveOrderDefault choose PICKUP/steal/pathing and
+// all failure feedback instead of manufacturing an inventory transfer here.
+static bool manualInteractionTryDirectLooseItem(RootObject* target)
+{
+    if (!manualInteractionLooseItemEligible(target) || !s_freeMoveAnchor) return false;
+    s_wasdHoldActive = false;
+    s_playerPointClickActive = true;
+    s_holdPosValid = false;
+    s_idleHoldEngaged = false;
+    s_freeMoveAnchor->playerMoveOrderDefault(nullptr, target, target->getPosition());
+    char logLine[144];
+    sprintf_s(logLine, sizeof(logLine),
+        "[Ironwind] interact_direct_item action=vanilla_default type=%d",
+        (int)target->getDataType());
+    VerbLog(logLine);
+    return true;
 }
 
 static bool manualInteractionRootValid(RootObject* target, Character* me)
@@ -10224,56 +10242,12 @@ static bool manualInteractionAabbScreenMiss(Ogre::Camera* cam, const Ogre::Aabb&
     return dx <= tolerance && dy <= tolerance;
 }
 
-static void manualInteractionConsiderItems(lektor<RootObject*>& items,
-                                           Ogre::Camera* cam,
-                                           const Ogre::Vector3& mp,
-                                           float aimX, float aimY, float maxR2,
-                                           RootObject*& best, float& bestScore)
-{
-    for (auto it = items.begin(); it != items.end(); ++it)
-    {
-        RootObject* root = *it;
-        if (!manualInteractionLooseItemEligible(root)) continue;
-        Ogre::Vector3 p = root->getPosition();
-        Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
-        float d2 = delta.squaredLength();
-        if (d2 >= maxR2) continue;
-        ++s_interactionPickSeen;
-
-        // Ground props can be only a few pixels wide.  Prefer their projected
-        // physical bounds with a small visual halo; use the exact world centre
-        // only when Kenshi exposes no usable AABB.  This remains a reticle hit,
-        // never a nearest-item magnet.
-        float miss = 0.0f;
-        bool covered = manualInteractionAabbScreenMiss(
-            cam, root->getAABB(), aimX, aimY, 8.0f, 12.0f, miss);
-        if (!covered)
-        {
-            int sx, sy;
-            if (!focusProject(cam, p, 0.0f, sx, sy)) continue;
-            float dx = fabsf(sx - aimX), dy = fabsf(sy - aimY);
-            if (dx > 24.0f || dy > 24.0f) continue;
-            miss = dx + dy;
-        }
-        if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
-            s_interactionPickNearestPx = miss;
-        float score = miss + sqrtf(d2) * 0.08f;
-        if (s_interactionTargetHandle.isValid()
-            && s_interactionTargetHandle.getRootObject() == root) score -= 0.15f;
-        if (score < bestScore)
-        {
-            bestScore = score;
-            best = root;
-            s_interactionPickSelectedDist = sqrtf(d2);
-        }
-    }
-}
-
 static RootObject* manualInteractionPick(Character* me)
 {
     s_interactionPickSeen = 0;
     s_interactionPickNearestPx = -1.0f;
     s_interactionPickSelectedDist = -1.0f;
+    s_interactionRayHitType = -1;
     if (!me || !me->movement || !s_gwFrame || !ou || !ou->player
         || !ou->player->camera) return nullptr;
     Ogre::Camera* cam = ou->player->camera->camera;
@@ -10330,27 +10304,29 @@ static RootObject* manualInteractionPick(Character* me)
     }
     if (best) return best;
 
-    // Detached over-shoulder/first-person cameras do not reliably populate
-    // mouseRightTarget because the native cursor is hidden.  Query only the
-    // immediate 30-unit neighbourhood and require the reticle to cover the
-    // projected item.  Weapons and armour are separate Kenshi data types even
-    // though all three are Item instances and use the same native menu.
-    s_interactionItemScratch.clear();
-    s_interactionWeaponScratch.clear();
-    s_interactionArmourScratch.clear();
-    s_gwFrame->getObjectsWithinSphere(s_interactionItemScratch, mp, 30.0f,
-                                      ITEM, 64, me);
-    s_gwFrame->getObjectsWithinSphere(s_interactionWeaponScratch, mp, 30.0f,
-                                      WEAPON, 64, me);
-    s_gwFrame->getObjectsWithinSphere(s_interactionArmourScratch, mp, 30.0f,
-                                      ARMOUR, 64, me);
-    manualInteractionConsiderItems(s_interactionItemScratch, cam, mp,
-                                   aimX, aimY, maxR2, best, bestScore);
-    manualInteractionConsiderItems(s_interactionWeaponScratch, cam, mp,
-                                   aimX, aimY, maxR2, best, bestScore);
-    manualInteractionConsiderItems(s_interactionArmourScratch, cam, mp,
-                                   aimX, aimY, maxR2, best, bestScore);
-    if (best) return best;
+    // The detached cameras intentionally hide Kenshi's mouse, so its native
+    // mouseRightTarget is often empty. Runtime Item objects also do not reliably
+    // participate in GameWorld's FCS-type sphere query. Use the current camera's
+    // exact centre ray instead: this is the same physical object under the
+    // crosshair, not a nearest-item magnet, and it covers every Item subtype.
+    Ogre::Ray aimRay = cam->getCameraToViewportRay(0.5f, 0.5f);
+    physHit aimHit(true, false, 0.0f);
+    UtilityT::rayTrace(aimHit, aimRay, 0xFFFFFFFFu);
+    RootObject* rayTarget = aimHit.hit && aimHit.hitObject.isValid()
+        ? aimHit.hitObject.getRootObject() : nullptr;
+    if (rayTarget) s_interactionRayHitType = (int)rayTarget->getDataType();
+    if (manualInteractionLooseItemEligible(rayTarget))
+    {
+        Ogre::Vector3 delta = rayTarget->getPosition() - mp; delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        if (d2 < maxR2)
+        {
+            ++s_interactionPickSeen;
+            s_interactionPickNearestPx = 0.0f;
+            s_interactionPickSelectedDist = sqrtf(d2);
+            return rayTarget;
+        }
+    }
 
     // Buildings are not in the character update list.  Query only a small
     // local sphere while V mode is active, then select by projected AABB centre.
@@ -10561,7 +10537,11 @@ static void manualInteractionActionTick()
         ? s_interactionTargetHandle.getRootObject() : nullptr;
     if (!manualInteractionRootValid(target, s_freeMoveAnchor))
     {
-        VerbLog("[Ironwind] interact_no_target");
+        char noTarget[176];
+        sprintf_s(noTarget, sizeof(noTarget),
+            "[Ironwind] interact_no_target ray_type=%d seen=%d miss_px=%.1f",
+            s_interactionRayHitType, s_interactionPickSeen, s_interactionPickNearestPx);
+        VerbLog(noTarget);
         return;
     }
     s_interactionTargetHandle = target;
@@ -15393,11 +15373,12 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
             s_interactionPendingHandle.setNull();
             if (manualInteractionRootValid(target, s_freeMoveAnchor))
             {
-                if (manualInteractionTryDirectBuilding(target))
+                if (manualInteractionTryDirectBuilding(target)
+                    || manualInteractionTryDirectLooseItem(target))
                 {
-                    // Direct doors and storage own no context-menu latch and no
-                    // Ironwind pause. The native object/UI has already accepted
-                    // the action in the same input phase as normal player use.
+                    // Direct doors, building inventories and loose-item default
+                    // orders own no context-menu latch and no Ironwind pause.
+                    // The native object/task/UI accepted the action here.
                     interactionOpenedThisFrame = false;
                 }
                 else

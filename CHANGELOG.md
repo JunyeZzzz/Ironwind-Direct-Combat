@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v132**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v133**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,12 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v133
+
+- 根据 v132 实机日志修正储具能力判断：测试储具使用原版 `LOOT_TARGET`，但不是 `StorageBuilding` 子类，故 `getFunctionStuff()` 永远没有进入直接库存路径。现改以 `Building::getInventory()` 的真实虚函数结果判断容器，并继续调用原版 `showInventoryBuilding`；已确认正常的门路径不改。
+- 删除没有在失败场景返回任何候选的 `ITEM/WEAPON/ARMOUR` 三套局部球形查询。隐藏鼠标时改用当前镜头中心射线和 Kenshi 原版 `UtilityT::rayTrace` 获取实际物理对象；只接受 30 单位内仍在地面、可见、未禁用且未进库存的任意 Item 子类。
+- 地面物品按 E 不再弹冗余单选菜单，而是调用受控角色自己的 `playerMoveOrderDefault`。插件不调用 `giveItem`、不直接搬进库存；PICKUP／偷窃语义、容量、犯罪、移动、声音和失败提示继续由原版默认任务决定。新增 `interact_direct_item` 与带 `ray_type` 的失败诊断。本版尚待游戏内验证。
 
 ## v132
 

@@ -341,10 +341,11 @@ function Invoke-IwCheck {
     foreach ($required in @(
         'static hand              s_interactionTargetHandle',
         'getObjectsWithinSphere(s_interactionBuildingScratch',
-        'getObjectsWithinSphere(s_interactionItemScratch',
-        'getObjectsWithinSphere(s_interactionWeaponScratch',
-        'getObjectsWithinSphere(s_interactionArmourScratch',
+        'cam->getCameraToViewportRay(0.5f, 0.5f)',
+        'UtilityT::rayTrace(aimHit, aimRay',
         'manualInteractionLooseItemEligible',
+        'manualInteractionTryDirectLooseItem',
+        'playerMoveOrderDefault(nullptr, target, target->getPosition())',
         '"ironwind_interaction_hint"',
         '"ironwind_interaction_hint_bg"',
         'contextMenu.rightMouseActivated = true',
@@ -362,10 +363,10 @@ function Invoke-IwCheck {
         'gui->showInventoryBuilding(b->getHandle())',
         'interact_direct_building action=door',
         'interact_direct_building action=storage',
-        'b->getFunctionStuff() != nullptr'
+        'b->getInventory() != nullptr'
     )) {
         if ($sourceText -notmatch [regex]::Escape($required)) {
-            throw "v132 direct building-interaction contract is incomplete: $required"
+            throw "v133 direct interaction contract is incomplete: $required"
         }
     }
     if ($sourceText -match 'b->isDoor\(\)\s*\|\|\s*b->isFurniture\(\)') {

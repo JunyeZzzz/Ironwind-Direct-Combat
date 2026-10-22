@@ -252,7 +252,7 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 普通未锁门按 E | 一次按键直接按当前状态开门或关门，不暂停、不弹两项菜单，也不经过旧的门任务抑制；锁门、破门或特殊门仍弹原版菜单 | `interact_direct_building action=door task=72/73/74/75 success=1`；普通门不得出现紧邻的 `interact_menu_open` 或 `dc_door_addorder_suppressed` |
 | 真正储具按 E | 一次按键直接打开 Kenshi 原版建筑库存，正常释放鼠标；不先暂停并要求再选“打开”。关闭库存后仍处于 V 模式 | `interact_direct_building action=storage success=1`，随后原版库存可见；不得出现紧邻的 `interact_menu_open` |
 | 对准纯装饰家具 | 不显示 E，也不产生重复的空菜单失败 | 不得出现该目标的 `interact_menu_open_failed reason=no_native_options` |
-| 准星覆盖近距地面物品／武器／护甲 | 30 单位内、准星覆盖对象投影时显示 `E`；侧边更近物品不得抢目标。按 E 打开该对象的原版菜单，选择拾取后由原版检查容量、所有权、偷窃和移动任务；铁风不直接塞入库存 | `interact_target selected=1 type=2/3/4 ...` → `interact_menu_requested` → `interact_menu_open visible=1`；选择项后出现原版任务或库存结果 |
+| 准星覆盖近距地面物品／武器／护甲 | 30 单位内、准星中心物理射线实际命中对象时显示 `E`；侧边更近物品不得抢目标。按 E 一次发出该对象的原版默认右键任务，由原版检查容量、所有权、偷窃、犯罪和寻路；铁风不直接塞入库存 | `interact_target selected=1 type=2/3/4 ... miss_px=0.0` → `interact_direct_item action=vanilla_default type=...` → 原版拾取任务／库存结果；不得紧邻出现 `interact_menu_open`。失败时 `interact_no_target ray_type=...` 应指出射线实际命中的对象类型 |
 | 有候选时按 E | 只打开一次该目标的原版上下文菜单，菜单稳定停留且世界暂停、光标释放；V 模式不退出 | `interact_menu_requested ...` 后 `interact_menu_open visible=1 orders=... pause_owned=1`；不得在约一帧内自动执行默认项 |
 | 点击菜单中的对话／急救／搬运／搜刮／使用／开门等选项 | 由原版 MyGUI 回调执行；插件不得直接调用 `optionSelected`。普通世界任务选完后恢复时间、准星和战斗；若进入对话／库存／地图，暂停所有权交给原版 UI | 普通项为 `interact_menu_closed ...` 后 `interact_pause_released`；嵌套 UI 为 `interact_pause_transferred_to_native_ui`，随后原版任务按选项出现 |
 | 玩家原本已经暂停 | E 不得认领或解除玩家自己的暂停；菜单关闭后仍保持原暂停 | 不得错误出现 `pause_owned=1` 或擅自 `interact_pause_released` |
