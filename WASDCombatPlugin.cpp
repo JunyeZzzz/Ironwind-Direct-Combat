@@ -49,7 +49,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "135"
+#define IRONWIND_VERSION "136"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -572,6 +572,11 @@ static bool              s_interactionMenuByE = false;
 static bool              s_interactionOpenPending = false;
 static hand              s_interactionTargetHandle;
 static hand              s_interactionPendingHandle;
+// A building inventory opened directly by E belongs to that same interaction
+// transaction.  Keeping the exact native owner lets a second E close only this
+// window; Tab inventory, trade, dialogue and unrelated UI remain untouched.
+static bool              s_interactionInventoryByE = false;
+static hand              s_interactionInventoryOwner;
 static bool              s_interactionPauseOwned = false;
 static ULONGLONG         s_interactionResumeAfterMs = 0;
 static MyGUI::Widget*    s_interactionHintBg = nullptr;
@@ -943,6 +948,8 @@ static void manualInteractionClearRuntime(bool forgetAutoTarget)
     s_interactionMenuByE = false;
     s_interactionOpenPending = false;
     s_interactionPendingHandle.setNull();
+    s_interactionInventoryByE = false;
+    s_interactionInventoryOwner.setNull();
     s_interactionPauseOwned = false;
     s_interactionResumeAfterMs = 0;
     if (forgetAutoTarget)
@@ -10191,7 +10198,12 @@ static bool manualInteractionTryDirectWorldObject(RootObject* target)
             "[Ironwind] interact_direct_world action=inventory success=%d",
             success ? 1 : 0);
         VerbLog(logLine);
-        if (success) return true;
+        if (success)
+        {
+            s_interactionInventoryByE = true;
+            s_interactionInventoryOwner = b->getHandle();
+            return true;
+        }
     }
 
     // Beds, chairs, turrets, workbenches, machines and mod-added facilities
@@ -10526,8 +10538,30 @@ static void manualInteractionActionTick()
             manualInteractionScheduleResume("native_close");
         }
     }
+    bool ownedInventoryOpen = s_interactionInventoryByE && gui
+        && s_interactionInventoryOwner.isValid()
+        && gui->hasInventoryWindowOpen(s_interactionInventoryOwner);
+    if (s_interactionInventoryByE && !ownedInventoryOpen)
+    {
+        s_interactionInventoryByE = false;
+        s_interactionInventoryOwner.setNull();
+        VerbLog("[Ironwind] interact_owned_inventory_released reason=native_close");
+    }
+
     if (!s_interactionRequested) return;
     s_interactionRequested = false;
+
+    // E is a true toggle for the native building inventory that this E path
+    // opened.  This check intentionally precedes dcUiWantsCursor(): the open
+    // inventory owns the cursor, but must not consume its own close key.
+    if (ownedInventoryOpen)
+    {
+        gui->closeInventoryBuilding();
+        s_interactionInventoryByE = false;
+        s_interactionInventoryOwner.setNull();
+        VerbLog("[Ironwind] interact_owned_inventory_closed_by_e");
+        return;
+    }
 
     if ((s_interactionMenuByE || s_interactionOpenPending) && ou && ou->player)
     {

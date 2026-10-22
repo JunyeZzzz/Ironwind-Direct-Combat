@@ -1,6 +1,6 @@
 # 铁风执刃架构
 
-本文描述 v125 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
+本文描述 v136 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
 
 ## 1. 产物链
 
@@ -201,7 +201,7 @@ v116 不存在铁风主动闪避状态。Shift+方向是普通移动，Q 没有�
 - 四个方向箭头位于准星上下左右并朝向中心，但任一时刻只显示当前选中的一个；四个方向都允许出现。四向由同一程序几何旋转生成独立 RGBA 纹理并通过 `ImageBox::setImageTexture()` 绑定；保持 64×64 外框、箭头长度和约 3 px 笔画，v73 的统一中心半径为 258 px。`s_dirMoveAvailable == 1` 的所选方向为绿色，其余和未知方向为白色；格挡输入不改变箭头颜色。
 - 真正命中时，四个斜线文本控件紧贴准星四个对角形成断开的红色 X，字形不放大，并在 1000 ms 内淡出；显示时间在加载清理中归零。
 - 交互候选与攻击目标解耦，但人物选择复用观察面板的严格准星身体覆盖结果：只有 30 单位内、准星实际落在投影身体上的非敌对／KO／死亡人物可获得 E，屏幕侧面的近人不再按世界距离抢目标。建筑通过局部 `getObjectsWithinSphere(BUILDING)` 查询，并且必须是门、真实暴露 `Inventory` 的容器或暴露原版鼠标光标／默认任务；准星还必须落入投影 AABB（含 18 px 视觉留白）。物品先保留 Kenshi `mouseRightTarget` 的精确结果；隐藏鼠标导致该结果缺失时，v133 使用当前渲染相机 `getCameraToViewportRay(0.5, 0.5)` 和原版 `UtilityT::rayTrace` 获取准星中心真实物理对象。只接受 30 单位内、`onGround`、可见、未禁用且未进库存的任意 Item 子类，因此不是附近物品磁吸，也不再维护三套 FCS 类型球形查询。持久身份保存 `hand`，提示是胸口／对象中心侧边的深色底黄色 `E`，不改写顶部战斗文字。
-- `E` 只登记一次请求；目标刷新和请求消费在同一主循环相邻执行，消费时直接使用已经显示提示的 `hand`，不再次按距离挑人。随后将执行请求延迟到 `PlayerInterface::playerControl`。v134 由唯一的 `manualInteractionTryDirectWorldObject` 按能力路由所有非人物目标：未锁且未损坏的门通过 `DoorStuff` 执行开／关；`Building::getInventory()` 非空的容器调用 `ForgottenGUI::showInventoryBuilding`；地面 Item 调用 `playerMoveOrderDefault(nullptr, item, position)`；其余具有 `Building::getDefaultTask()` 的设施调用 `playerMoveOrderDefault(building, nullptr, position)`。后两者先通过 `manualInteractionYieldToNativeOrder` 释放 WASD 停位所有权，具体任务映射、距离、寻路及失败仍由原版决定。人物、锁门／破门和未暴露明确主要能力的对象回退原版菜单。菜单路径在原版调用前设置 `ContextMenu::rightMouseActivated` 和同帧 RMB 持有态，再调用 `ContextMenu::showContextMenu`；只有菜单在 `playerControl` 返回后仍可见时才调用 `userPause(true)`。关闭后只释放本次 E 所拥有的暂停；若选项打开对话、库存、地图或角色页，则暂停所有权转交该 UI。`MODE_FREE_MOVE`、攻击、格挡和移动状态机不切换。
+- `E` 只登记一次请求；目标刷新和请求消费在同一主循环相邻执行，消费时直接使用已经显示提示的 `hand`，不再次按距离挑人。随后将执行请求延迟到 `PlayerInterface::playerControl`。v134 由唯一的 `manualInteractionTryDirectWorldObject` 按能力路由所有非人物目标：未锁且未损坏的门通过 `DoorStuff` 执行开／关；`Building::getInventory()` 非空的容器调用 `ForgottenGUI::showInventoryBuilding`；地面 Item 调用 `playerMoveOrderDefault(nullptr, item, position)`；其余具有 `Building::getDefaultTask()` 的设施调用 `playerMoveOrderDefault(building, nullptr, position)`。后两者先通过 `manualInteractionYieldToNativeOrder` 释放 WASD 停位所有权，具体任务映射、距离、寻路及失败仍由原版决定。人物、锁门／破门和未暴露明确主要能力的对象回退原版菜单。菜单路径在原版调用前设置 `ContextMenu::rightMouseActivated` 和同帧 RMB 持有态，再调用 `ContextMenu::showContextMenu`；只有菜单在 `playerControl` 返回后仍可见时才调用 `userPause(true)`。关闭后只释放本次 E 所拥有的暂停；若选项打开对话、库存、地图或角色页，则暂停所有权转交该 UI。v136 另以 `s_interactionInventoryOwner` 记录 E 直接打开的建筑库存：请求消费先检查该精确 owner 是否仍在原版库存表中，存在则调用 `closeInventoryBuilding()` 并结束本次按键；原版鼠标关闭、V 退出或世界清理只清除此账本。该门位于通用 UI 拒绝之前，因此库存拥有光标时仍能收到自己的关闭键，同时不会把任意已开 UI 当作 E 所有。`MODE_FREE_MOVE`、攻击、格挡和移动状态机不切换。
 - 红色断开 X 只由真实 `_getHit` 触发。v84 使用 26 px 红色斜线和同色系 1 px 阴影增加笔画重量，控件 alpha 最高 0.82，并在 1000 ms 内衰减；位置与四段布局不变。
 - 插件不直接调用 `ContextMenu::optionSelected`；攻击、格挡、受击或其他 UI 占用鼠标时拒绝开菜单，真实受击会关闭由 E 打开的菜单。
 - 暂停与真实 UI 都进入统一的 `dcUiWantsCursor`，释放系统光标并停止 OTS／FP 鼠标捕获；恢复后只在捕获上升沿回中一次。E 菜单的暂停有独立所有权，不能解除玩家原先的暂停或原版后续 UI 的暂停。

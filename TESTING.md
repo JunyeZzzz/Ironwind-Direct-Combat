@@ -251,7 +251,8 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 靠近活着的红名敌人 | 不显示 E 交互提示，不影响方向攻击；敌人 KO 或死亡后允许成为搜刮候选 |
 | 准星覆盖 30 单位内的门、床、工作台／炮台投影范围 | 对象中心侧边出现同样的深色底黄色 `E`；普通墙体、装饰和无原版任务对象不提示 | `interact_target selected=1 type=0 ...` 与 `interaction_hint_visible type=0 ...`；不得生成虚构选项 |
 | 普通未锁门按 E | 一次按键直接按当前状态开门或关门，不暂停、不弹两项菜单，也不经过旧的门任务抑制；锁门、破门或特殊门仍弹原版菜单 | `interact_direct_world action=door task=72/73/74/75 success=1`；普通门不得出现紧邻的 `interact_menu_open` 或 `dc_door_addorder_suppressed` |
-| 真正储具按 E | 一次按键直接打开 Kenshi 原版建筑库存，正常释放鼠标；不先暂停并要求再选“打开”。关闭库存后仍处于 V 模式 | `interact_direct_world action=inventory success=1`，随后原版库存可见；不得出现紧邻的 `interact_menu_open` |
+| 真正储具按 E，再按一次 E | 第一次直接打开 Kenshi 原版建筑库存并释放鼠标；第二次调用原版建筑库存关闭入口，恢复准星且仍处于 V 模式。若改用鼠标关闭，也应自动释放本次 E 所有权 | 依次出现 `interact_direct_world action=inventory success=1`、`interact_owned_inventory_closed_by_e`；鼠标关闭分支为 `interact_owned_inventory_released reason=native_close`，不得出现紧邻的 `interact_menu_open` |
+| Tab 背包、交易或对话已打开时按 E | 不得把任意原版 UI 误认成 E 打开的储具；维持各自原版关闭方式 | 不得出现 `interact_owned_inventory_closed_by_e` |
 | 对准纯装饰家具 | 不显示 E，也不产生重复的空菜单失败 | 不得出现该目标的 `interact_menu_open_failed reason=no_native_options` |
 | 准星覆盖近距地面物品／武器／护甲 | 30 单位内、准星中心物理射线实际命中对象时显示 `E`；侧边更近物品不得抢目标。按 E 一次发出该对象的原版默认右键任务，由原版检查容量、所有权、偷窃、犯罪和寻路；铁风不直接塞入库存 | `interact_target selected=1 type=2/3/4 ... miss_px=0.0` → `interact_direct_world action=item_default type=...` → 原版拾取任务／库存结果；不得紧邻出现 `interact_menu_open`。失败时 `interact_no_target ray_type=...` 应指出射线实际命中的对象类型 |
 | 床、椅、炮台、工作台、机器或 Mod 设施具有原版默认任务 | 一次 E 提交该建筑自己的原版主要任务，不先弹只有一个选项的菜单；角色按原版距离和路径移动／使用。没有默认任务但确实有多项选择的对象仍走菜单 | `interact_direct_world action=building_default task=...` 后出现对应原版任务；不得紧邻出现 `interact_menu_open visible=1 orders=1` |

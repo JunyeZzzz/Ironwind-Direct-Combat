@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v135**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v136**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,12 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v136
+
+- E 直接打开的建筑库存现在属于同一次交互事务：插件记录该建筑的原版 `hand`，再次按 E 时调用 Kenshi 的 `closeInventoryBuilding()`，不再要求把指针移到关闭按钮。
+- 关闭门只在已记录 owner 仍有原版库存窗口时生效，并位于通用 UI 输入拒绝之前；Tab 自有背包、交易、对话及其他既有 UI 不会被误关。鼠标关闭、退出 V、读档或世界清理都会放弃本次所有权。
+- 保留 v135 的原版攻击片段虚挂恢复及 v134 的统一能力路由。已通过静态回归门、Visual C++ 2010 x64 编译、开发通道部署及构建／暂存／安装一致性验证；DLL SHA256 为 `E4B5EB6C822576245626E4F311249AB164CB46B3DDED622C126F20F4531FA9FB`，PDB SHA256 为 `7EAD82BD618DBC70A88AD3CE1D6339AAC2921CF41AB8554E7A56A44CED945C2E`。E 再按关闭与误关隔离仍待 v136 实机确认。
 
 ## v135
 
