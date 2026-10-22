@@ -15,7 +15,7 @@ Ironwind does not replace Kenshi with a custom damage system. Your input decides
 - Complete hit and miss animations, native stagger ownership, and no fixed-duration reaction overrides.
 - Compact two-row, eight-part health display using Kenshi's real medical states and colours.
 - Confirmed-hit red X feedback and directional availability arrows, without custom hand/weapon attack glows.
-- Nearby character interaction through `E`, using the original context menu.
+- World-attached `E` prompts for nearby people, doors and usable objects, using the original context menu.
 - Character-centred audio while direct control is active.
 - In-game Chinese settings page plus advanced INI calibration.
 
@@ -29,7 +29,7 @@ Ironwind does not replace Kenshi with a custom damage system. Your input decides
 | Release LMB | Commit one strike |
 | Hold RMB | Directional guard, or authorise vanilla AI guard direction |
 | RMB while aiming | Cancel the uncommitted attack |
-| `E` | Interact with the nearby selected character |
+| `E` | Pause and open the nearby target's original interaction menu |
 | `F` | Switch over-the-shoulder / first person |
 | Mouse wheel | Adjust shoulder distance; enter first person at the near end |
 | `Z` / `X` | Vanilla Kenshi 1× / 5× game speed |

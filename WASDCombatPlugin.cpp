@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "123"
+#define IRONWIND_VERSION "124"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -553,12 +553,20 @@ static volatile int      s_lastAttackDirection = CUT_DOWNWARD;
 static volatile bool     s_blockGestureSeen    = false;  // guard direction came from the mouse
 static volatile ULONGLONG s_rmbCombatEdgeMs    = 0;      // poll: RMB press, classified on the game thread
 static ULONGLONG         s_rmbCombatEdgeSeenMs = 0;
-// Directional combat gives LMB/RMB exclusively to attack/guard.  E is a
-// one-shot interaction request for the nearby, automatically selected target.
-// The native context menu owns the cursor only while that menu is visible.
+// Directional combat gives LMB/RMB exclusively to attack/guard. E targets one
+// nearby original RootObject (character, door, furniture, machine, etc.). The
+// native context menu owns the cursor and an Ironwind-owned pause only while
+// the interaction UI chain is alive; MODE_FREE_MOVE never changes.
 static volatile bool     s_interactionRequested = false;
 static bool              s_interactionMenuByE = false;
-static Character*        s_interactionAutoTarget = nullptr; // identity only; refreshed on game thread
+static bool              s_interactionOpenPending = false;
+static hand              s_interactionTargetHandle;
+static hand              s_interactionPendingHandle;
+static ULONGLONG         s_interactionNextScanMs = 0;
+static bool              s_interactionPauseOwned = false;
+static ULONGLONG         s_interactionResumeAfterMs = 0;
+static MyGUI::TextBox*   s_interactionHint = nullptr;
+static bool              s_interactionHintTried = false;
 
 // Defence mode inside manual combat. false = directional player guard;
 // true = original Kenshi AI owns both block timing and direction. The two
@@ -911,7 +919,15 @@ static void manualInteractionClearRuntime(bool forgetAutoTarget)
 {
     s_interactionRequested = false;
     s_interactionMenuByE = false;
-    if (forgetAutoTarget) s_interactionAutoTarget = nullptr;
+    s_interactionOpenPending = false;
+    s_interactionPendingHandle.setNull();
+    s_interactionNextScanMs = 0;
+    s_interactionPauseOwned = false;
+    s_interactionResumeAfterMs = 0;
+    if (forgetAutoTarget)
+    {
+        s_interactionTargetHandle.setNull();
+    }
 }
 
 // Read-only end-of-frame contract check.  It never repairs state: silently
@@ -5776,14 +5792,8 @@ static void manualAttackHudUpdate()
     {
         MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();   // follows resolution changes
         s_manualHud->setPosition(v.width / 2 - 130, 34);
-        bool interactionPrompt = s_directionalCombat && s_interactionAutoTarget
-            && !s_attackAimHeld && !s_attackActive && !s_mouseBlockHeld;
-        s_manualHud->setTextColour(interactionPrompt
-            ? MyGUI::Colour(0.95f, 0.82f, 0.18f) : MyGUI::Colour::White);
-        if (interactionPrompt)
-            s_manualHud->setCaption(std::string(dcZh("Interact: "))
-                + s_interactionAutoTarget->getName());
-        else if (s_directionalCombat && s_settingAiBlocks && s_mouseBlockHeld)
+        s_manualHud->setTextColour(MyGUI::Colour::White);
+        if (s_directionalCombat && s_settingAiBlocks && s_mouseBlockHeld)
             s_manualHud->setCaption(dcZh("Guard: AI"));
         else if (s_directionalCombat && !s_settingAiBlocks && s_mouseBlockHeld)
             s_manualHud->setCaption(std::string(dcZh("Guard: ")) + dcZh(combatDirectionLabel((CutDirection)s_blockDesired)));
@@ -6219,6 +6229,79 @@ static bool focusNameTagCreate()
     }
     catch (...) { s_nameTag = nullptr; DebugLog("[WASDCombat] aim_name_tag_create_failed"); return false; }
 }
+
+static bool manualInteractionHintCreate()
+{
+    if (s_interactionHint || s_interactionHintTried) return s_interactionHint != nullptr;
+    s_interactionHintTried = true;
+    try
+    {
+        MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
+        if (!g) return false;
+        s_interactionHint = g->createWidget<MyGUI::TextBox>(
+            "Kenshi_TextboxStandardText_Small", 0, 0, 30, 24,
+            MyGUI::Align::Default, "Top", "ironwind_interaction_hint");
+        if (!s_interactionHint) return false;
+        s_interactionHint->setCaption("E");
+        s_interactionHint->setTextAlign(MyGUI::Align::Center | MyGUI::Align::VCenter);
+        s_interactionHint->setTextColour(MyGUI::Colour(1.00f, 0.84f, 0.22f));
+        s_interactionHint->setTextShadow(true);
+        s_interactionHint->setTextShadowColour(MyGUI::Colour::Black);
+        try { s_interactionHint->setFontHeight(18); } catch (...) {}
+        s_interactionHint->setNeedMouseFocus(false);
+        s_interactionHint->setVisible(false);
+        DebugLog("[Ironwind] interaction_hint_created");
+        return true;
+    }
+    catch (...)
+    {
+        s_interactionHint = nullptr;
+        DebugLog("[Ironwind] interaction_hint_create_failed");
+        return false;
+    }
+}
+
+static void manualInteractionHintUpdate(Ogre::Camera* cam, bool live)
+{
+    bool show = live && s_directionalCombat && (s_firstPersonActive || s_otsCamActive)
+        && !s_interactionMenuByE && !s_interactionOpenPending
+        && !s_attackAimHeld && !s_attackActive && !manualAttackCommitLive()
+        && !s_mouseBlockHeld && !s_blockHeld
+        && !manualHitReactionLive(s_freeMoveAnchor)
+        && !dcUiWantsCursor()
+        && s_interactionTargetHandle.isValid();
+    RootObject* target = show ? s_interactionTargetHandle.getRootObject() : nullptr;
+    show = show && target && target->isValid();
+    if (show && (s_interactionHint || manualInteractionHintCreate()))
+    {
+        Ogre::Vector3 marker = Ogre::Vector3::ZERO;
+        if (target->getDataType() == CHARACTER)
+        {
+            Character* c = static_cast<Character*>(target);
+            show = focusBonePos(c, "Bip01 Head", 18.0f, marker);
+            if (show) marker += Ogre::Vector3(0.0f, 4.0f, 0.0f);
+        }
+        else if (target->getDataType() == BUILDING)
+        {
+            Building* b = static_cast<Building*>(target);
+            marker = b->getAABB().mCenter;
+            if (fabsf(marker.x) >= 1.0e7f || fabsf(marker.y) >= 1.0e7f
+                || fabsf(marker.z) >= 1.0e7f)
+                marker = b->getPosition() + Ogre::Vector3(0.0f, 2.5f, 0.0f);
+        }
+        else marker = target->getPosition() + Ogre::Vector3(0.0f, 2.0f, 0.0f);
+        int sx = 0, sy = 0;
+        show = show && focusProject(cam, marker, 0.0f, sx, sy);
+        if (show)
+        {
+            MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+            show = sx >= 0 && sy >= 0 && sx < view.width && sy < view.height;
+            if (show) s_interactionHint->setCoord(sx - 15, sy - 12, 30, 24);
+        }
+    }
+    if (s_interactionHint && s_interactionHint->getVisible() != show)
+        s_interactionHint->setVisible(show);
+}
 // Character::attackingYou - the victim is told at swing start.  Track the
 // attacker (identity only) when WE are the victim.
 static void (*s_attackingYouOrig)(Character* self, Character* attacker, bool so, bool doAwarenessCheck);
@@ -6468,6 +6551,11 @@ static void focusMarkersUpdate(CameraClass* thisptr)
             if (s_hbLabel[i] && s_hbLabel[i]->getVisible()) s_hbLabel[i]->setVisible(false);
         }
     }
+
+    // The E prompt is anchored in world space and follows the selected native
+    // interaction target.  It is intentionally separate from the top combat
+    // label so people, doors and furniture read as one consistent affordance.
+    manualInteractionHintUpdate(cam, live);
 
     // Expire incoming-attack state without rendering it. Automatic guard reads
     // the same slots, so this lifecycle must remain even though the old visual
@@ -9897,17 +9985,48 @@ static void manualAttackAimCaptureTick()
     VerbLog(b);
 }
 
-// Nearby interaction target selection. Unlike attack intent this is forgiving:
-// a close character in the central view is selected without pixel-perfect body
-// overlap. Distance dominates the score, then screen offset breaks ties.
+// Nearby interaction target selection.  It deliberately stays independent of
+// attack intent: E may address a person or a world building while LMB remains
+// entirely owned by manual combat.  Characters use a forgiving projected-body
+// gate; buildings use their world AABB and must expose a native cursor/task (or
+// be a door/furniture).  The final action is still validated by Kenshi's native
+// ContextMenu, so this layer never invents an order.
 static int s_interactionPickSeen = 0;
 static float s_interactionPickNearestPx = -1.0f;
-static float s_interactionPickNearestDist = -1.0f;
 static float s_interactionPickSelectedDist = -1.0f;
-static Character* manualInteractionPick(Character* me)
+static lektor<RootObject*> s_interactionBuildingScratch;
+
+static bool manualInteractionBuildingEligible(Building* b)
+{
+    if (!b || !b->isValid() || !b->getVisible() || b->isDestroyed()) return false;
+    return b->isDoor() || b->isFurniture()
+        || b->getMouseCursor() != DEFAULT_CURSOR
+        || b->getDefaultTask() != NULL_TASK;
+}
+
+static bool manualInteractionRootValid(RootObject* target, Character* me)
+{
+    if (!target || !target->isValid() || target == me) return false;
+    itemType type = target->getDataType();
+    if (type == CHARACTER)
+    {
+        Character* c = static_cast<Character*>(target);
+        if (!c->movement) return false;
+        // A conscious live enemy remains the LMB/RMB combat subject.  E is for
+        // social, rescue, loot/carry and world interactions.
+        return !c->isEnemy(me, true) || c->isDead() || c->getProneState() == PS_KO;
+    }
+    if (type == BUILDING)
+        return manualInteractionBuildingEligible(static_cast<Building*>(target));
+    // Let an exact target already chosen by Kenshi expose its own native menu
+    // (for example a loose item).  We do not run a broad fallback scan for it.
+    return type == ITEM;
+}
+
+static RootObject* manualInteractionPick(Character* me)
 {
     s_interactionPickSeen = 0;
-    s_interactionPickNearestPx = s_interactionPickNearestDist = -1.0f;
+    s_interactionPickNearestPx = -1.0f;
     s_interactionPickSelectedDist = -1.0f;
     if (!me || !me->movement || !s_gwFrame || !ou || !ou->player
         || !ou->player->camera) return nullptr;
@@ -9918,7 +10037,7 @@ static Character* manualInteractionPick(Character* me)
     const float aimX = view.width * 0.5f, aimY = view.height * 0.5f;
     const Ogre::Vector3 mp = me->movement->pos;
     const float maxR2 = 40.0f * 40.0f;
-    Character* best = nullptr;
+    RootObject* best = nullptr;
     float bestScore = 1e9f;
     auto& chars = s_gwFrame->getCharacterUpdateList();
     for (auto it = chars.begin(); it != chars.end(); ++it)
@@ -9972,7 +10091,6 @@ static Character* manualInteractionPick(Character* me)
         if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
         {
             s_interactionPickNearestPx = miss;
-            s_interactionPickNearestDist = sqrtf(d2);
         }
         // Close proximity provides the selection; the broad view gate only
         // prevents an NPC behind the camera or at the extreme edge stealing E.
@@ -9980,11 +10098,78 @@ static Character* manualInteractionPick(Character* me)
             continue;
         float score = sqrtf(d2) * 0.20f + miss * 0.012f
                     + fabsf(aimX - centerX) * 0.002f;
-        if (c == s_interactionAutoTarget) score -= 1.25f; // stable until another target is clearly better
+        if (s_interactionTargetHandle == c) score -= 1.25f; // stable until another target is clearly better
         if (score < bestScore)
         {
             bestScore = score;
             best = c;
+            s_interactionPickSelectedDist = sqrtf(d2);
+        }
+    }
+
+    // Exact native mouse target wins a close contest.  This keeps thin doors,
+    // loose items and other awkward shapes faithful to Kenshi's own picking.
+    RootObject* nativeTarget = ou->player->mouseRightTargetSet
+        ? ou->player->mouseRightTarget : nullptr;
+    if (manualInteractionRootValid(nativeTarget, me))
+    {
+        Ogre::Vector3 p = nativeTarget->getPosition();
+        Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        int nx, ny;
+        if (d2 < maxR2 && focusProject(cam, p + Ogre::Vector3(0.0f, 2.0f, 0.0f), 0.0f, nx, ny)
+            && fabsf(nx - aimX) <= 160.0f && fabsf(ny - aimY) <= 140.0f)
+        {
+            float miss = fabsf(nx - aimX) + fabsf(ny - aimY);
+            float score = sqrtf(d2) * 0.20f + miss * 0.010f - 3.0f;
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = nativeTarget;
+                s_interactionPickSelectedDist = sqrtf(d2);
+            }
+        }
+    }
+
+    // Buildings are not in the character update list.  Query only a small
+    // local sphere while V mode is active, then select by projected AABB centre.
+    s_interactionBuildingScratch.clear();
+    s_gwFrame->getObjectsWithinSphere(s_interactionBuildingScratch, mp, 40.0f,
+                                      BUILDING, 128, me);
+    for (auto it = s_interactionBuildingScratch.begin();
+         it != s_interactionBuildingScratch.end(); ++it)
+    {
+        RootObject* root = *it;
+        Building* b = root ? static_cast<Building*>(root) : nullptr;
+        if (!manualInteractionBuildingEligible(b)) continue;
+        Ogre::Vector3 p = b->getPosition();
+        Ogre::Vector3 marker = p + Ogre::Vector3(0.0f, 2.5f, 0.0f);
+        const Ogre::Aabb& box = b->getAABB();
+        if (fabsf(box.mCenter.x) < 1.0e7f && fabsf(box.mCenter.y) < 1.0e7f
+            && fabsf(box.mCenter.z) < 1.0e7f
+            && (fabsf(box.mCenter.x) + fabsf(box.mCenter.y) + fabsf(box.mCenter.z)) > 0.01f)
+            marker = box.mCenter;
+        Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        int bx, by;
+        if (d2 >= maxR2 || !focusProject(cam, marker, 0.0f, bx, by)) continue;
+        ++s_interactionPickSeen;
+        float missX = fabsf(bx - aimX);
+        float missY = fabsf(by - aimY);
+        float miss = missX + missY;
+        if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
+        {
+            s_interactionPickNearestPx = miss;
+        }
+        // A structure must actually sit near the reticle.  Character selection
+        // remains more forgiving because moving bodies are much thinner.
+        if (missX > 150.0f || missY > 135.0f) continue;
+        float score = sqrtf(d2) * 0.20f + miss * 0.018f;
+        if (s_interactionTargetHandle == b) score -= 1.25f;
+        if (score < bestScore)
+        {
+            bestScore = score;
+            best = b;
             s_interactionPickSelectedDist = sqrtf(d2);
         }
     }
@@ -10007,30 +10192,53 @@ static bool manualHasPlayerTalk(Character* me, Character* target)
 
 static void manualInteractionTargetTick()
 {
+    if (s_interactionMenuByE || s_interactionOpenPending)
+    {
+        s_allowTalkCursor = false;
+        s_xhairTint = 0;
+        return;
+    }
     bool allow = false;
     int tint = 0;
-    Character* selected = nullptr;
+    RootObject* selected = nullptr;
     if (s_mode == MODE_FREE_MOVE && s_directionalCombat
         && (s_firstPersonActive || s_otsCamActive) && s_freeMoveAnchor
         && !s_dcShutdownInProgress && !s_loadGuardActive
         && !s_cameraUiOpen && !dcUiWantsCursor() && ou && ou->player)
     {
-        Character* t = manualInteractionPick(s_freeMoveAnchor);
-        if (t && focusTargetLoaded(t))
+        ULONGLONG now = GetTickCount64();
+        RootObject* t = nullptr;
+        if (now < s_interactionNextScanMs && s_interactionTargetHandle.isValid())
+            t = s_interactionTargetHandle.getRootObject();
+        else
+        {
+            s_interactionNextScanMs = now + 75;
+            t = manualInteractionPick(s_freeMoveAnchor);
+        }
+        if (manualInteractionRootValid(t, s_freeMoveAnchor))
         {
             selected = t;
-            allow = manualHasPlayerTalk(s_freeMoveAnchor, t);
-            tint = (t->isAlly(s_freeMoveAnchor, true)
-                    || manualVPlayerTeamMember(t)) ? 2 : 1;
+            if (t->getDataType() == CHARACTER)
+            {
+                Character* c = static_cast<Character*>(t);
+                allow = manualHasPlayerTalk(s_freeMoveAnchor, c);
+                tint = (c->isAlly(s_freeMoveAnchor, true)
+                        || manualVPlayerTeamMember(c)) ? 2 : 1;
+            }
+            else tint = 1;
         }
     }
-    if (selected != s_interactionAutoTarget)
+    RootObject* previous = s_interactionTargetHandle.isValid()
+        ? s_interactionTargetHandle.getRootObject() : nullptr;
+    if (selected != previous)
     {
-        s_interactionAutoTarget = selected;
+        if (selected) s_interactionTargetHandle = selected;
+        else s_interactionTargetHandle.setNull();
         char b[192];
         sprintf_s(b, sizeof(b),
-            "[Ironwind] interact_target selected=%d distance=%.1f seen=%d miss_px=%.1f",
-            selected ? 1 : 0, selected ? s_interactionPickSelectedDist : -1.0f,
+            "[Ironwind] interact_target selected=%d type=%d distance=%.1f seen=%d miss_px=%.1f",
+            selected ? 1 : 0, selected ? (int)selected->getDataType() : -1,
+            selected ? s_interactionPickSelectedDist : -1.0f,
             s_interactionPickSeen, s_interactionPickNearestPx);
         VerbLog(b);
     }
@@ -10038,33 +10246,91 @@ static void manualInteractionTargetTick()
     s_xhairTint = tint;
 }
 
-// One-shot E interaction. Target selection stays automatic and combat remains
-// active; only the native menu temporarily receives the pointer. We never call
-// ContextMenuGUI::optionSelected ourselves: its own widgets execute the order.
+static void manualInteractionScheduleResume(const char* reason)
+{
+    s_interactionMenuByE = false;
+    s_interactionOpenPending = false;
+    s_interactionPendingHandle.setNull();
+    if (ou && ou->player)
+        ou->player->contextMenu.rightMouseActivated = false;
+    if (s_interactionPauseOwned)
+        s_interactionResumeAfterMs = GetTickCount64() + 120;
+    char b[160];
+    sprintf_s(b, sizeof(b), "[Ironwind] interact_menu_closed reason=%s pause_owned=%d",
+              reason ? reason : "unknown", s_interactionPauseOwned ? 1 : 0);
+    VerbLog(b);
+}
+
+static bool manualInteractionNestedUiVisible()
+{
+    ManagementScreen* ms = ManagementScreen::getSingleton();
+    return s_lootUiSuspendActive
+        || (ms && ms->getVisible())
+        || (gui && (gui->inDialogue() || gui->isAnyInventoryWindowOpen()
+                   || gui->isStatsWindowOpen()));
+}
+
+// Restore only a pause that this E transaction created.  If the chosen native
+// order opened dialogue/inventory/map, ownership transfers to that original UI
+// instead of Ironwind unpausing underneath it.
+static void manualInteractionPauseTick()
+{
+    if (!s_interactionPauseOwned || !ou) return;
+    if (!ou->isPaused())
+    {
+        s_interactionPauseOwned = false;
+        s_interactionResumeAfterMs = 0;
+        return;
+    }
+    if (s_interactionOpenPending || s_interactionMenuByE
+        || (ou->player && ou->player->contextMenu.isVisible())) return;
+    ULONGLONG now = GetTickCount64();
+    if (!s_interactionResumeAfterMs || now < s_interactionResumeAfterMs) return;
+    if (manualInteractionNestedUiVisible())
+    {
+        s_interactionPauseOwned = false;
+        s_interactionResumeAfterMs = 0;
+        VerbLog("[Ironwind] interact_pause_transferred_to_native_ui");
+        return;
+    }
+    ou->userPause(false);
+    s_interactionPauseOwned = false;
+    s_interactionResumeAfterMs = 0;
+    VerbLog("[Ironwind] interact_pause_released");
+}
+
+// One-shot E interaction.  The request is prepared in the world loop, then
+// opened inside playerControl_hook so Kenshi observes a held-RMB lifecycle in
+// the same input phase as its original context menu.  We never invoke an option
+// ourselves; the native ContextMenuGUI owns selection and every resulting task.
 static void manualInteractionActionTick()
 {
     bool valid = s_mode == MODE_FREE_MOVE && s_directionalCombat
         && s_manualAttackOn && s_freeMoveAnchor
         && !s_dcShutdownInProgress && !s_loadGuardActive
         && !s_dcPtrLossActive;
+    if (s_interactionOpenPending && !valid)
+    {
+        manualInteractionScheduleResume("context_lost_before_open");
+    }
     if (s_interactionMenuByE)
     {
         bool visible = valid && ou && ou->player
             && ou->player->contextMenu.isVisible();
         if (!visible)
         {
-            s_interactionMenuByE = false;
-            VerbLog("[Ironwind] interact_menu_closed");
+            if (ou && ou->player && ou->player->contextMenu.isVisible() && s_gwFrame)
+                s_gwFrame->hideContextMenu();
+            manualInteractionScheduleResume("native_close");
         }
     }
     if (!s_interactionRequested) return;
     s_interactionRequested = false;
 
-    if (s_interactionMenuByE && ou && ou->player)
+    if ((s_interactionMenuByE || s_interactionOpenPending) && ou && ou->player)
     {
         if (s_gwFrame) s_gwFrame->hideContextMenu();
-        s_interactionMenuByE = false;
-        VerbLog("[Ironwind] interact_menu_closed reason=e_toggle");
+        manualInteractionScheduleResume("e_toggle");
         return;
     }
     if (!valid)
@@ -10086,13 +10352,15 @@ static void manualInteractionActionTick()
         VerbLog("[Ironwind] interact_mode_denied reason=committed_action");
         return;
     }
-    Character* target = manualInteractionPick(s_freeMoveAnchor);
-    if (!target || !focusTargetLoaded(target))
+    // Key-down gets a fresh spatial pick so the 75 ms HUD scan throttle never
+    // makes E act on the target the player has already moved away from.
+    RootObject* target = manualInteractionPick(s_freeMoveAnchor);
+    if (!manualInteractionRootValid(target, s_freeMoveAnchor))
     {
         VerbLog("[Ironwind] interact_no_target");
         return;
     }
-    s_interactionAutoTarget = target;
+    s_interactionTargetHandle = target;
     // Never carry a combat edge into the native menu.
     s_rmbCombatEdgeSeenMs = s_rmbCombatEdgeMs;
     s_rmbCombatEdgeMs = 0;
@@ -10102,13 +10370,12 @@ static void manualInteractionActionTick()
     s_mouseBlockHeld = false;
     s_blockHeld = false;
     s_blockGestureSeen = false;
-    ou->player->contextMenu.showContextMenu(true, target);
-    s_interactionMenuByE = ou->player->contextMenu.isVisible();
+    s_interactionPendingHandle = target;
+    s_interactionOpenPending = true;
     char b[224];
     sprintf_s(b, sizeof(b),
-        "[Ironwind] interact_menu_open visible=%d distance=%.1f target_dead=%d target_ko=%d",
-        s_interactionMenuByE ? 1 : 0, s_interactionPickSelectedDist,
-        target->isDead() ? 1 : 0, target->getProneState() == PS_KO ? 1 : 0);
+        "[Ironwind] interact_menu_requested type=%d distance=%.1f",
+        (int)target->getDataType(), s_interactionPickSelectedDist);
     VerbLog(b);
 }
 
@@ -11726,8 +11993,7 @@ static HitMaterialType iHitYouAreYouHit_hook(CombatClass* cc, CutDirection dir, 
         if (s_interactionMenuByE)
         {
             if (s_gwFrame) s_gwFrame->hideContextMenu();
-            manualInteractionClearRuntime(false);
-            VerbLog("[Ironwind] interact_menu_closed reason=hit");
+            manualInteractionScheduleResume("hit");
         }
         s_rmbCombatEdgeSeenMs = s_rmbCombatEdgeMs;
         s_rmbCombatEdgeMs = 0;
@@ -12374,8 +12640,9 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             }
         }
     }
-    manualInteractionTargetTick(); // nearby visible character -> E prompt
-    manualInteractionActionTick(); // E opens only that target's native menu
+    manualInteractionTargetTick(); // nearby native-interactable object -> attached E prompt
+    manualInteractionActionTick(); // E queues that target's original context menu
+    manualInteractionPauseTick();  // release only the pause created by this E transaction
     manualConsumeCombatRmb();       // RMB is always guard outside a visible menu
     manualBlockTick();    // manual combat: block hold/release edges (self-gated, cheap)
     // Hard-shutdown: all DC hook logic suppressed while true.
@@ -14850,8 +15117,35 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
         s_playerControlOrig(thisptr, k);
         return;
     }
+    bool interactionOpenedThisFrame = false;
     if (s_mode == MODE_FREE_MOVE && !s_lootUiSuspendActive)
     {
+        if (s_interactionOpenPending)
+        {
+            RootObject* target = s_interactionPendingHandle.isValid()
+                ? s_interactionPendingHandle.getRootObject() : nullptr;
+            s_interactionOpenPending = false;
+            s_interactionPendingHandle.setNull();
+            if (manualInteractionRootValid(target, s_freeMoveAnchor))
+            {
+                // showContextMenu is the original hold-RMB path.  Set its latch
+                // and the matching InputHandler state before the original
+                // playerControl update, otherwise it observes an immediate
+                // release and executes/closes the default option in one frame.
+                thisptr->contextMenu.rightMouseActivated = true;
+                k.mRight = k.lastMRight = true;
+                k.mRDown = k.mRUp = false;
+                s_interactionMenuByE = true;
+                thisptr->contextMenu.showContextMenu(true, target);
+                interactionOpenedThisFrame = thisptr->contextMenu.isVisible();
+                if (!interactionOpenedThisFrame)
+                {
+                    s_interactionMenuByE = false;
+                    VerbLog("[Ironwind] interact_menu_open_failed reason=no_native_options");
+                }
+            }
+            else VerbLog("[Ironwind] interact_menu_open_failed reason=stale_target");
+        }
         if (s_interactionMenuByE && thisptr->contextMenu.isVisible())
         {
             // Native hold-menu normally expects RMB to remain down. Keep only
@@ -14862,7 +15156,7 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
         }
         else if (s_interactionMenuByE)
         {
-            s_interactionMenuByE = false;
+            manualInteractionScheduleResume("input_phase_close");
         }
         if (mouseCombatContext())
         {
@@ -14903,6 +15197,30 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
         }
     }
     s_playerControlOrig(thisptr, k);
+
+    if (s_mode == MODE_FREE_MOVE && s_interactionMenuByE)
+    {
+        if (thisptr->contextMenu.isVisible())
+        {
+            // Pause only after the native player-control update accepted and
+            // retained the menu.  Existing pauses are never claimed.
+            if (!s_interactionPauseOwned && ou && !ou->isPaused())
+            {
+                ou->userPause(true);
+                s_interactionPauseOwned = true;
+            }
+            if (interactionOpenedThisFrame)
+            {
+                char b[224];
+                sprintf_s(b, sizeof(b),
+                    "[Ironwind] interact_menu_open visible=1 orders=%u pause_owned=%d",
+                    (unsigned)thisptr->contextMenu.orders.size(),
+                    s_interactionPauseOwned ? 1 : 0);
+                VerbLog(b);
+            }
+        }
+        else manualInteractionScheduleResume("post_input_close");
+    }
 
     if (s_mode == MODE_FREE_MOVE
         && !s_fpActive && !s_firstPersonActive   // OTS/FP own a DETACHED camera node — never

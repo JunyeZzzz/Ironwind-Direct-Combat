@@ -244,14 +244,18 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 玩家主动暂停后开库存 | 插件不得擅自解除主动暂停 |
 | 搜刮／交易 | 窗口距离与关闭行为保持原版合理性 |
 | 战斗层短按或长按右键 | 无论目标和时长都只格挡；不得打开菜单或对话 |
-| 靠近并面向中立／友方角色 | 自动出现黄色 `交互：名字`；距离更近者优先，视野边缘或 40 单位外目标不抢提示 | 目标变化时 `interact_target selected=... distance=... miss_px=...` |
+| 靠近并面向中立／友方角色 | 目标头部附近出现跟随位置的黄色 `E`；顶部战斗文字保持方向／格挡信息。距离更近者优先，视野边缘或 40 单位外目标不抢提示 | 目标变化时 `interact_target selected=1 type=1 distance=... miss_px=...` |
 | 靠近活着的红名敌人 | 不显示 E 交互提示，不影响方向攻击；敌人 KO 或死亡后允许成为搜刮候选 |
-| 有候选时按 E | 只打开一次该目标的原版上下文菜单，光标临时释放；不进入常驻模式 | `interact_menu_open visible=1 ...` |
-| 点击菜单中的对话／急救／搬运／搜刮等选项 | 由原版 MyGUI 回调执行；插件不得直接调用 `optionSelected`，菜单关闭后自动恢复准星和战斗 | `interact_menu_closed`，随后原版任务按选项出现 |
+| 准星靠近门、床、工作台／炮台 | 对象 AABB 附近出现同样的黄色 `E`；普通墙体、装饰和无原版任务对象不提示 | `interact_target selected=1 type=0 ...`；不得扫描或生成虚构选项 |
+| Kenshi 精确识别近距地面物品 | 允许显示 `E`；只有原版 `mouseRightTarget` 实际给出该物品时成立，不做全场物品扫描 | `interact_target selected=1 type=4 ...` |
+| 有候选时按 E | 只打开一次该目标的原版上下文菜单，菜单稳定停留且世界暂停、光标释放；V 模式不退出 | `interact_menu_requested ...` 后 `interact_menu_open visible=1 orders=... pause_owned=1`；不得在约一帧内自动执行默认项 |
+| 点击菜单中的对话／急救／搬运／搜刮／使用／开门等选项 | 由原版 MyGUI 回调执行；插件不得直接调用 `optionSelected`。普通世界任务选完后恢复时间、准星和战斗；若进入对话／库存／地图，暂停所有权交给原版 UI | 普通项为 `interact_menu_closed ...` 后 `interact_pause_released`；嵌套 UI 为 `interact_pause_transferred_to_native_ui`，随后原版任务按选项出现 |
+| 玩家原本已经暂停 | E 不得认领或解除玩家自己的暂停；菜单关闭后仍保持原暂停 | 不得错误出现 `pause_owned=1` 或擅自 `interact_pause_released` |
+| 候选没有任何原版菜单项 | 不暂停、不执行默认动作、不改变 V 模式 | `interact_menu_open_failed reason=no_native_options` |
 | 无候选时按 E | 不弹框、不吸附远处人物、不改变战斗状态 | `interact_no_target` |
 | 攻击、格挡、受击或已有 UI 时按 E | 不夺取动作或鼠标所有权 | `interact_mode_denied reason=committed_action/ui/context` |
 | E 菜单可见时受到真实攻击 | 菜单关闭并完整进入原版受击反应 | `interact_menu_closed reason=hit`，随后正常 `hit_native_reaction` |
-| 空格暂停中的 OTS／第一人称 | 世界人物和战斗保持暂停；鼠标仍可旋转视角，滚轮仍能调整远近／进出第一人称 | 可见暂停期间 `ots_zoom`；不得产生移动、攻击或任务推进 |
+| 空格暂停中的 OTS／第一人称 | 世界人物和战斗保持暂停，系统光标释放；不得继续捕获鼠标、移动、攻击或推进任务。恢复后准星只回中一次 | 暂停时能正常使用菜单光标；恢复后无鼠标锁死或连续回中 |
 | Esc、库存、地图、对话或 E 菜单 | 光标释放，鼠标移动和滚轮不得同时转动 V 镜头；关闭 UI 后恢复 |
 | 中立无对话包 | 黄准星，不出现原版黄箭头 |
 | 友方无对话包 | 绿准星，不出现原版绿箭头 |

@@ -297,7 +297,7 @@ function Invoke-IwCheck {
         $visibleOptions, '\{\s*"(?:Settings|FirstPerson)"\s*,'
     ).Count
     if ($visibleSettingCount -gt 11) {
-        throw "Ironwind options page regrew beyond the v123 compact limit: $visibleSettingCount visible settings."
+        throw "Ironwind options page regrew beyond the v124 compact limit: $visibleSettingCount visible settings."
     }
     if ($defaultIniText -notmatch '(?m)^\s*AiBlocksInManual\s*=\s*false\s*$') {
         throw 'Automatic block must ship disabled so the initial guard mode is manual directional.'
@@ -337,6 +337,26 @@ function Invoke-IwCheck {
         if ($settingsTsvText -match [regex]::Escape($text)) {
             throw "Removed custom incoming-attack translation returned: $text"
         }
+    }
+    foreach ($required in @(
+        'static hand              s_interactionTargetHandle',
+        'getObjectsWithinSphere(s_interactionBuildingScratch',
+        '"ironwind_interaction_hint"',
+        'contextMenu.rightMouseActivated = true',
+        'manualInteractionPauseTick',
+        'interact_pause_released'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "V-mode native interaction contract is incomplete: $required"
+        }
+    }
+    foreach ($removed in @('s_interactionAutoTarget', 'dc_manual_interaction_hud')) {
+        if ($sourceText -match [regex]::Escape($removed)) {
+            throw "Removed character-only interaction HUD path returned: $removed"
+        }
+    }
+    if ($settingsTsvText -match '(?m)^Interact:\s') {
+        throw 'Removed top-bar Interact caption translation returned.'
     }
     if ($sourceText -notmatch 'en\s*==\s*"focus_char"\s*&&\s*viewDown') {
         throw 'V-mode FirstPerson=F must suppress the colliding vanilla focus_char event.'

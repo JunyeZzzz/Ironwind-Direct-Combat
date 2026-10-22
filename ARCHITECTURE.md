@@ -1,6 +1,6 @@
 # 铁风执刃架构
 
-本文描述 v123 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
+本文描述 v124 的当前结构。历史方案见 `CHANGELOG.md`，当前缺陷见 `KNOWN_ISSUES.md`。项目正式名称为“铁风执刃 / Ironwind: Hands-On Combat”；下文出现的 `WASDCombatPlugin` 是必须保留的兼容文件名，不是产品归属，完整声明见 `NOTICE.md`。
 
 ## 1. 产物链
 
@@ -198,11 +198,11 @@ v116 不存在铁风主动闪避状态。Shift+方向是普通移动，Q 没有�
 - 准星模式只复用一套姓名和两行生命面板。`focusNpcTargetUnderCrosshair` 对敌对、中立、友军和玩家队友使用完全相同的只读规则：准星必须实际落在已加载角色的投影身体矩形内，重叠时取距离最近者，离开身体即隐藏。它不读取或写入 `s_lockTarget`、AI 战斗目标、交互目标、CombatClass、攻击意图或阵营关系。姓名按关系显示敌对红、友方绿、中立黄；医疗条颜色不随关系变化。面板上排为血／头／胸／腹，下排为左臂／右臂／左腿／右腿；不生成总 HP。v119 将单条视觉尺寸改为 `38×5 px`，缩小标签留白、列隙和行距，使条更长更细但两行更紧凑。标准身体使用稳定 FCS `stringID`（28～32、100、101 的 gamedata.quack 记录），自定义种族四肢以 `PART_ARM/PART_LEG + side` 回退。`focusHealthStates` 以 `_maxHealth * age * HPMult` 为原始容量，并按 `flesh - fleshStun`、`flesh`、`flesh + bandaging`、扣除 `wearDamage` 的有效上限和 `juryRigging` 计算原版医疗分段；`isRobotic()` 逐部位决定健康段使用原版绿皮肤还是骨人蓝皮肤。渲染直接复用 `Kenshi_LifeBarSkin/Robot/Stunned/Hurt/Healed/Crushed/Splint`，不存在的部位不绘制。敌人攻击不再生成铁风自制的手部／武器发光 widget；原版碰撞特效不属于该 HUD 模块。
 - 四个方向箭头位于准星上下左右并朝向中心，但任一时刻只显示当前选中的一个；四个方向都允许出现。四向由同一程序几何旋转生成独立 RGBA 纹理并通过 `ImageBox::setImageTexture()` 绑定；保持 64×64 外框、箭头长度和约 3 px 笔画，v73 的统一中心半径为 258 px。`s_dirMoveAvailable == 1` 的所选方向为绿色，其余和未知方向为白色；格挡输入不改变箭头颜色。
 - 真正命中时，四个斜线文本控件紧贴准星四个对角形成断开的红色 X，字形不放大，并在 1000 ms 内淡出；显示时间在加载清理中归零。
-- v102 每帧从 40 单位内的已加载角色筛选交互候选，距离优先、屏幕偏移次之；活着的敌对角色不抢交互提示，昏迷／死亡角色仍可选。候选显示黄色 `交互：名字`，有玩家对话包时仍显示对话气泡。
-- `E` 只登记一次请求；游戏线程重新验证候选与动作状态后调用原版 `ContextMenu::showContextMenu`。菜单可见期间临时释放光标并维持原版 RMB 菜单的持有语义，但选项点击完全交给 MyGUI／原版回调，菜单关闭即恢复战斗输入，不存在常驻交互模式。
+- v124 的交互候选与攻击／观察目标完全解耦。人物仍以 40 单位内的投影身体和距离评分选择，活着的敌人不抢提示，KO／死亡角色可选；建筑通过局部 `getObjectsWithinSphere(BUILDING)` 查询，并且必须是门、家具或暴露原版鼠标光标／默认任务。Kenshi 已精确给出的 `mouseRightTarget` 可补入地面物品等窄目标。持久身份只保存 `hand`，提示是附着于人物头部或建筑 AABB 中心的黄色 `E`，不再改写顶部战斗文字。
+- `E` 只登记一次请求；世界线程复核目标和动作状态后，将打开请求延迟到 `PlayerInterface::playerControl`。该 Hook 在调用原版前设置 `ContextMenu::rightMouseActivated` 和同帧 RMB 持有态，再调用原版 `ContextMenu::showContextMenu`，避免旧实现因输入相位错位在约一帧内关闭并误执行默认项。只有原版菜单在 `playerControl` 返回后仍可见时才调用 `userPause(true)`；菜单选项完全交给 MyGUI／原版回调。关闭后只释放本次 E 所拥有的暂停；若原版选项打开对话、库存、地图或角色页，则暂停所有权转交该 UI。`MODE_FREE_MOVE`、攻击、格挡和移动状态机不切换。
 - 红色断开 X 只由真实 `_getHit` 触发。v84 使用 26 px 红色斜线和同色系 1 px 阴影增加笔画重量，控件 alpha 最高 0.82，并在 1000 ms 内衰减；位置与四段布局不变。
 - 插件不直接调用 `ContextMenu::optionSelected`；攻击、格挡、受击或其他 UI 占用鼠标时拒绝开菜单，真实受击会关闭由 E 打开的菜单。
-- 空格暂停与 UI 菜单必须分开：世界暂停不进入 `dcUiWantsCursor`，所以 OTS／FP 继续读取鼠标与滚轮；`controlEnabled=false` 的真实菜单仍停止相机并释放光标。
+- 暂停与真实 UI 都进入统一的 `dcUiWantsCursor`，释放系统光标并停止 OTS／FP 鼠标捕获；恢复后只在捕获上升沿回中一次。E 菜单的暂停有独立所有权，不能解除玩家原先的暂停或原版后续 UI 的暂停。
 - 默认保持准星：中立黄、友方绿、空处/红名白。只有确认存在玩家对话包时才显示对话气泡，不显示原版黄/绿箭头。
 - V 模式库存打开时保留控制与镜头距离，自动释放鼠标；未按 WASD 时原地保持。
 - v123 的游戏内设置页为 11 个铁风按键和 11 个常用设置；`AimNameTag` 统一控制全部关系的观察面板，不再保留重复的 `ShowFriendlyHealth`。原版移动档位不重复展示。自动格挡的出厂值和页面重置值都为关闭，默认进入手动方向格挡；部署仍保留已有个人选择。仍有运行价值的攻击缓冲、键盘格挡、特殊种族和镜头裁剪参数只保留在 INI，页面“恢复默认”不覆盖这些个人 DIY 值。
