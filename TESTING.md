@@ -144,8 +144,8 @@
 | 松开左键 | 只提交一次当前高亮方向的攻击 |
 | 边缘绕圈 poke | 绿色方向在任意距离释放都应选择 `attack_direction_native_random` 并挥刀；远处目标允许 `contacts=0`，靠近后由原版产生 hit_candidate/blocked/dodged。未精确捕获但附近有敌人时应见 `attack_incidental_carrier` 或 `attack_incidental_carrier_anywhere`；不得出现目标距离拒绝、自动转向或 AI 自动靠近 |
 | 出手后切换准星目标 | 姓名/血条可以切换到新的 UI 焦点；在途 AttackState 不动态换载体。刀路实际碰到新角色时仍可由原版产生 `_getHit`，未碰到则正常落空 |
-| 中文／英文原版医疗面板 | 姓名下方只出现两行紧凑细长条：上排“血／头／胸／腹”，下排“左臂／右臂／左腿／右腿”。单条约 `38×5 px`，应明显长于 v118 的 `22×6 px` 色块，同时两行总高度更小、标签与条之间无多余空隙。有机健康必须为原版绿，骨人全身及机械义肢健康段为原版蓝；制造钝伤、未处理切割伤、包扎／机械修理、夹板和机械磨损，分别确认灰、红、黄、白覆盖和原版磨损段来自同一条内的真实比例，而不是整条按阈值换色 | 首次聚焦记录 `aim_health_part ... flesh=... stun=... bandage=... rig=... wear=... max=... robot=...`；28/29/30/31/32/100/101 ID 应解析正确。切换语言不影响识别，缺失部位不显示伪造空条，不得读取本地化显示名、合成总 HP 或重新引入健康阈值色 |
-| 全关系 NPC 精确观察面板 | 依次用准星直接覆盖敌对、中立、友军、玩家队友及倒地角色的身体，均显示姓名与同一套两行八部位面板；重叠时只显示距离最近者，移开准星立即隐藏。姓名应为敌对红、友方绿、中立黄，医疗条保持原版伤势颜色。关闭“显示 NPC 名称与生命状态”后全部隐藏 | 进入／离开覆盖时出现 `bars_observed_target set/none`；全场始终只有一套面板，不得因已有锁敌／AI 目标而在准星移开后继续显示，也不得改变锁敌、E 交互候选、攻击目标、CombatClass 或敌对关系 |
+| 中文／英文原版医疗面板 | 姓名下方只出现两行紧凑条：上排“血／头／胸／腹”，下排“左臂／右臂／左腿／右腿”。标签为 12 px、单条约 `50×8 px`、列隙 1 px；应比 v119 清晰，中文双字标签不挤压，同时标签与条、列与列、两行之间无多余空隙。有机健康必须为原版绿，骨人全身及机械义肢健康段为原版蓝；制造钝伤、未处理切割伤、包扎／机械修理、夹板和机械磨损，分别确认灰、红、黄、白覆盖和原版磨损段来自同一条内的真实比例，而不是整条按阈值换色 | 首次聚焦记录 `aim_health_part ... flesh=... stun=... bandage=... rig=... wear=... max=... robot=...`；28/29/30/31/32/100/101 ID 应解析正确。切换语言不影响识别，缺失部位不显示伪造空条，不得读取本地化显示名、合成总 HP 或重新引入健康阈值色 |
+| 全关系 NPC 精确观察面板 | 依次用准星直接覆盖敌对、中立、友军、玩家队友及倒地角色的身体，均显示姓名与同一套两行八部位面板；12 px 标签清晰、`50×8 px` 条可辨，列缝和两行仍紧凑且不遮挡人物。重叠时只显示距离最近者，移开准星立即隐藏。姓名应为敌对红、友方绿、中立黄，医疗条保持原版伤势颜色。关闭“显示 NPC 名称与生命状态”后全部隐藏 | 进入／离开覆盖时出现 `bars_observed_target set/none`；全场始终只有一套面板，不得因已有锁敌／AI 目标而在准星移开后继续显示，也不得改变锁敌、E 交互候选、攻击目标、CombatClass 或敌对关系 |
 | 原版 CHOP 完整性 | `attack_direct_native started=1` 后应以 `attack_native_finish_transition` 正常结束，或紧邻真实 `hit_on_me` 并以 `reason=hit_reaction*` 收权。若见 `attack_native_state_recovered`，必须至多一次、带 `source=combat_track/main_lifecycle` 且 progress<0.98，随后仍由原版完成；不得按固定时间重播。`attack_native_early_exit` 需保留为失败证据 |
 | impact 后视觉收招 | `currentTechniqueHasFinished` 后先记录 `attack_native_impact_finished progress<0.98`；此后只允许 `attack_native_recovery_clip`，不得新增 verdict/gethit。最终必须以 `attack_native_finish_transition source=clip_finished` 和 `attack_done` 结束，不能永久停在 CHOP |
 | impact 前按住右键 | 只记录一次 `attack_guard_wait_for_impact`，攻击的原版命中阶段继续；impact 后才允许开始交接 |
@@ -248,7 +248,7 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | 准星覆盖 30 单位内的中立／友方角色身体 | 胸口侧边出现带深色底、跟随位置的黄色 `E`；顶部战斗文字保持方向／格挡信息。同屏更近但未被准星覆盖的人不得抢提示，30 单位外不得提示 | `interact_target selected=1 type=1 ... miss_px=0.0` 后出现 `interaction_hint_visible type=1 x=... y=...` |
 | 靠近活着的红名敌人 | 不显示 E 交互提示，不影响方向攻击；敌人 KO 或死亡后允许成为搜刮候选 |
 | 准星覆盖 30 单位内的门、床、工作台／炮台投影范围 | 对象中心侧边出现同样的深色底黄色 `E`；普通墙体、装饰和无原版任务对象不提示 | `interact_target selected=1 type=0 ...` 与 `interaction_hint_visible type=0 ...`；不得生成虚构选项 |
-| Kenshi 精确识别近距地面物品 | 允许显示 `E`；只有原版 `mouseRightTarget` 实际给出该物品时成立，不做全场物品扫描 | `interact_target selected=1 type=4 ...` |
+| 准星覆盖近距地面物品／武器／护甲 | 30 单位内、准星覆盖对象投影时显示 `E`；侧边更近物品不得抢目标。按 E 打开该对象的原版菜单，选择拾取后由原版检查容量、所有权、偷窃和移动任务；铁风不直接塞入库存 | `interact_target selected=1 type=2/3/4 ...` → `interact_menu_requested` → `interact_menu_open visible=1`；选择项后出现原版任务或库存结果 |
 | 有候选时按 E | 只打开一次该目标的原版上下文菜单，菜单稳定停留且世界暂停、光标释放；V 模式不退出 | `interact_menu_requested ...` 后 `interact_menu_open visible=1 orders=... pause_owned=1`；不得在约一帧内自动执行默认项 |
 | 点击菜单中的对话／急救／搬运／搜刮／使用／开门等选项 | 由原版 MyGUI 回调执行；插件不得直接调用 `optionSelected`。普通世界任务选完后恢复时间、准星和战斗；若进入对话／库存／地图，暂停所有权交给原版 UI | 普通项为 `interact_menu_closed ...` 后 `interact_pause_released`；嵌套 UI 为 `interact_pause_transferred_to_native_ui`，随后原版任务按选项出现 |
 | 玩家原本已经暂停 | E 不得认领或解除玩家自己的暂停；菜单关闭后仍保持原暂停 | 不得错误出现 `pause_owned=1` 或擅自 `interact_pause_released` |

@@ -13,6 +13,7 @@
 #include <kenshi/CharStats.h>
 #include <kenshi/Damages.h>
 #include <kenshi/Inventory.h>
+#include <kenshi/Item.h>
 #include <kenshi/Gear.h>
 #include <kenshi/combat/CombatClass.h>
 #include <kenshi/combat/CombatState.h>
@@ -47,7 +48,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "127"
+#define IRONWIND_VERSION "128"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -794,15 +795,16 @@ static MyGUI::Widget*    s_hbLayer[HB_COUNT][HBL_COUNT] = {};
 static bool              s_hbTried             = false;
 static bool              s_hbNamesLogged       = false;  // DIAG: the body-part names seen, once
 static const int         HB_COLS = 4, HB_ROWS = 2;
-// Long, fine anatomy strips: keep two-character labels readable while giving
-// the actual vanilla damage composition most of each cell.  The tighter rows
-// reduce head clutter even though every value has substantially more length.
-static const int         HB_LABEL_W = 18, HB_BAR_W = 38, HB_CELL_W = 57;
-static const int         HB_H = 5, HB_GAP = 2, HB_ROW_H = 10;
+// Readable but compact anatomy strips.  Chinese two-character labels receive
+// a real 12 px line box, while the bar itself is larger in both dimensions.
+// Cells contain no spare padding and the one-pixel column gap keeps the two
+// rows visually dense despite the larger content.
+static const int         HB_LABEL_W = 27, HB_BAR_W = 50, HB_CELL_W = 78;
+static const int         HB_H = 8, HB_GAP = 1, HB_ROW_H = 13;
 static const int         HB_PANEL_W = HB_COLS * HB_CELL_W + (HB_COLS - 1) * HB_GAP;
 static MyGUI::TextBox*   s_hbLabel[HB_COUNT]   = {};
-static const int         HB_LH = 10;
-static const int         HB_RAISE = 36;                   // both rows stay clear of the head
+static const int         HB_LH = 13;
+static const int         HB_RAISE = 40;                   // both larger rows stay clear of the head
 // Vanilla SPEECH TEXT (user 2026-09-30): while the tagged enemy has a speech
 // bubble up, the name+bars group steps ABOVE it by the bubble's real on-screen
 // height and drops back when it is gone.  Build 66: bubbles are found by
@@ -6136,7 +6138,7 @@ static bool focusHealthBarsCreate()
             s_hbLabel[i]->setTextColour(MyGUI::Colour(0.78f, 0.78f, 0.76f));
             s_hbLabel[i]->setTextShadow(true);
             s_hbLabel[i]->setTextShadowColour(MyGUI::Colour::Black);
-            try { s_hbLabel[i]->setFontHeight(9); } catch (...) {}
+            try { s_hbLabel[i]->setFontHeight(12); } catch (...) {}
             s_hbLabel[i]->setNeedMouseFocus(false); s_hbLabel[i]->setVisible(false);
         }
         DebugLog("[WASDCombat] aim_health_bars_created");
@@ -10087,15 +10089,18 @@ static void manualAttackAimCaptureTick()
 }
 
 // Nearby interaction target selection.  It deliberately stays independent of
-// attack intent: E may address a person or a world building while LMB remains
-// entirely owned by manual combat.  Characters use a forgiving projected-body
-// gate; buildings use their world AABB and must expose a native cursor/task (or
-// be a door/furniture).  The final action is still validated by Kenshi's native
+// attack intent: E may address a person, loose inventory item or world building
+// while LMB remains entirely owned by manual combat. Characters reuse the strict
+// projected-body observer; loose items and buildings use local world queries plus
+// projected bounds. The final action is still validated by Kenshi's native
 // ContextMenu, so this layer never invents an order.
 static int s_interactionPickSeen = 0;
 static float s_interactionPickNearestPx = -1.0f;
 static float s_interactionPickSelectedDist = -1.0f;
 static lektor<RootObject*> s_interactionBuildingScratch;
+static lektor<RootObject*> s_interactionItemScratch;
+static lektor<RootObject*> s_interactionWeaponScratch;
+static lektor<RootObject*> s_interactionArmourScratch;
 
 static bool manualInteractionBuildingEligible(Building* b)
 {
@@ -10103,6 +10108,14 @@ static bool manualInteractionBuildingEligible(Building* b)
     return b->isDoor() || b->isFurniture()
         || b->getMouseCursor() != DEFAULT_CURSOR
         || b->getDefaultTask() != NULL_TASK;
+}
+
+static bool manualInteractionLooseItemEligible(RootObject* root)
+{
+    if (!root || !root->isValid() || !root->typeIsAnItem()) return false;
+    Item* item = static_cast<Item*>(root);
+    return item->onGround() && !item->isInInventory
+        && item->getVisible() && !item->isDisabled();
 }
 
 static bool manualInteractionRootValid(RootObject* target, Character* me)
@@ -10119,13 +10132,12 @@ static bool manualInteractionRootValid(RootObject* target, Character* me)
     }
     if (type == BUILDING)
         return manualInteractionBuildingEligible(static_cast<Building*>(target));
-    // Let an exact target already chosen by Kenshi expose its own native menu
-    // (for example a loose item).  We do not run a broad fallback scan for it.
-    return type == ITEM;
+    return manualInteractionLooseItemEligible(target);
 }
 
 static bool manualInteractionAabbScreenMiss(Ogre::Camera* cam, const Ogre::Aabb& box,
-                                            float aimX, float aimY, float& missOut)
+                                            float aimX, float aimY, float halo,
+                                            float tolerance, float& missOut)
 {
     const Ogre::Vector3& c = box.mCenter;
     const Ogre::Vector3& h = box.mHalfSize;
@@ -10152,12 +10164,56 @@ static bool manualInteractionAabbScreenMiss(Ogre::Camera* cam, const Ogre::Aabb&
         ++projected;
     }
     if (!projected) return false;
-    const float halo = 18.0f;
     left -= halo; right += halo; top -= halo; bottom += halo;
     float dx = aimX < left ? left - aimX : (aimX > right ? aimX - right : 0.0f);
     float dy = aimY < top ? top - aimY : (aimY > bottom ? aimY - bottom : 0.0f);
     missOut = dx + dy;
-    return dx <= 24.0f && dy <= 24.0f;
+    return dx <= tolerance && dy <= tolerance;
+}
+
+static void manualInteractionConsiderItems(lektor<RootObject*>& items,
+                                           Ogre::Camera* cam,
+                                           const Ogre::Vector3& mp,
+                                           float aimX, float aimY, float maxR2,
+                                           RootObject*& best, float& bestScore)
+{
+    for (auto it = items.begin(); it != items.end(); ++it)
+    {
+        RootObject* root = *it;
+        if (!manualInteractionLooseItemEligible(root)) continue;
+        Ogre::Vector3 p = root->getPosition();
+        Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        if (d2 >= maxR2) continue;
+        ++s_interactionPickSeen;
+
+        // Ground props can be only a few pixels wide.  Prefer their projected
+        // physical bounds with a small visual halo; use the exact world centre
+        // only when Kenshi exposes no usable AABB.  This remains a reticle hit,
+        // never a nearest-item magnet.
+        float miss = 0.0f;
+        bool covered = manualInteractionAabbScreenMiss(
+            cam, root->getAABB(), aimX, aimY, 8.0f, 12.0f, miss);
+        if (!covered)
+        {
+            int sx, sy;
+            if (!focusProject(cam, p, 0.0f, sx, sy)) continue;
+            float dx = fabsf(sx - aimX), dy = fabsf(sy - aimY);
+            if (dx > 24.0f || dy > 24.0f) continue;
+            miss = dx + dy;
+        }
+        if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
+            s_interactionPickNearestPx = miss;
+        float score = miss + sqrtf(d2) * 0.08f;
+        if (s_interactionTargetHandle.isValid()
+            && s_interactionTargetHandle.getRootObject() == root) score -= 0.15f;
+        if (score < bestScore)
+        {
+            bestScore = score;
+            best = root;
+            s_interactionPickSelectedDist = sqrtf(d2);
+        }
+    }
 }
 
 static RootObject* manualInteractionPick(Character* me)
@@ -10197,12 +10253,10 @@ static RootObject* manualInteractionPick(Character* me)
     }
     if (best) return best;
 
-    // A loose item has no broad fallback scan.  Accept it only when Kenshi's
-    // native picker already resolved that exact item very near the crosshair.
+    // Preserve Kenshi's own exact picker when it has a valid loose item.
     RootObject* nativeTarget = ou->player->mouseRightTargetSet
         ? ou->player->mouseRightTarget : nullptr;
-    if (manualInteractionRootValid(nativeTarget, me)
-        && nativeTarget->getDataType() == ITEM)
+    if (manualInteractionLooseItemEligible(nativeTarget))
     {
         Ogre::Vector3 p = nativeTarget->getPosition();
         Ogre::Vector3 delta = p - mp; delta.y = 0.0f;
@@ -10223,6 +10277,28 @@ static RootObject* manualInteractionPick(Character* me)
     }
     if (best) return best;
 
+    // Detached over-shoulder/first-person cameras do not reliably populate
+    // mouseRightTarget because the native cursor is hidden.  Query only the
+    // immediate 30-unit neighbourhood and require the reticle to cover the
+    // projected item.  Weapons and armour are separate Kenshi data types even
+    // though all three are Item instances and use the same native menu.
+    s_interactionItemScratch.clear();
+    s_interactionWeaponScratch.clear();
+    s_interactionArmourScratch.clear();
+    s_gwFrame->getObjectsWithinSphere(s_interactionItemScratch, mp, 30.0f,
+                                      ITEM, 64, me);
+    s_gwFrame->getObjectsWithinSphere(s_interactionWeaponScratch, mp, 30.0f,
+                                      WEAPON, 64, me);
+    s_gwFrame->getObjectsWithinSphere(s_interactionArmourScratch, mp, 30.0f,
+                                      ARMOUR, 64, me);
+    manualInteractionConsiderItems(s_interactionItemScratch, cam, mp,
+                                   aimX, aimY, maxR2, best, bestScore);
+    manualInteractionConsiderItems(s_interactionWeaponScratch, cam, mp,
+                                   aimX, aimY, maxR2, best, bestScore);
+    manualInteractionConsiderItems(s_interactionArmourScratch, cam, mp,
+                                   aimX, aimY, maxR2, best, bestScore);
+    if (best) return best;
+
     // Buildings are not in the character update list.  Query only a small
     // local sphere while V mode is active, then select by projected AABB centre.
     s_interactionBuildingScratch.clear();
@@ -10241,7 +10317,8 @@ static RootObject* manualInteractionPick(Character* me)
         if (d2 >= maxR2) continue;
         ++s_interactionPickSeen;
         float miss = 0.0f;
-        if (!manualInteractionAabbScreenMiss(cam, box, aimX, aimY, miss)) continue;
+        if (!manualInteractionAabbScreenMiss(cam, box, aimX, aimY,
+                                             18.0f, 24.0f, miss)) continue;
         if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
             s_interactionPickNearestPx = miss;
         float score = miss + sqrtf(d2) * 0.08f;

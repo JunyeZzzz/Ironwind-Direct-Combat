@@ -341,6 +341,10 @@ function Invoke-IwCheck {
     foreach ($required in @(
         'static hand              s_interactionTargetHandle',
         'getObjectsWithinSphere(s_interactionBuildingScratch',
+        'getObjectsWithinSphere(s_interactionItemScratch',
+        'getObjectsWithinSphere(s_interactionWeaponScratch',
+        'getObjectsWithinSphere(s_interactionArmourScratch',
+        'manualInteractionLooseItemEligible',
         '"ironwind_interaction_hint"',
         '"ironwind_interaction_hint_bg"',
         'contextMenu.rightMouseActivated = true',
@@ -349,6 +353,15 @@ function Invoke-IwCheck {
     )) {
         if ($sourceText -notmatch [regex]::Escape($required)) {
             throw "V-mode native interaction contract is incomplete: $required"
+        }
+    }
+    foreach ($required in @(
+        'HB_LABEL_W = 27, HB_BAR_W = 50, HB_CELL_W = 78',
+        'HB_H = 8, HB_GAP = 1, HB_ROW_H = 13',
+        'setFontHeight(12)'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v128 readable compact health-panel contract is incomplete: $required"
         }
     }
     foreach ($removed in @('s_interactionAutoTarget', 'dc_manual_interaction_hud')) {
