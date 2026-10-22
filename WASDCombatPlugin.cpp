@@ -48,7 +48,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "128"
+#define IRONWIND_VERSION "129"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -797,14 +797,15 @@ static bool              s_hbNamesLogged       = false;  // DIAG: the body-part 
 static const int         HB_COLS = 4, HB_ROWS = 2;
 // Readable but compact anatomy strips.  Chinese two-character labels receive
 // a real 12 px line box, while the bar itself is larger in both dimensions.
-// Cells contain no spare padding and the one-pixel column gap keeps the two
-// rows visually dense despite the larger content.
-static const int         HB_LABEL_W = 27, HB_BAR_W = 50, HB_CELL_W = 78;
-static const int         HB_H = 8, HB_GAP = 1, HB_ROW_H = 13;
+// Labels and bars keep their v128 readable sizes. The label box is only as
+// wide as two 12 px Chinese glyphs need, touches its bar directly, and cells
+// touch each other; compactness comes from spacing, never smaller content.
+static const int         HB_LABEL_W = 25, HB_BAR_W = 50, HB_CELL_W = 75;
+static const int         HB_H = 8, HB_GAP = 0, HB_ROW_H = 13;
 static const int         HB_PANEL_W = HB_COLS * HB_CELL_W + (HB_COLS - 1) * HB_GAP;
 static MyGUI::TextBox*   s_hbLabel[HB_COUNT]   = {};
 static const int         HB_LH = 13;
-static const int         HB_RAISE = 40;                   // both larger rows stay clear of the head
+static const int         HB_RAISE = 38;                   // larger rows stay close to, but clear of, the head
 // Vanilla SPEECH TEXT (user 2026-09-30): while the tagged enemy has a speech
 // bubble up, the name+bars group steps ABOVE it by the bubble's real on-screen
 // height and drops back when it is gone.  Build 66: bubbles are found by
@@ -6587,7 +6588,7 @@ static void focusMarkersUpdate(CameraClass* thisptr)
                     int row = i / HB_COLS, col = i % HB_COLS;
                     int cellX = sx - HB_PANEL_W / 2 + col * (HB_CELL_W + HB_GAP);
                     int rowY = sy + 1 + row * HB_ROW_H;
-                    int bx = cellX + HB_LABEL_W + 1;
+                    int bx = cellX + HB_LABEL_W;
                     int by = rowY + (HB_LH - HB_H) / 2;
                     s_hbBg[i]->setCoord(bx, by, HB_BAR_W, HB_H);
                     s_hbBg[i]->setVisible(health[i].present);

@@ -356,12 +356,13 @@ function Invoke-IwCheck {
         }
     }
     foreach ($required in @(
-        'HB_LABEL_W = 27, HB_BAR_W = 50, HB_CELL_W = 78',
-        'HB_H = 8, HB_GAP = 1, HB_ROW_H = 13',
+        'HB_LABEL_W = 25, HB_BAR_W = 50, HB_CELL_W = 75',
+        'HB_H = 8, HB_GAP = 0, HB_ROW_H = 13',
+        'int bx = cellX + HB_LABEL_W;',
         'setFontHeight(12)'
     )) {
         if ($sourceText -notmatch [regex]::Escape($required)) {
-            throw "v128 readable compact health-panel contract is incomplete: $required"
+            throw "v129 readable compact health-panel contract is incomplete: $required"
         }
     }
     foreach ($removed in @('s_interactionAutoTarget', 'dc_manual_interaction_hud')) {
