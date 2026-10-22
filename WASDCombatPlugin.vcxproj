@@ -14,7 +14,7 @@
     <VCProjectVersion>16.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{079C45A7-5448-4BCA-A454-82C255AD0922}</ProjectGuid>
-    <RootNamespace>WASDCombatPlugin</RootNamespace>
+    <RootNamespace>IronwindCombat</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <PropertyGroup>

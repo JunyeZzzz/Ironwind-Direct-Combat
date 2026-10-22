@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "sessionStartPattern": "Ironwind Combat v(?<version>[0-9]+)",
+  "pluginPattern": "WASDCombatPlugin:",
+  "noisePatterns": [
+    "^camera$",
+    "^mouse_input$",
+    "^dc_load_flag$",
+    "^dc_fp_cutaway_gate$"
+  ],
+  "groups": [
+    {
+      "id": "attack_input",
+      "label": "攻击输入",
+      "patterns": ["^attack_aim_", "^attack_press_target$", "^attack_release_commit$", "^attack_commit$", "^attack_queue"]
+    },
+    {
+      "id": "attack_native",
+      "label": "原版攻击链",
+      "patterns": ["^attack_direct_native$", "^attack_native_", "^attack_done$", "^attack_direction_native_random$"]
+    },
+    {
+      "id": "free_action",
+      "label": "自由动作",
+      "patterns": ["^free_attack_", "^free_action_", "^free_block_"]
+    },
+    {
+      "id": "outcome",
+      "label": "命中与防御结果",
+      "patterns": ["^attack_native_verdict$", "^attack_native_gethit$", "^hit_marker_trigger$", "^hit_vanilla_verdict$", "^directional_guard_block$", "^ai_block_", "^ai_guard_"]
+    },
+    {
+      "id": "reaction",
+      "label": "玩家受击反应",
+      "patterns": ["^hit_on_me$", "^stagger_", "^hit_reaction_", "^knockdown_or_stagger_started$", "^getup_animation_started$"]
+    },
+    {
+      "id": "control",
+      "label": "控制权与移动",
+      "patterns": ["^manual_combat_", "^attack_direct_control_", "^combat_move$", "^guard_stationary_hold$", "^dc_wasd_", "^MODE$"]
+    },
+    {
+      "id": "interface",
+      "label": "界面与交互",
+      "patterns": ["^direction_", "^hit_marker_hud_", "^interact_", "^inventory_", "^dc_menu_", "^ots_zoom"]
+    },
+    {
+      "id": "lifecycle",
+      "label": "加载与生命周期",
+      "patterns": ["^session_start$", "^unloaded$", "^hook_ok$", "^combat_base_update_resolved$", "^dc_native_"]
+    }
+  ],
+  "dynamicPrefixes": [
+    { "id": "auto_attack", "pattern": "^attack_" },
+    { "id": "auto_guard", "pattern": "^(block_|guard_|perfect_block)" },
+    { "id": "auto_control", "pattern": "^(dc_|wasd_|manual_ai_|combat_|stale_movement|snap_)" },
+    { "id": "auto_interface", "pattern": "^(aim_|bars_|glint_|direction_|hit_marker_hud_)" },
+    { "id": "auto_weapon", "pattern": "^weapon_" },
+    { "id": "auto_lifecycle", "pattern": "^(settings_|human_|anchor_)" }
+  ],
+  "riskRules": [
+    {
+      "id": "fatal",
+      "severity": "error",
+      "pattern": "(?i)(access violation|exception code|fatal error|assertion failed|crashed|crash_dump[^\\r\\n]*(written|created))",
+      "description": "发现崩溃、异常或断言文本"
+    },
+    {
+      "id": "runtime_invariant",
+      "severity": "error",
+      "pattern": "invariant_violation",
+      "description": "铁风运行时出现互斥所有权重叠或残留状态"
+    },
+    {
+      "id": "native_start_failed",
+      "severity": "info",
+      "pattern": "attack_direct_native.*started=0",
+      "description": "原版攻击初始化失败"
+    },
+    {
+      "id": "native_early_exit",
+      "severity": "warning",
+      "pattern": "attack_native_early_exit",
+      "description": "原版攻击提前退出"
+    },
+    {
+      "id": "native_state_recovered",
+      "severity": "info",
+      "pattern": "attack_native_state_recovered",
+      "description": "保护门恢复了仍在播放的攻击状态"
+    },
+    {
+      "id": "reaction_fallback_advance",
+      "severity": "info",
+      "pattern": "hit_reaction_fallback_advance",
+      "description": "第三方调度遗漏时补执行了一次原版受击状态推进"
+    },
+    {
+      "id": "invalid_native_advance",
+      "severity": "warning",
+      "pattern": "attack_native_advance_invalid",
+      "description": "原版攻击推进入口无效"
+    },
+    {
+      "id": "missing_technique",
+      "severity": "info",
+      "pattern": "(free_attack_no_technique|free_block_no_technique)",
+      "description": "请求方向没有可用动作"
+    },
+    {
+      "id": "queue_expired",
+      "severity": "info",
+      "pattern": "attack_queue_expired",
+      "description": "缓存攻击过期"
+    },
+    {
+      "id": "clip_invalid",
+      "severity": "warning",
+      "pattern": "(clip_invalid|direction_arrow_textures_create_failed|direction_hud_create_failed|hit_marker_hud_create_failed)",
+      "description": "动画片段或 HUD 资源无效"
+    },
+    {
+      "id": "weapon_reach_invalid",
+      "severity": "warning",
+      "pattern": "weapon_reach_invalid",
+      "description": "原版武器距离访问结果越界"
+    },
+    {
+      "id": "ai_or_path_takeover",
+      "severity": "error",
+      "pattern": "(?i)(manual_combat_ai_takeover|target_pathfinding|automatic_followup_attack)",
+      "description": "疑似 AI 接管、寻路或自动连击"
+    }
+  ],
+  "attackChain": {
+    "releaseEvent": "attack_release_commit",
+    "startEvent": "attack_direct_native",
+    "startSuccessPattern": "started=1",
+    "impactEvent": "attack_native_impact_finished",
+    "finishEvents": ["attack_done", "free_attack_done", "attack_native_early_exit"],
+    "verdictEvent": "attack_native_verdict",
+    "confirmedHitEvent": "attack_native_gethit",
+    "markerEvent": "hit_marker_trigger"
+  }
+}

@@ -1,16 +1,23 @@
-#include <Debug.h>
+﻿#include <Debug.h>
 #include <kenshi/GameWorld.h>
 #include <kenshi/SaveManager.h>
 #include <kenshi/PlayerInterface.h>
 #include <kenshi/InputHandler.h>
 #include <kenshi/Character.h>
+#include <kenshi/Dialogue.h>
+#include <kenshi/CharacterHuman.h>
 #include <kenshi/CharBody.h>
 #include <kenshi/Tasker.h>
 #include <kenshi/CharMovement.h>
 #include <kenshi/util/UtilityT.h>       // traceNoActors — detached OTS camera collision
 #include <kenshi/CharStats.h>
-#include <kenshi/CombatClass.h>
-#include <kenshi/CombatTechniqueData.h>  // manual dodge: isDodge technique filter
+#include <kenshi/Damages.h>
+#include <kenshi/Inventory.h>
+#include <kenshi/Gear.h>
+#include <kenshi/combat/CombatClass.h>
+#include <kenshi/combat/CombatState.h>
+#include <kenshi/combat/CombatTechniqueData.h>  // native attack / defence technique metadata
+#include <kenshi/Animation/AnimationClass.h>
 #include <kenshi/CameraClass.h>
 #include <kenshi/Globals.h>
 #include <kenshi/OptionsHolder.h>
@@ -31,6 +38,7 @@
 #include <ogre/OgreGpuProgramParams.h>  // FP head hidden-parts mask
 #include <ogre/OgreOldSkeletonInstance.h>   // first-person head-bone tracking
 #include <ogre/OgreOldBone.h>               // first-person head-bone tracking
+#include <ogre/OgreAnimationState.h>         // actual clip timeline for manual attacks
 #include <kenshi/Appearance.h>              // AppearanceBase (head/hair hide, skeleton)
 #include <kenshi/Town.h>                    // TownBase::withinBordersRange (slave camp bounds)
 #include <kenshi/Building/Building.h>      // Building::hasInterior (FP floor cutaway gate)
@@ -39,6 +47,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
+#define IRONWIND_VERSION "120"
+#define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
 #pragma comment(lib, "winmm.lib")
@@ -47,6 +57,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <limits.h>
+#include <map>
 #include <mygui/MyGUI.h>
 #include <mygui/MyGUI_TextBox.h>       // "Manual Attack" HUD label
 #include <mygui/MyGUI_ImageBox.h>      // lock-on dot + weapon glints (GUI-space markers)
@@ -141,7 +152,7 @@ static const LogConfig g_log = {
     /* debugVerbose              */ false,
 };
 // v1.5: the per-event combat / movement diagnostics that drove the 1.5 tuning
-// (every hit, swing, dodge, block, stagger, aim change, release stop, load
+// (every hit, swing, native defence result, block, stagger, aim change, release stop, load
 // flag ...) stay in the build behind ONE runtime switch so a player report can
 // be diagnosed by flipping a setting - [Settings] VerboseLog (tab:
 // TROUBLESHOOTING > "Detailed log for bug reports").  Off by default.
@@ -193,7 +204,6 @@ static volatile bool        s_wHeld  = false;
 static volatile bool        s_aHeld  = false;
 static volatile bool        s_sHeld  = false;
 static volatile bool        s_dHeld  = false;
-static volatile bool        s_xPressed = false;
 // SPEEDSYNC-TWEAK: set when vanilla cycle_run_speed fires while DC is active;
 // mainLoop re-syncs the anchor's desired speed to the (already-cycled) panel.
 static volatile bool        s_syncSpeedToAnchor = false;
@@ -212,21 +222,10 @@ static bool                 s_rmbPrev        = false;  // poll thread only
 static bool                 s_lmbPrev          = false;     // poll thread only
 static ULONGLONG            s_lastLmbDownMs    = 0;         // poll thread only
 static volatile ULONGLONG   s_lmbDoubleClickMs = 0;        // set by poll, consumed by main
-// CTRL toggle (user req 2026-06-20; upgraded 2026-09-02): in DC mode CTRL is a
-// press-on/press-off TOGGLE.  The poll thread flips s_camRotateToggle on each
-// CTRL press while in DC; cameraUpdate_hook forces InputHandler::rotate (the
-// flag CameraClass::update reads) so the mouse rotates the view continuously,
-// AND (v1.4.0) drives the vanilla orbit camera into an OVER-THE-SHOULDER pose
-// — short zoom, pivot raised/pushed toward the shoulder — so CTRL now reads as
-// a third-person action-camera toggle.  The vanilla camera still owns rotation,
-// collision and floor clamps; we only steer where it orbits.  Reset whenever DC
-// turns off or any UI opens (cursor freed for menus, unchanged).
-static volatile bool        s_camRotateToggle  = false;
-static bool                 s_ctrlPrevPoll     = false;     // poll thread only
 // XHAIR-TWEAK (user req 2026-09-04): draw our own fixed white "+" crosshair
 // and HIDE the game pointer while FP/OTS is engaged, instead of parking the
 // visible OS cursor at center.  The look math (cursor warp / rotate) is
-// unchanged — it just runs behind a hidden pointer, so toggling CTRL/P shows
+// unchanged — it just runs behind a hidden pointer, so V/F shows
 // the crosshair and hides the cursor with no visible sweep across the screen.
 // Two WhiteSkin bars on the "Top" MyGUI layer; created lazily on the UI
 // thread; hidden (pointer restored) whenever a UI suspends the mode.
@@ -247,14 +246,15 @@ static bool           s_xhWasWant = false;   // want last frame (return-to-cente
 // changed).  So we hook the MyGUIEngine_x64.dll exports themselves —
 // record-and-forward only, never alter the call.
 static std::string    s_xhPtrName("arrow");
+static volatile bool  s_allowTalkCursor = false; // game thread: reticle has player dialogue
+static volatile int   s_xhairTint = 0;           // 0 white, 1 yellow neutral, 2 green ally
 static void dcNotePointerName(const std::string& _name) { s_xhPtrName = _name; }
 static bool dcPointerIsContextual()
 {
-    // Kenshi pointer set (data/gui/pointer/kenshi_pointers.xml): everything
-    // except the plain arrow / hidden states signals an interaction.
-    return !s_xhPtrName.empty()
-        && s_xhPtrName != "arrow"
-        && s_xhPtrName != "invisible";
+    // Keep the V-mode reticle.  Only the talk bubble may replace it, and only
+    // when the character under the crosshair has a player-talk package.
+    return s_allowTalkCursor
+        && (s_xhPtrName == "talk" || s_xhPtrName == "s_talk");
 }
 // Hook trio: public setPointer(name) = world hover; private setPointer(name,
 // owner) = widget path (also reached from inside the public one when the DLL
@@ -320,6 +320,10 @@ static bool             s_otsHadAutoTrack  = false;
 static bool             s_otsCursorCaptured = false;  // own mouse-look baseline
 static float            s_otsZoomCur       = 20.0f;   // live zoom (base + wheel)
 static float            s_otsCollDistSm    = 20.0f;   // collision-clamped distance (eased out, snaps in)
+static const float      OTS_ZOOM_MAX       = 120.0f;
+static const float      OTS_ZOOM_FP_ENTER  = 3.0f;
+static const float      OTS_ZOOM_FP_EXIT   = 6.0f;
+static bool             s_otsResumeZoomPending = false; // preserve wheel distance on FP -> OTS
 // OTS rig coherence (v1.4.1): while the detached OTS camera owns the view the
 // vanilla rig is parked (stopFollowing at enter) — but the AUDIO LISTENER and
 // zone/foliage streaming key off that rig, so area sounds kept playing from
@@ -333,8 +337,8 @@ static float            s_otsFovDeg        = 60.0f;   // OTS field of view (3rd-
 static float            s_otsShoulderSign  = 1.0f;    // +1 = right shoulder, -1 = left (SwapShoulder key)
 static void exitOtsCam(bool restoreCamera);           // fwd decl (enterFirstPerson uses it)
 // [Settings] OTS tunables (INI + settings-tab sliders; live).
-static float s_otsCamDist   = 20.0f;  // OtsDistance — orbit zoom while engaged
-static float s_otsCamHeight = 15.0f;  // OtsHeight — pivot height above the feet;
+static float s_otsCamDist   = 23.0f;  // OtsDistance — orbit zoom while engaged
+static float s_otsCamHeight = 18.0f;  // OtsHeight — pivot height above the feet;
                                       // ~15 ≈ shoulder line, height-scaled per
                                       // character (user-tuned default 2026-09-06;
                                       // slider range -5..20)
@@ -346,11 +350,9 @@ static float s_otsNearClipMin = 0.15f; // OtsNearClip — near plane once the ca
                                       // character open (user 2026-09-11).
 static float s_otsCamSide   = 4.0f;   // OtsSide — shoulder offset (+ = right, - =
                                       // left; flipped live by the SwapShoulder key)
-// Set by cameraUpdate_hook (player camera) when ANY UI wants the cursor.  The poll
-// thread reads it to NOT flip the crosshair toggle on CTRL presses made INSIDE a
-// menu (Kenshi uses CTRL+click constantly in trade/inventory) — otherwise those
-// presses corrupt the crosshair toggle/home (field 2026-06-21, merchant trade).
-static volatile bool        s_camRotateUiOpen  = false;
+// Set by cameraUpdate_hook (player camera) when any UI wants the cursor. This is
+// a generic camera/input gate, not the removed legacy Ctrl camera toggle.
+static volatile bool        s_cameraUiOpen  = false;
 // Poll thread: set on first WASD key press; consumed and cleared on full WASD release.
 static volatile ULONGLONG   s_wasdTapStartMs = 0;
 // SelectControl ("G" by default since v1.5, INI-configurable) press edge.  While DC is active,
@@ -471,14 +473,14 @@ static void setMode(ControlMode next)
 // is touched — movement, hold, point-click, camera, combat, and XP logic
 // are unchanged.
 // =======================================================================
-enum KeyRole { KR_FORWARD = 0, KR_LEFT, KR_BACK, KR_RIGHT, KR_TOGGLE, KR_SPEED, KR_SELECT, KR_FP, KR_SNEAK, KR_OTS_SHOULDER, KR_BLOCK, KR_DODGE, KR_ATTACK, KR_MANUAL, KR_COUNT };
-static int s_bindVk[KR_COUNT] = { 'W', 'A', 'S', 'D', 'V', 'X', 'G', 'P', 'C', 'H', 'F', 'Q', 'E', 'Z' };  // defaults (v1.5: control G, block F)
+enum KeyRole { KR_FORWARD = 0, KR_LEFT, KR_BACK, KR_RIGHT, KR_TOGGLE, KR_SELECT, KR_FP, KR_SNEAK, KR_OTS_SHOULDER, KR_BLOCK, KR_ATTACK, KR_COUNT };
+static int s_bindVk[KR_COUNT] = { 'W', 'A', 'S', 'D', 'V', 'G', 'F', 'C', 'H', 'Q', 'E' };  // v118: X/Z are exclusively vanilla speed_3/speed_1
 static const char* const KR_INI_KEY[KR_COUNT] =
-    { "MoveForward", "MoveLeft", "MoveBackward", "MoveRight", "ToggleDC", "SpeedCycle", "SelectControl", "FirstPerson", "SneakToggle", "SwapShoulder", "Block", "Dodge", "Attack", "ManualAttack" };
+    { "MoveForward", "MoveLeft", "MoveBackward", "MoveRight", "ToggleDC", "SelectControl", "FirstPerson", "SneakToggle", "SwapShoulder", "Block", "Attack" };
 static const char* const KR_DEFAULT[KR_COUNT] =
-    { "W", "A", "S", "D", "V", "X", "G", "P", "C", "H", "F", "Q", "E", "Z" };
+    { "W", "A", "S", "D", "V", "G", "F", "C", "H", "Q", "E" };
 static char    s_bindCfgStr[KR_COUNT][32];  // resolved strings for the summary log
-static int     s_uiBindVk[KR_COUNT] = { 'W', 'A', 'S', 'D', 'V', 'X', 'G', 'P', 'C', 'H', 'F', 'Q', 'E', 'Z' };
+static int     s_uiBindVk[KR_COUNT] = { 'W', 'A', 'S', 'D', 'V', 'G', 'F', 'C', 'H', 'Q', 'E' };
                                             // options-tab dropdown mirrors of s_bindVk:
                                             // the UI edits these; dcOptionsWatch commits
                                             // changes to s_bindVk + INI.  Seeded from the
@@ -508,49 +510,75 @@ static bool    s_settingWasdSpeedCap     = true;
 static bool    s_settingEnemyPursuit     = true;
 
 // =======================================================================
-// MANUAL COMBAT - Build 2: hold-to-block = VANILLA block mode; timed press =
-// PERFECT block (FocusCombat branch, 2026-09-18, after the build-1 field test).
+// MANUAL COMBAT: the player owns the guard request; the original game still
+// owns the successful block branch (pose, sound, spark and XP).
 //
-//  HOLD the Block key  -> the controlled character gets Kenshi's own standing
-//      order M_SET_ORDER_DEFENSIVE_COMBAT (the orders-panel BLOCK button) for
-//      exactly as long as the key is down.  Blocking is then 100% vanilla:
-//      skill-based success, native pose, sparks, sound, XP, and the HUD button
-//      lights.  Released -> the order is restored to what it was before.
-//  PRESS the Block key as an attack comes in -> for PerfectBlockWindowMs after
-//      the press edge, melee hits from the front arc are answered as a block
-//      regardless of skill.  Mechanism (disassembly of 1.0.65, 2026-09-18):
-//      Character::hitByMeleeAttack asks CombatClass::_iHitYouAreYouHit for a
-//      verdict and, on HIT_SWORD, itself runs the WHOLE native block branch -
-//      _blockHit, the "Parry"/"HtH_Impacts" sound, the weapon spark at
-//      "Bip01 Prop2", block XP.  So we hook only _iHitYouAreYouHit and return
-//      HIT_SWORD inside the perfect window; vanilla does everything else.
-//      Then a PerfectBlockRewardMs window in which the next press is free.
-//      Holding past the window falls back to the skill block above.
+//  DIRECTIONAL: while RMB remains held, a valid accepted request from the
+//      defendable front arc blocks only the matching direction. Eligibility
+//      begins on the accepted press, not when the visible pose reaches its
+//      final frame: vanilla can also resolve HIT_SWORD while its block pose is
+//      still entering. Character::hitByMeleeAttack receives HIT_SWORD and runs
+//      the complete native block branch itself.
+//  AUTOMATIC: RMB is permission only. Kenshi chooses the direction/technique
+//      and may fail according to its original defence logic.
+//  KEYBOARD FALLBACK: the old non-directional E/Q mode keeps its hold budget
+//      and cooldown as INI-only compatibility tuning.
 //  Never written: the combat state machine (2026-07-29 changeState crash).
 //  Vanilla's toggle_block command is suppressed while DC is on so the same
 //  key doesn't also flip the panel's block MODE underneath the hold.
 // =======================================================================
 static bool              s_settingManualBlock  = true;   // [Settings] ManualBlock
-static bool              s_settingAiBlocks     = true;   // [Settings] AiBlocksInManual: with Z on the AI still blocks on its own (G adds the hold + perfect block)
-static float             s_perfectWindowMs     = 1000.0f;// [Settings] PerfectBlockWindowMs (user 2026-09-18: 1 s)
-static float             s_perfectRewardMs     = 1200.0f;// [Settings] PerfectBlockRewardMs (replaced PerfectBlockCooldownMs in v1.5)
+// In look mode, LMB hold chooses a cut and release commits the swing; RMB hold
+// chooses a guard. Outside manual look mode the original mouse UI stays active.
+static bool              s_directionalCombat   = true;   // [Settings] DirectionalCombat
+static volatile bool     s_mouseBlockHeld      = false;
+static volatile LONG     s_recentMouseX        = 0;
+static volatile LONG     s_recentMouseY        = 0;
+static volatile ULONGLONG s_recentMouseStartMs = 0;
+static volatile ULONGLONG s_recentMouseLastMs  = 0;
+static volatile LONG     s_combatGestureDirection = CUT_DEFAULT;
+static volatile int      s_attackDesired       = CUT_DEFAULT;
+static int               s_attackDesiredForSwing = CUT_DEFAULT;
+static volatile int      s_blockDesired        = CUT_DEFAULT;
+// Bannerlord-style directional input without a chamber animation: LMB enters
+// an input-only aiming state, mouse movement may change the cut, and release
+// commits exactly one swing. RMB cancels that pending swing and becomes guard.
+static volatile bool     s_attackAimHeld       = false;
+static volatile bool     s_attackAimCancelled  = false;
+static volatile bool     s_attackAimGestureSeen = false; // this hold has a real mouse cut
+static volatile bool     s_attackAimHoldLocked = false; // v38: a during-hold gesture fixed the direction
+static volatile int      s_attackAimDirection  = CUT_DEFAULT;
+static volatile ULONGLONG s_attackAimStartedMs = 0;
+static volatile int      s_lastAttackDirection = CUT_DOWNWARD;
+static volatile bool     s_blockGestureSeen    = false;  // guard direction came from the mouse
+static volatile ULONGLONG s_rmbCombatEdgeMs    = 0;      // poll: RMB press, classified on the game thread
+static ULONGLONG         s_rmbCombatEdgeSeenMs = 0;
+// Directional combat gives LMB/RMB exclusively to attack/guard.  E is a
+// one-shot interaction request for the nearby, automatically selected target.
+// The native context menu owns the cursor only while that menu is visible.
+static volatile bool     s_interactionRequested = false;
+static bool              s_interactionMenuByE = false;
+static Character*        s_interactionAutoTarget = nullptr; // identity only; refreshed on game thread
+
+// Defence mode inside manual combat. false = directional player guard;
+// true = original Kenshi AI owns both block timing and direction. The two
+// modes are exclusive: an RMB direction never biases automatic defence.
+static bool              s_settingAiBlocks     = false;  // [Settings] AiBlocksInManual
 static volatile bool     s_blockHeld           = false;  // poll thread -> main thread
 static volatile ULONGLONG s_blockPressMs       = 0;      // poll thread: last press EDGE tick
 static bool              s_blockHeldPrev       = false;  // main thread edge tracking
 static bool              s_blockOrderApplied   = false;  // we turned DEFENSIVE_COMBAT on
 static Character*        s_blockOrderChar      = nullptr;// identity only (who we applied it to)
-static ULONGLONG         s_perfectCooldownUntilMs = 0;   // next perfect window allowed after
-static ULONGLONG         s_perfectUsedPressMs  = 0;      // press edge already spent on a perfect block
-static ULONGLONG         s_perfectLastHitMs    = 0;      // last perfect hit: a combo's follow-up is covered for PERFECT_FOLLOWUP_MS after it
-static const ULONGLONG   PERFECT_FOLLOWUP_MS   = 600;    // log 2026-09-29: "downward combo-18" strikes twice, 360 ms apart
-// Perfect-block REWARD (user 2026-10-08): a perfect block wipes the block
-// cooldowns for PerfectBlockRewardMs - the next Block press is accepted at once,
-// even right after letting go - and your weapon glows blue while it lasts.
-// The first fresh press spends it.  Length = PerfectBlockRewardMs.
-static ULONGLONG         s_perfectRewardUntilMs = 0;
-static MyGUI::ImageBox*  s_rewardGlow          = nullptr;
-static bool              s_rewardGlowTried     = false;
 static ULONGLONG         s_blockInjectedPressMs = 0;     // G press already turned into a block pose
+// Automatic guard gets exactly one native chooseBlock roll per notified enemy
+// swing.  Keeping the swing token after a failed roll prevents a held RMB from
+// retrying every frame until it becomes a guaranteed block.
+static Character*        s_autoBlockAttemptWho = nullptr;
+static ULONGLONG         s_autoBlockAttemptStartMs = 0;
+// Exact ownership token for the one native BLOCK selected by automatic guard.
+// It remains valid only while the original BLOCK state is still playing; this
+// lets the native state finish even after the incoming-glint edge has ended.
+static CombatTechniqueData* s_autoBlockActiveTech = nullptr;
 // Timed block (user 2026-09-18: no unlimited hold).  A press opens a block for
 // at most BlockHoldMs (the vanilla order + pose), then it drops even if the key
 // stays down, and BlockCooldownMs must pass before the next press counts.
@@ -563,65 +591,48 @@ static ULONGLONG         s_blockCooldownUntilMs = 0;
 // a move.  Extra presses of a combat key inside InputRepeatGuardMs of the last
 // accepted press are ignored; a Block re-press that soon after letting go
 // RESUMES the same block (no cooldown, hold budget + perfect window still run
-// from the first press, pose kept); a swing / dodge that just ended is followed
-// by a short recovery in which new presses are ignored (follow-through plays).
+// from the first press, pose kept); a swing that just ended is followed by a
+// short recovery in which new presses are ignored (follow-through plays).
 static float             s_inputRepeatGuardMs  = 250.0f; // [Settings] InputRepeatGuardMs
 static ULONGLONG         s_blockHoldStartMs    = 0;      // origin of the hold budget + perfect window (survives a resume)
 static ULONGLONG         s_blockReleaseMs      = 0;      // tick of the last release (resume window)
 
-// --- Build 11: MANUAL DODGE = an ACTION on the key ---------------------------
-// Disassembly of 1.0.65 (see _research_RE):
-//  * CombatClass::changeState(state, minTime) is three writes: stateTimer,
-//    nextMove, combatState.  (The 2026-07-29 "changeState crash" was a call
-//    at a STALE header RVA - real 2B2A60, header 2B25F0 - not the writes.)
-//  * The BLOCK state (blockState) is self-sufficient: given currentTechnique
-//    and a blocking target it starts the technique animation itself (its own
-//    play call, every frame until progress passes the technique's end) and
-//    hands the machine back to DECISION when the dodge is done.
-//  * Dodge techniques come from CharStats::chooseBlock; vanilla only rolls
-//    Dodge for the UNARMED category and by chance.  For the PICK we present
-//    the character as unarmed and force the dodge chance to 100 so a dodge is
-//    always chosen (still tier-gated by skill); SUCCESS is a separate, honest
-//    roll of calculateDodgeChance (Dodge +DodgeSkillBonus, the flat +20 the
-//    BLOCK toggle gives melee defence) vs the attacker's melee attack.
-// Press (in combat, off cooldown) -> commit window (WASD buffers, the AI runs
-// and re-engages combat if you were moving) -> on the first idle combat frame:
-// pick, roll, inject (the four changeState writes + technique + target).  The
-// animation always plays; a failed roll means the verdict hook lets the hit
-// through (technique hidden from the verdict for that hit).  No i-frames from
-// us: a successful dodge is protected only by the technique's own window.
-static volatile bool     s_dodgeHeld           = false;
-static volatile ULONGLONG s_dodgePressMs       = 0;      // poll thread: press EDGE tick
-static float             s_dodgeWindowMs       = 600.0f; // [Settings] DodgeWindowMs (press must be this close to the attack)
-static float             s_dodgeCooldownMs     = 300.0f; // [Settings] DodgeCooldownMs (the in-flight lock is the real gate)
-static float             s_dodgeSkillBonus     = 20.0f;  // [Settings] DodgeSkillBonus (block mode's melee-defence bonus is +20)
-static ULONGLONG         s_dodgeCooldownUntilMs = 0;
-static float             s_dodgeRecoveryMs     = 400.0f; // [Settings] DodgeRecoveryMs (after a dodge ends)
-static ULONGLONG         s_dodgeRecoveryUntilMs = 0;
-static ULONGLONG         s_dodgeAcceptedPressMs = 0;     // last press that passed the gates (repeat guard)
 // Stagger policy (user 2026-09-21, final): a stagger plays through.  NO input
-// counts while staggered - E, Q and G presses are DROPPED (never buffered) and
+// counts while staggered - attack and block presses are DROPPED (never buffered) and
 // anything pending dies when it starts; inputs count again the frame it ends.
-// (Build 42-49 let one Q through on a long stagger; removed by user request.)
 static ULONGLONG         s_staggerStartMs      = 0;      // rising edge of the current stagger (0 = not staggered)
 static ULONGLONG         s_staggerRawSinceMs   = 0;      // raw staggered signal edge (debounced into s_staggerStartMs)
-static const ULONGLONG   STAGGER_DEBOUNCE_MS   = 100;    // log 2026-09-21: 31-47 ms stumble flickers ate a Dodge press
-static ULONGLONG         s_dodgeInjectedPressMs = 0;     // press already turned into a dodge
+static const ULONGLONG   STAGGER_DEBOUNCE_MS   = 100;    // filters 31-47 ms false reaction-state flickers seen in logs
+// v44: hit ownership follows the native _getHit(..., stumble) decision and
+// native combat states.  There is no gameplay-duration timer here: a true
+// `stumble` may briefly leave STUMBLE/REACTION_BLOCK in nextMove before go()
+// enters it, then the actual state owns the body until vanilla leaves it.
+// The poll thread reads only the interlocked input-lock flag; all CombatClass
+// state is inspected on the game thread.
+static bool               s_hitReactionPending    = false;
+static volatile LONG      s_hitReactionInputLock  = 0;
+static unsigned int       s_hitReactionSerial     = 0;
+// A third-party combat controller can let _getHit queue STARTUP -> STUMBLE
+// without scheduling this character's CombatClass::go again. Track whether
+// the queued native reaction already received its normal go call this world
+// frame, so mainLoop may supply exactly the missing call and nothing else.
+static unsigned int       s_hitReactionAdvancedFrameSerial = 0;
 static GameWorld*        s_gwFrame             = nullptr;// refreshed every mainLoop frame (foe scan)
 
-// --- Build 17: MANUAL ATTACK (press) - same shape as the dodge -----------------
+// --- Build 17: MANUAL ATTACK (press) -------------------------------------------
 // Disassembly (1.0.65): the AI starts a swing by moving to STARTUP with
 // nextMove = CHOP_WEAPON; CombatClassAI::startupState then re-asserts the
 // attack target, and calls getStateClass(nextMove)->initialise() =
 // AttackState::_NV_initialise -> initialiseAttack(target): nearest enemy in
 // the attack zone, victim notified (attackingYou), CharStats::chooseAttack
-// (skill/weapon-gated, native), the technique clip started (same play call as
-// the dodge), targets in the attack zone computed - then combatState =
+// (skill/weapon-gated, native), the technique clip started, targets in the
+// attack zone computed - then combatState =
 // CHOP_WEAPON and the attack state runs the impact checks and damage.  If the
-// target is out of reach it steps in (combatMovementOffensive) and retries.
-// So an E press only needs: a foe as the current target + the three
-// changeState(STARTUP) writes with nextMove = CHOP_WEAPON.  Everything else -
-// technique choice, animation, hit detection, XP, sounds - is vanilla's.
+// target is out of reach the AI path would normally step in and retry.  Ironwind
+// instead calls initialiseAttack(target) synchronously for one player press:
+// success enters CHOP immediately, failure becomes an air swing, and no AI
+// approach/retry task exists. Technique choice, animation, hit detection, XP
+// and sounds remain vanilla.
 static volatile bool     s_attackHeld          = false;
 static volatile ULONGLONG s_attackPressMs      = 0;
 static float             s_attackWindowMs      = 400.0f; // [Settings] AttackWindowMs (press must find the AI within this)
@@ -629,33 +640,94 @@ static ULONGLONG         s_attackCommitUntilMs = 0;      // press live: WASD buf
 static ULONGLONG         s_attackSeenPressMs   = 0;
 static ULONGLONG         s_attackInjectedPressMs = 0;
 static ULONGLONG         s_attackAcceptedPressMs = 0;    // press that passed the gates (ignored presses never inject)
+static ULONGLONG         s_attackEngagePressMs = 0;
 static bool              s_attackActive        = false;  // our swing in flight (STARTUP -> CHOP_WEAPON)
 static ULONGLONG         s_attackActiveSinceMs = 0;      // bounded: a swing that never starts is released
 static bool              s_attackSawChop       = false;  // the swing actually started (CHOP_WEAPON seen)
+static bool              s_attackObservedUnfinished = false; // this swing, not the previous technique, owns the finish edge
+static bool              s_attackStateRecovered = false; // one live unfinished clip may reclaim CHOP after an external early exit
+static bool              s_attackNativeImpactFinished = false; // native damage phase ended; let its real clip play the recovery frames
+static bool              s_attackGuardHandoffPending = false; // intentional post-impact CHOP exit; never recover it as an accidental state steal
+static bool              s_attackDirectInitialising = false; // exact scope: one player-requested native initializer
+// A directly initialised CHOP has no combat task to keep CombatClassAI::go alive.
+// Advance only the native AttackState execution object, at most once per game
+// main-loop frame; never run the surrounding AI decision layer for our swing.
+static unsigned int      s_manualMainFrameSerial = 1;
+static unsigned int      s_attackAdvancedFrameSerial = 0;
+static ULONGLONG         s_attackAdvanceLogMs = 0;
+// Resolved base-class implementation, not a virtual call. In CHOP this runs
+// CombatClass::attackState (animation sections / impact / finish) without
+// entering CombatClassAI::update or its decision/movement layer.
+static void              (*s_combatBaseUpdateNative)(CombatClass*, float) = nullptr;
 static float             s_attackRecoveryMs    = 400.0f; // [Settings] AttackRecoveryMs (after a swing ends)
 static ULONGLONG         s_attackRecoveryUntilMs = 0;
-static ULONGLONG         s_attackRetryPressMs  = 0;      // press being retried after a fizzled start
-static ULONGLONG         s_attackAfterDodgeMs  = 0;      // E pressed during our dodge: fires when the dodge ends (build 49; 43 such presses in the build-48 log)
-static int               s_attackRetries       = 0;      // bounded (a start that keeps failing is given up)
-static float             s_attackApproachMs    = 1500.0f;// [Settings] AttackApproachMs: out of reach -> keep closing in this long
-static ULONGLONG         s_attackReapproachLogMs = 0;
-
+static volatile ULONGLONG s_attackQueuedAtMs   = 0;
+static volatile int      s_attackQueuedDirection = CUT_DEFAULT;
+static const ULONGLONG   ATTACK_QUEUE_MS       = 1000;
+// v38 live per-direction attack availability for the aim HUD (game thread
+// only). Replaces the old post-release "no matching move" 1200 ms lockout.
+// v49 lets every direction produce a selected-direction arrow: confirmed
+// available directions are green, unavailable or unchecked directions are
+// white. Releasing on an unavailable direction still simply does not start a
+// swing. Refreshed by
+// manualRefreshDirMoveAvailability() plus ground truth from real commits.
+static int               s_dirMoveAvailable[4] = { -1, -1, -1, -1 }; // -1 unknown, 0 none, 1 ok
+static ULONGLONG         s_dirMoveCheckedMs    = 0;
+static Character*        s_dirMoveAnchor       = nullptr;
+static int               s_dirMoveWeaponType   = -2;
+static int               s_dirMoveHands        = -1;
+static int               s_attackNativeContacts = 0;
+static int               s_attackNativeHits     = 0;
+static int               s_attackNativeBlocks   = 0;
+static int               s_attackNativeDodges   = 0;
+static CombatTechniqueData* s_freeAttackTech = nullptr;
+static float             s_freeAttackSpeed = 1.0f;
+static ULONGLONG         s_freeAttackStartMs = 0;
+static bool              s_freeAttackSeenAnim = false;
+static float             s_freeAttackLastProgress = -1.0f;
+static ULONGLONG         s_freeAttackLastAdvanceMs = 0;
+static CombatTechniqueData* s_lastFreeAttackTech = nullptr;
+static Character*        s_attackIntentTarget = nullptr; // deliberate aimed target for this press, validated before use
+static Character*        s_attackAimCapturedTarget = nullptr; // target under reticle at LMB-down, before the direction stroke turns the camera
+static Character*        s_attackQueuedTarget = nullptr; // captured target carried with the single buffered strike
+static Character*        s_attackWorldNotified[8] = {}; // confirmed neutral victims notified once per authorised native swing
+static Character*        s_attackNeutralContact[8] = {}; // neutral just before native contact can turn relations hostile
+static Character*        s_attackNeutralIntentTarget = nullptr; // target was neutral at LMB-down; survives failed native initialise
+// Victim-side retaliation is deliberately deferred until the current original
+// game loop has returned.  notifyTheCampaignOfAnAttack/attackingYou can update
+// faction and awareness state during AttackState initialisation; attackTarget
+// in that same nested call stack can observe the old neutral relation and be
+// rejected.  These slots contain identity only and are update-list validated
+// before every dereference.
+static Character*        s_victimResponseVictim[8] = {};
+static Character*        s_victimResponseAttacker[8] = {};
+static const char*       s_victimResponseSource[8] = {};
+static ULONGLONG         s_freeAttackPressMs = 0;
+static bool              s_freeAttackImpactPassed = false; // gates RMB recovery cancel; air swings never deal damage
+static ULONGLONG         s_attackIntentPressMs = 0;
+static ULONGLONG         s_attackAimCapturedStartMs = 0;
 // --- MANUAL ATTACK mode (Z toggle) -----------------------------------------------------
 // While ON, in DC: the combat AI's OWN swings are denied at the game's attack
 // initialiser (and any stray transition into the attack state becomes the
-// armed ready stance), AND its own block/dodge choice is denied at the
-// technique chooser - so the character takes no combat action by itself
-// (stagger reactions stay vanilla); G / Q / E are the only responses and the
-// character can be hit if the player does nothing.  Targeting stays vanilla
+// armed ready stance), AND its own defence choice is denied unless automatic
+// guard has been explicitly requested - so the character takes no combat
+// action by itself (stagger reactions stay vanilla); attack and block require
+// player input, so the character can be hit if the player does nothing. Targeting stays vanilla
 // (the AI's current target).  A small fixed "Manual Attack" label shows while ON.
-static volatile ULONGLONG s_manualPressMs      = 0;
-static ULONGLONG         s_manualSeenPressMs   = 0;
-static bool              s_manualAttackOn      = false;
+static volatile bool     s_manualAttackOn      = false;
 static ULONGLONG         s_manualSuppressLogMs = 0;
 static ULONGLONG         s_manualPinLogMs      = 0;
 static int               s_anchorPrevState     = -1;     // DIAG: the anchor's combat state last frame (which state started a refused swing?)
 static MyGUI::TextBox*   s_manualHud           = nullptr;
 static bool              s_manualHudTried      = false;
+static MyGUI::ImageBox*  s_directionHud[4]     = { nullptr, nullptr, nullptr, nullptr };
+static bool              s_directionHudTried   = false;
+static bool              s_directionArrowTexTried = false;
+static bool              s_directionArrowTexOk = false;
+static MyGUI::TextBox*   s_hitMarkerHud[4]     = { nullptr, nullptr, nullptr, nullptr };
+static bool              s_hitMarkerHudTried   = false;
+static volatile ULONGLONG s_hitMarkerUntilMs   = 0;
+static const ULONGLONG   HIT_MARKER_VISIBLE_MS = 1000;
 
 // --- AIM FOCUS (user 2026-09-21; replaces the frozen lock-on) ----------------------
 // While manual combat (Z) is on, the enemy you POINT AT is the combat AI's
@@ -696,19 +768,34 @@ static bool              s_settingAimName      = true;   // [Settings] AimNameTa
 static MyGUI::TextBox*   s_nameTag             = nullptr;
 static bool              s_nameTagTried        = false;
 static Character*        s_nameTagFor          = nullptr;// identity: whose name the caption holds
-// Health bars under the name (user 2026-09-29): BLOOD, HEAD, CHEST, STOMACH as
-// thin strips (dark background + coloured fill), read live from the target's
-// MedicalSystem (blood / getMaxBlood, part flesh / _maxHealth).  Same show/hide
-// as the name tag.
-static const int         HB_COUNT              = 4;      // 0 blood, 1 head, 2 chest, 3 stomach
+// Compact anatomy panel under the name (user 2026-10-22).  Two real rows:
+// blood/head/chest/stomach, then left/right arms and left/right legs.  Every
+// strip reads its own live MedicalSystem value; there is no synthetic total HP.
+enum FocusHealthSlot
+{
+    HB_BLOOD = 0, HB_HEAD, HB_CHEST, HB_STOMACH,
+    HB_LEFT_ARM, HB_RIGHT_ARM, HB_LEFT_LEG, HB_RIGHT_LEG,
+    HB_COUNT
+};
 static MyGUI::Widget*    s_hbBg[HB_COUNT]      = {};
-static MyGUI::Widget*    s_hbFill[HB_COUNT]    = {};
+enum FocusHealthLayer
+{
+    HBL_HEALTHY = 0, HBL_ROBOT, HBL_STUN, HBL_CUT, HBL_BANDAGED,
+    HBL_WEAR, HBL_SPLINT, HBL_COUNT
+};
+static MyGUI::Widget*    s_hbLayer[HB_COUNT][HBL_COUNT] = {};
 static bool              s_hbTried             = false;
 static bool              s_hbNamesLogged       = false;  // DIAG: the body-part names seen, once
-static const int         HB_W = 64, HB_H = 3, HB_GAP = 7;   // 3 px bars on a 10 px pitch (room for the labels)
-static MyGUI::TextBox*   s_hbLabel[HB_COUNT]   = {};     // tiny captions left of each bar (user 2026-09-29)
-static const int         HB_LW = 46, HB_LH = 12;         // label box (game's smallest text skin, ~9 px)
-static const int         HB_RAISE = 42;                   // whole name+bars group lifted so the last bars clear the head
+static const int         HB_COLS = 4, HB_ROWS = 2;
+// Long, fine anatomy strips: keep two-character labels readable while giving
+// the actual vanilla damage composition most of each cell.  The tighter rows
+// reduce head clutter even though every value has substantially more length.
+static const int         HB_LABEL_W = 18, HB_BAR_W = 38, HB_CELL_W = 57;
+static const int         HB_H = 5, HB_GAP = 2, HB_ROW_H = 10;
+static const int         HB_PANEL_W = HB_COLS * HB_CELL_W + (HB_COLS - 1) * HB_GAP;
+static MyGUI::TextBox*   s_hbLabel[HB_COUNT]   = {};
+static const int         HB_LH = 10;
+static const int         HB_RAISE = 36;                   // both rows stay clear of the head
 // Vanilla SPEECH TEXT (user 2026-09-30): while the tagged enemy has a speech
 // bubble up, the name+bars group steps ABOVE it by the bubble's real on-screen
 // height and drops back when it is gone.  Build 66: bubbles are found by
@@ -719,7 +806,7 @@ static const int         HB_RAISE = 42;                   // whole name+bars gro
 // the game's main loop that another plugin's handler swallowed, so the rest of
 // the game update was skipped each frame = "toggling Z pauses the game".
 // WEAPON GLINT (user concept 2026-09-21): an enemy's weapon glints while their
-// swing is coming at you - the visual cue for Block / Dodge / a counter.
+// swing is coming at you - the visual cue for a guard or counter.
 // Signal = Character::attackingYou, the game's own "I am swinging at you"
 // notification sent to the victim at swing start (the AI blocks off the same
 // signal).  The glint ramps from swing start to GlintLeadMs, holds bright, and
@@ -727,44 +814,49 @@ static const int         HB_RAISE = 42;                   // whole name+bars gro
 static bool              s_settingGlint        = true;   // [Settings] WeaponGlint
 static float             s_glintLeadMs         = 700.0f; // [Settings] GlintLeadMs (ramp to full brightness; log 2026-09-21: swing start -> impact median 844 ms)
 static float             s_glintPx             = 22.0f;  // [Settings] GlintPx (on-screen size at full)
-static const int         GLINT_MAX             = 4;      // attackers tracked at once
-struct GlintSlot { Character* who; ULONGLONG startMs; ULONGLONG chopMs; ULONGLONG impactMs; int tier; };
+static const int         INCOMING_ATTACK_MAX   = 4;      // attackers tracked at once
+struct IncomingAttackSlot { Character* who; ULONGLONG startMs; ULONGLONG chopMs; ULONGLONG impactMs; };
 // Glint COLOUR = the defence that works (user 2026-10-01, "honest arc rule"):
 //   tier 0 WHITE  = the hit lands inside the front arc -> a Block tap stops it
-//   tier 1 ORANGE = outside the arc (side / rear) -> the perfect block is
-//                   refused by design; Dodge (direction-free) or the skill block
+//   tier 1 ORANGE = outside the defendable arc (side / rear) -> a manual guard is
+//                   refused by design; turn and use the normal skill defence
 //   tier 2 RED    = heavy tier (heavy weapon, or impact power >= GlintHeavyPower)
-//                   -> dodge preferred even from the front
+//                   -> especially dangerous incoming strike
 // Re-evaluated every frame with the SAME test the block verdict applies, so
 // turning to face the attacker flips orange -> white live.
 static bool              s_glintColourTiers    = false;  // [Settings] GlintColourTiers (OFF for the v1.5 release, user 2026-10-03: all glints white; colours = next update)
 static bool              s_glintHeavyTier      = true;   // [Settings] GlintHeavyTier (heavy = the technique's skill list says SKILL_HEAVY; log 2026-10-01: the attacker's currentWeaponType read 0 for everyone and ImpactPoint power is a flat 1)
-static GlintSlot         s_glint[GLINT_MAX]    = {};     // who = identity only, validated each frame
-static MyGUI::ImageBox*  s_glintBox[GLINT_MAX] = {};
+// Native incoming-attack state is independent of the optional glint renderer.
+// Automatic guard may consume these events even
+// when WeaponGlint is disabled. who is identity only, validated before use.
+static IncomingAttackSlot s_incomingAttack[INCOMING_ATTACK_MAX] = {};
+static MyGUI::ImageBox*  s_glintBox[INCOMING_ATTACK_MAX] = {};
 static bool              s_glintTried          = false;
-static CombatTechniqueData* s_dodgeActiveTech  = nullptr; // the technique we injected (identity only)
-static bool              s_dodgeRollOk         = false;  // honest roll for the active dodge
-// Mod-owned COPIES of the game's dodge techniques (user design 2026-09-18):
-// deep-copied once from the vanilla pool, never freed, never seen by the
-// chooser/AI - Q hands one straight to the block state.  Vanilla stays vanilla.
-struct DcDodgeCopy { CombatTechniqueData* tech; bool stumbleOnly; float weight; };
-static DcDodgeCopy       s_dcDodge[8];
-static int               s_dcDodgeCount        = 0;
 static CombatTechniqueData* s_dcBlock[8];                  // mod-owned copies of the BLOCK techniques
 static int               s_dcBlockCount        = 0;
-static bool              s_dcDodgeBuilt        = false;
-// The technique-animation START call (what initialiseBlock does right after
-// choosing a dodge).  Not exported by KenshiLib (no AnimationClass header), so
-// it is resolved at its 1.0.65 address and BYTE-VERIFIED before the first use;
-// on any mismatch the dodge is disabled with a log line instead of a call.
+static CombatTechniqueData* s_dcAttack[256];
+static int               s_dcAttackCount       = 0;
+static bool              s_dcAttackBuilt       = false;
+static ULONGLONG         s_freeBlockPressMs    = 0;
+static bool              s_freeGuardUpperIdle  = false;
+static bool              s_freeGuardCombatOwned = false;
+static CombatTechniqueData* s_freeBlockTech    = nullptr;
+static float             s_freeBlockSpeed     = 1.0f;
+static bool              s_freeAnimCombatMode  = false;
+static ULONGLONG         s_weaponDrawAttemptMs = 0;
+static bool              s_weaponMissingLogged = false;
+static bool              s_weaponDrawInProgress = false;
+static bool              s_dcBlockBuilt        = false;
+// The native defence-animation START call used when automatic guard's original
+// chooser returns a dodge technique. It is not exported by KenshiLib, so the
+// 1.0.65 address is byte-verified before use. This is only a pass-through for
+// Kenshi's own accepted defence; Ironwind has no player-authored dodge action.
 // Signature (from the disassembly): rcx = AnimationClass*, rdx = technique,
 // xmm2 = speed (blockSpeed * animSpeedMultiplier), r9 = std::string* suffix.
 typedef void (*DcTechPlayFn)(void* animClass, CombatTechniqueData* tech, float speed, std::string* suffix);
-static DcTechPlayFn      s_dodgePlayFn         = nullptr;
-static bool              s_dodgePlayChecked    = false;
-static const uintptr_t   DC_DODGE_PLAY_RVA     = 0x5B6D70;   // Kenshi 1.0.65 (Steam/GOG RE_Kenshi exe)
-static ULONGLONG         s_dodgeCommitUntilMs  = 0;      // live press = COMMITTED action: WASD buffers, the AI runs
-static ULONGLONG         s_dodgeSeenPressMs    = 0;      // main thread: last press edge processed by manualBlockTick
+static DcTechPlayFn      s_defencePlayFn       = nullptr;
+static bool              s_defencePlayChecked  = false;
+static const uintptr_t   DC_DEFENCE_PLAY_RVA   = 0x5B6D70;   // Kenshi 1.0.65 (Steam/GOG RE_Kenshi exe)
 
 static float   s_settingWasdSpeedMult    = 1.0f;
 // Combat-mode FLICKERS (isInCombatMode blips false between swings / when the
@@ -775,6 +867,114 @@ static float   s_settingWasdSpeedMult    = 1.0f;
 // cover looting/disarming right as a fight ends.
 static ULONGLONG s_lastInCombatMs = 0;
 static const ULONGLONG FACECAM_COMBAT_GRACE_MS = 1500;
+
+// Runtime-state ownership helpers.
+//
+// These deliberately contain no engine calls.  They are safe to use from load,
+// V-mode and reaction teardown paths even when cached Character/Ogre pointers
+// are no longer valid.  Keep direct writes to the grouped fields inside these
+// helpers or inside the state machine that actively owns the field; this avoids
+// the historical class of bugs where one exit path cleared two members of a
+// three-member latch and left the next V session permanently queued/locked.
+static void manualAttackClearCapturedTarget()
+{
+    s_attackAimCapturedTarget = nullptr;
+    s_attackAimCapturedStartMs = 0;
+}
+
+static void manualAttackClearNeutralIntent()
+{
+    s_attackNeutralIntentTarget = nullptr;
+}
+
+static void manualAttackClearAimInput(bool cancelled, bool clearCapturedTarget)
+{
+    s_attackAimHeld = false;
+    s_attackAimCancelled = cancelled;
+    s_attackAimGestureSeen = false;
+    s_attackAimHoldLocked = false;
+    s_attackAimDirection = CUT_DEFAULT;
+    s_attackAimStartedMs = 0;
+    if (clearCapturedTarget)
+    {
+        manualAttackClearCapturedTarget();
+    }
+}
+
+static void manualAttackClearQueuedInput(bool clearCapturedTarget)
+{
+    s_attackQueuedAtMs = 0;
+    s_attackQueuedDirection = CUT_DEFAULT;
+    s_attackQueuedTarget = nullptr;
+    if (clearCapturedTarget)
+    {
+        manualAttackClearCapturedTarget();
+    }
+}
+
+static void manualAttackClearActiveRuntime()
+{
+    s_attackActive = false;
+    s_attackActiveSinceMs = 0;
+    s_attackSawChop = false;
+    s_attackObservedUnfinished = false;
+    s_attackStateRecovered = false;
+    s_attackNativeImpactFinished = false;
+    s_attackGuardHandoffPending = false;
+    s_attackDirectInitialising = false;
+    s_attackAdvancedFrameSerial = 0;
+    s_attackAdvanceLogMs = 0;
+    s_attackNativeContacts = 0;
+    s_attackNativeHits = 0;
+    s_attackNativeBlocks = 0;
+    s_attackNativeDodges = 0;
+}
+
+static void manualHitReactionClearRuntime()
+{
+    s_hitReactionPending = false;
+    s_hitReactionAdvancedFrameSerial = 0;
+    InterlockedExchange(&s_hitReactionInputLock, 0);
+}
+
+static void manualInteractionClearRuntime(bool forgetAutoTarget)
+{
+    s_interactionRequested = false;
+    s_interactionMenuByE = false;
+    if (forgetAutoTarget) s_interactionAutoTarget = nullptr;
+}
+
+// Read-only end-of-frame contract check.  It never repairs state: silently
+// guessing which owner should win would recreate the animation/AI regressions
+// this pass is meant to prevent.  A non-zero mask is therefore durable evidence
+// for the next log analysis, while edge/5-second throttling avoids log floods.
+static void manualRuntimeInvariantTick()
+{
+    unsigned int mask = 0;
+    if (s_attackActive && s_freeAttackTech) mask |= 0x01;
+    if (s_attackActive && s_freeBlockTech) mask |= 0x02;
+    if (s_attackQueuedTarget && s_attackQueuedAtMs == 0) mask |= 0x04;
+    if (s_attackQueuedAtMs != 0 && s_attackQueuedDirection == CUT_DEFAULT) mask |= 0x08;
+    if (s_attackDirectInitialising && !s_attackActive) mask |= 0x10;
+    if (s_attackNativeImpactFinished && !s_attackActive) mask |= 0x20;
+
+    static unsigned int lastMask = 0;
+    static ULONGLONG lastLogMs = 0;
+    ULONGLONG now = GetTickCount64();
+    if (mask && (mask != lastMask || now - lastLogMs >= 5000))
+    {
+        char b[192];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] invariant_violation mask=0x%02X attack=%d free_attack=%d free_block=%d queued=%d queued_target=%d direct_init=%d impact_done=%d",
+            mask, s_attackActive ? 1 : 0, s_freeAttackTech ? 1 : 0,
+            s_freeBlockTech ? 1 : 0, s_attackQueuedAtMs ? 1 : 0,
+            s_attackQueuedTarget ? 1 : 0, s_attackDirectInitialising ? 1 : 0,
+            s_attackNativeImpactFinished ? 1 : 0);
+        ErrorLog(b);
+        lastLogMs = now;
+    }
+    lastMask = mask;
+}
 
 // =======================================================================
 // Inventory face-cam — a temporary DETACHED Ogre camera (s_fpNode) that swings
@@ -854,22 +1054,117 @@ static float            s_otsSavedAltitude  = 0.0f;  // face-cam: held to block 
 // (s_fpSuspendedForInv).  Toggled by the FirstPerson key (default P) in DC.
 // =======================================================================
 static bool  s_firstPersonActive   = false;  // detached cam is in first-person drive mode
+
+// The HUD arrow describes blade travel toward the crosshair, not the side on
+// which the mouse sits: moving right shows a left-pointing arrow and therefore
+// selects CUT_LEFT (weapon starts on screen-right and travels left). Moving
+// left selects CUT_RIGHT. Moving up selects overhead, down selects thrust.
+// The raw device reports counts rather than pixels.  In field input those raw
+// counts are not perceptually square: v88 produced 47 horizontal selections
+// versus 25 vertical selections, and the old 1.35 axis hysteresis then kept the
+// already-common horizontal direction sticky.  Classify in a lightly
+// normalised space (Y * 1.25) and use only a narrow 1.15 diagonal hysteresis.
+// The four outputs remain four angular sectors; the compensation makes a
+// deliberate up/down stroke as easy to select as the same felt left/right
+// stroke while still absorbing camera tremor at the diagonal.
+static CutDirection combatDirectionFromDelta(LONG x, LONG y, CutDirection previous = CUT_DEFAULT)
+{
+    LONG ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+    const LONGLONG sx = (LONGLONG)ax * 4;
+    const LONGLONG sy = (LONGLONG)ay * 5;
+    if (sx * sx + sy * sy < (12LL * 4) * (12LL * 4)) return previous;
+    bool previousHorizontal = previous == CUT_LEFT || previous == CUT_RIGHT;
+    bool previousVertical = previous == CUT_DOWNWARD || previous == CUT_THRUST;
+    if (previousHorizontal && sy * 100 <= sx * 115)
+        return x >= 0 ? CUT_LEFT : CUT_RIGHT;
+    if (previousVertical && sx * 100 <= sy * 115)
+        return y < 0 ? CUT_DOWNWARD : CUT_THRUST;
+    if (sx > sy) return x > 0 ? CUT_LEFT : CUT_RIGHT;
+    return y < 0 ? CUT_DOWNWARD : CUT_THRUST;
+}
+
+// Attack input stores the direction in which the blade travels: a mouse move
+// to the right produces the right-side inward arrow but selects CUT_LEFT.
+// Kenshi block techniques, on the other hand, name the side being guarded.
+// Convert only the horizontal pair when the same gesture starts a block;
+// overhead and thrust guards already use the same enum as their gestures.
+// This function is its own inverse, so the HUD can recover the original
+// gesture arrow while s_blockDesired remains the native guard/verdict value.
+static CutDirection combatGuardDirectionFromGesture(CutDirection gesture)
+{
+    if (gesture == CUT_LEFT) return CUT_RIGHT;
+    if (gesture == CUT_RIGHT) return CUT_LEFT;
+    return gesture;
+}
+
+static CutDirection combatRecentDirection()
+{
+    // v106: selection and its arrow are one state.  Keep the last valid
+    // direction for 1200 ms, while every new mouse stroke can replace it
+    // immediately.  The timeout is not a lock; it only clears an idle choice.
+    ULONGLONG last = s_recentMouseLastMs;
+    if (!last || GetTickCount64() - last > 1200) return CUT_DEFAULT;
+    return (CutDirection)InterlockedCompareExchange(&s_combatGestureDirection, CUT_DEFAULT, CUT_DEFAULT);
+}
+
+static bool mouseCombatContext()
+{
+    return s_directionalCombat && s_settingManualBlock && s_manualAttackOn && s_mode == MODE_FREE_MOVE
+        && (s_firstPersonActive || s_otsCamActive) && !s_cameraUiOpen
+        && !s_lootUiSuspendActive && !s_dcShutdownInProgress
+        && !s_interactionMenuByE;
+}
+
+static bool combatDirectionMatches(CutDirection wanted, CutDirection incoming)
+{
+    if (wanted == CUT_DEFAULT) return false;
+    if (incoming == CUT_REAR_LEFT) incoming = CUT_LEFT;
+    else if (incoming == CUT_REAR_RIGHT) incoming = CUT_RIGHT;
+    else if (incoming == CUT_REAR_DOWNWARD) incoming = CUT_DOWNWARD;
+    return wanted == incoming;
+}
+
+static const char* combatDirectionLabel(CutDirection direction)
+{
+    switch (direction)
+    {
+        case CUT_LEFT: return "Left";
+        case CUT_RIGHT: return "Right";
+        case CUT_DOWNWARD: return "Overhead";
+        case CUT_THRUST: return "Thrust";
+        default: return "Choose direction";
+    }
+}
+
+// Slot index of the four on-screen arrows. Horizontal CutDirection values are
+// blade travel directions, so CUT_RIGHT belongs to the left-side inward arrow
+// and CUT_LEFT belongs to the right-side inward arrow. Rear cuts and unknowns
+// have no slot (they never match a free-attack commit either).
+static int combatDirectionSlot(CutDirection d)
+{
+    switch (d)
+    {
+        case CUT_RIGHT:     return 0;
+        case CUT_LEFT:      return 1;
+        case CUT_DOWNWARD:  return 2;
+        case CUT_THRUST:    return 3;
+        default:            return -1;
+    }
+}
 // s_userWantsFP — PERSISTENT first-person INTENT (mirrors s_userWantsDC).  Survives
 // survivable loads (chunk streaming / micro-loads / save-load into gameplay) so FP is
 // re-entered after the scene rebuilds; cleared only on P-off, DC-off (V), new game, or
 // hard teardown.  Fixes "FP disables when loading between chunks" (user 2026-07-29).
 static bool  s_userWantsFP         = false;
-static volatile bool s_fpToggleRequested = false;  // P-key edge -> consumed on game thread
+static bool  s_wheelFirstPersonActive = false; // FP was entered by V-mode wheel, not F
+static volatile bool s_fpToggleRequested = false;  // F-key edge -> consumed on game thread
 static bool  s_fpSuspendedForInv   = false;  // FP paused while the inventory face-cam runs
 static float s_fpSensitivityFP     = 1.0f;   // [FirstPerson] Sensitivity (mouse-look scale)
 static float s_fpEyeHeight         = 16.5f;  // [FirstPerson] EyeHeight (fallback neck model)
-static float s_fpFwdOffset         = 1.0f;   // [FirstPerson] ForwardOffset (v1.4.0 tuned default)
-static float s_fpFovDegFP          = 75.0f;  // [FirstPerson] FOV (wide first-person view)
+static float s_fpFwdOffset         = 0.0f;   // [FirstPerson] ForwardOffset (Ironwind: eye 1 unit farther back)
+static float s_fpFovDegFP          = 90.0f;  // [FirstPerson] FOV (Ironwind wide-angle default)
 static float s_fpNearClipFP        = 1.0f;   // [FirstPerson] NearClip (1.0 since build 71: 0.1 gave 50x coarser depth than vanilla's 5.0/30000 -> distant grass z-fought and shimmered on every pan; 1.0 = 5x, user-confirmed sweet spot vs body clipping)
 static float s_fpNeckLimitRad      = 1.745f; // [FirstPerson] NeckLimit (deg -> rad; 100 deg — user-pictured extents 2026-08-23)
-static float s_uiNeckLimitDeg      = 100.0f; // options-tab slider mirror of NeckLimit: the UI edits
-                                             // DEGREES; dcOptionsWatch converts to s_fpNeckLimitRad
-                                             // on change, loadFirstPersonConfig syncs it back.
 static float s_fpSideLookFwd       = 1.0f;   // [FirstPerson] SideLookForward — extra eye reach at side-look so the shoulder clears the lens
 static bool  s_fpHideHair          = true;   // [FirstPerson] HideHair
 static bool  s_fpHideHead          = false;  // [FirstPerson] HideHead — LEGACY bone shrink.  Retired
@@ -1124,7 +1419,7 @@ static const float FP_HEAD_LEN     = 1.8f;   // neck-pivot to eye (fallback mode
 static const float FP_BONE_SMOOTH  = 0.45f;  // per-frame height lerp (damps stride bob)
 
 // -----------------------------------------------------------------------
-// Native Controls-menu keybinds (v1.7.3) — TOGGLE + SPEED ONLY.
+// Native Controls-menu keybinds (v1.7.3) — V toggle only.
 //
 // HARD CONSTRAINT learned in the field (2026-06-10): Kenshi's InputHandler
 // allows exactly ONE command per physical key.  Vanilla camera panning
@@ -1137,9 +1432,10 @@ static const float FP_BONE_SMOOTH  = 0.45f;  // per-frame height lerp (damps str
 //     polling (INI-configurable, v1.6 system); playerControl_hook already
 //     context-switches the camera keys during DC.  NEVER register
 //     dc_move_* commands in the InputHandler.
-//   - Toggle (V) and Speed (X) sit on keys vanilla leaves unbound — they
-//     are registered natively (KEP pattern) and rebindable in the
-//     Controls menu.  Presses arrive via key->events in processKeys.
+//   - Toggle (V) is registered natively (KEP pattern) and rebindable in the
+//     Controls menu. X/Z remain vanilla speed_3/speed_1. The vanilla
+//     cycle_run_speed event is only observed after dispatch so the directly
+//     controlled character inherits the selected movement pace.
 // Evidence the game persists plugin commands when bound: toggle_devtools
 // =F12 (KEP) lives in controls.cfg; our dc_ lines were missing because
 // vanilla camera lines re-stole W/A/S/D at loadConfig, leaving dc_move_*
@@ -1258,6 +1554,50 @@ static void getConfigPath(char* out, size_t cap)
     strcat_s(out, cap, "WASDCombatPlugin.ini");
 }
 
+// MyGUI expects UTF-8 text, while this VC2010 project otherwise compiles
+// narrow literals through the system ANSI code page. Read the Chinese UI
+// strings as raw UTF-8 bytes from a sidecar next to the DLL. INI identifiers
+// and saved key bindings remain unchanged for existing installations.
+static const char* dcZh(const char* english)
+{
+    if (!english) return nullptr;
+    static bool loaded = false;
+    static std::map<std::string, std::string> strings;
+    if (!loaded)
+    {
+        loaded = true;
+        char path[MAX_PATH];
+        getConfigPath(path, sizeof(path));
+        char* slash = strrchr(path, '\\');
+        if (slash) strcpy_s(slash + 1, sizeof(path) - (slash + 1 - path), "Settings.zh-CN.tsv");
+        FILE* file = nullptr;
+        if (fopen_s(&file, path, "rb") == 0 && file)
+        {
+            char line[2048];
+            bool first = true;
+            while (fgets(line, sizeof(line), file))
+            {
+                char* start = line;
+                if (first && (unsigned char)start[0] == 0xEF
+                    && (unsigned char)start[1] == 0xBB
+                    && (unsigned char)start[2] == 0xBF) start += 3;
+                first = false;
+                if (*start == '#' || *start == '\r' || *start == '\n') continue;
+                char* tab = strchr(start, '\t');
+                if (!tab) continue;
+                *tab++ = '\0';
+                char* end = tab + strlen(tab);
+                while (end > tab && (end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+                if (*start && *tab) strings[start] = tab;
+            }
+            fclose(file);
+        }
+        else DebugLog("[Ironwind] settings_zh_missing");
+    }
+    std::map<std::string, std::string>::const_iterator it = strings.find(english);
+    return it == strings.end() ? english : it->second.c_str();
+}
+
 static void writeDefaultConfig(const char* path)
 {
     HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, nullptr,
@@ -1277,24 +1617,20 @@ static void writeDefaultConfig(const char* path)
         "MoveLeft        = A\r\n"
         "MoveRight       = D\r\n"
         "SelectControl   = G\r\n"
-        "FirstPerson     = P\r\n"
+        "FirstPerson     = F\r\n"
         "; Sneak is the chord SHIFT + this key (first-person and third-person views).\r\n"
         "SneakToggle     = C\r\n"
-        "; Swap the CTRL third-person camera to the other shoulder.\r\n"
+        "; Swap the V-mode third-person camera to the other shoulder.\r\n"
         "SwapShoulder    = H\r\n"
-        "; Manual combat: hold to guard, tap as a hit lands for a perfect block.\r\n"
-        "Block           = F\r\n"
-        "; Press to dodge an incoming attack while Direct Control is on.\r\n"
-        "Dodge           = Q\r\n"
-        "; Manual attack (toggle): your character stops attacking on its own;\r\n"
-        "; every swing is the Attack key.  A \"Manual Attack\" label shows while on.\r\n"
+        "; Keyboard attack/block are used when DirectionalCombat is false.\r\n"
+        "Block           = Q\r\n"
+        "; V starts manual combat automatically. Attack key applies when directional mode is off.\r\n"
         "Attack          = E\r\n"
-        "ManualAttack    = Z\r\n"
         "; While manual combat is on, your character fights whoever you point at:\r\n"
         "; the enemy under the mouse cursor, or nearest the crosshair in first person\r\n"
-        "; and the CTRL third-person view.  The camera is never moved for it.\r\n"
-        "; Key layout version (leave as is): 2 = v1.5 layout, Block F / control G.\r\n"
-        "KeyLayout       = 2\r\n"
+        "; and the V-mode third-person view.  The camera is never moved for it.\r\n"
+        "; Key layout version (leave as is): 3 = v117 layout, view F / Block Q / control G.\r\n"
+        "KeyLayout       = 3\r\n"
         "\r\n"
         "[Settings]\r\n"
         "; true = camera faces your character when their inventory opens.\r\n"
@@ -1307,35 +1643,26 @@ static void writeDefaultConfig(const char* path)
         "; Enemies see your real movement, chase at full speed and can attack\r\n"
         "; you while you move (false = old behaviour: kiting never gets you hit).\r\n"
         "EnemyPursuit     = true\r\n"
-        "; Manual combat: Block and Dodge keys on/off.  Hold Block = skill block;\r\n"
-        "; tap it as an attack lands = perfect block (window / cooldown in ms).\r\n"
+        "; Manual combat and Block key on/off.\r\n"
         "ManualBlock      = true\r\n"
-        "; With manual combat (Z) on, your character still blocks on their own; your\r\n"
-        "; Block key adds the timed hold and the perfect block. false = fully manual defence.\r\n"
-        "AiBlocksInManual = true\r\n"
-        "PerfectBlockWindowMs   = 1000\r\n"
-        "; After a perfect block: the next press is free (no cooldown) for this long.\r\n"
-        "PerfectBlockRewardMs   = 1200\r\n"
-        "; Block is timed: a press blocks for up to BlockHoldMs, then a cooldown.\r\n"
+        "; V opens shoulder view and manual combat. Hold left mouse while moving\r\n"
+        "; to choose a direction; release to attack. Right mouse cancels into guard.\r\n"
+        "DirectionalCombat = true\r\n"
+        "; With V combat on, true keeps RMB as the guard request but lets\r\n"
+        "; Kenshi choose the defence direction. Releasing RMB stops it.\r\n"
+        "AiBlocksInManual = false\r\n"
+        "; Keyboard fallback only: a press blocks for up to BlockHoldMs, then a cooldown.\r\n"
         "BlockHoldMs            = 1200\r\n"
         "BlockCooldownMs        = 800\r\n"
-        "; Dodge: press within this many ms of the incoming attack; skill-rolled\r\n"
-        "; like vanilla with +DodgeSkillBonus dodge skill (block mode gives +20).\r\n"
-        "DodgeWindowMs          = 600\r\n"
-        "DodgeCooldownMs        = 300\r\n"
-        "DodgeSkillBonus        = 20\r\n"
         "; Attack: the press must reach the combat AI within this many ms.\r\n"
         "AttackWindowMs         = 400\r\n"
-        "; Attack out of reach: keep stepping in for up to this many ms, then swing.\r\n"
-        "AttackApproachMs       = 1500\r\n"
         "; Input forgiveness: extra presses of the same combat key within this\r\n"
         "; many ms are ignored (a double-tap is one move). Letting go of Block and\r\n"
         "; pressing it again this soon resumes the same block (no cooldown).\r\n"
         "InputRepeatGuardMs     = 250\r\n"
-        "; After a swing / dodge ends, new presses are ignored for this long so\r\n"
+        "; After a swing ends, new presses are ignored for this long so\r\n"
         "; the follow-through plays out instead of restarting the move.\r\n"
         "AttackRecoveryMs       = 400\r\n"
-        "DodgeRecoveryMs        = 400\r\n"
         "; Directional aim: how far off the view centre (degrees) an enemy still\r\n"
         "; counts as aimed at.\r\n"
         "AimConeDeg             = 35\r\n"
@@ -1350,19 +1677,19 @@ static void writeDefaultConfig(const char* path)
         "GlintPx                = 22\r\n"
         "; Detailed log for bug reports (writes every combat/movement event).\r\n"
         "VerboseLog             = false\r\n"
-        "; CTRL third-person camera: distance / height / shoulder offset.\r\n"
-        "OtsDistance      = 20\r\n"
-        "OtsHeight        = 15.0\r\n"
+        "; V-mode third-person camera: distance / height / shoulder offset.\r\n"
+        "OtsDistance      = 23\r\n"
+        "OtsHeight        = 18.0\r\n"
         "OtsSide          = 4.0\r\n"
         "; Near plane when a wall pushes the camera in close (lower keeps\r\n"
         "; your character's mesh intact at point-blank camera range).\r\n"
         "OtsNearClip      = 0.15\r\n"
         "\r\n"
         "[FirstPerson]\r\n"
-        "; First-person view (press P while Direct Control is on).\r\n"
+        "; First-person view (press F while Direct Control is on).\r\n"
         "Sensitivity      = 1.0\r\n"
         "; Field of view in degrees (50-110).\r\n"
-        "FOV              = 75\r\n"
+        "FOV              = 90\r\n"
         "; Hide your own head in first person (per-pixel - clean).\r\n"
         "HeadPixelHide    = 1\r\n"
         "; Legacy head hide (shrinks the head bone instead).  Turn this on -\r\n"
@@ -1403,7 +1730,7 @@ static void loadFirstPersonConfig(const char* path)
     float sens = (float)atof(fb);
     if (sens < 0.1f) sens = 0.1f;  if (sens > 5.0f) sens = 5.0f;
     s_fpSensitivityFP = sens;
-    GetPrivateProfileStringA("FirstPerson", "FOV", "75", fb, sizeof(fb), path);
+    GetPrivateProfileStringA("FirstPerson", "FOV", "90", fb, sizeof(fb), path);
     float fov = (float)atof(fb);
     if (fov < 50.0f) fov = 50.0f;  if (fov > 110.0f) fov = 110.0f;
     s_fpFovDegFP = fov;
@@ -1411,7 +1738,7 @@ static void loadFirstPersonConfig(const char* path)
     float eye = (float)atof(fb);
     if (eye < 1.0f) eye = 1.0f;    if (eye > 40.0f) eye = 40.0f;
     s_fpEyeHeight = eye;
-    GetPrivateProfileStringA("FirstPerson", "ForwardOffset", "1.0", fb, sizeof(fb), path);
+    GetPrivateProfileStringA("FirstPerson", "ForwardOffset", "0.0", fb, sizeof(fb), path);
     float fwd = (float)atof(fb);
     if (fwd < 0.0f) fwd = 0.0f;    if (fwd > 10.0f) fwd = 10.0f;
     s_fpFwdOffset = fwd;
@@ -1474,7 +1801,6 @@ static void loadFirstPersonConfig(const char* path)
     float nl = (float)atof(fb);
     if (nl < 30.0f) nl = 30.0f;    if (nl > 170.0f) nl = 170.0f;
     s_fpNeckLimitRad = nl * 3.14159265f / 180.0f;
-    s_uiNeckLimitDeg = nl;   // keep the options-tab slider (degrees) in step
     GetPrivateProfileStringA("FirstPerson", "NearClip", "1.0", fb, sizeof(fb), path);
     float nc = (float)atof(fb);
     if (nc < 0.05f) nc = 0.05f;    if (nc > 5.0f) nc = 5.0f;
@@ -1577,7 +1903,8 @@ static void loadKeybinds()
     // SelectControl=F (and Block=G, or no Block at all = would now default to F
     // and collide) - swap them ONCE, then stamp KeyLayout=2 so a player who
     // later binds F/G the old way on purpose is never swapped back.
-    if (GetPrivateProfileIntA("Keybinds", "KeyLayout", 1, path) < 2)
+    int keyLayout = (int)GetPrivateProfileIntA("Keybinds", "KeyLayout", 1, path);
+    if (keyLayout < 2)
     {
         bool oldPair = s_bindVk[KR_SELECT] == 'F'
                     && (s_bindVk[KR_BLOCK] == 'G' || s_bindVk[KR_BLOCK] == 'F');
@@ -1593,6 +1920,37 @@ static void loadKeybinds()
             DebugLog("[WASDCombat] dc_keybinds_migrated_v15 select=G block=F");
         }
         WritePrivateProfileStringA("Keybinds", "KeyLayout", "2", path);
+        keyLayout = 2;
+    }
+
+    // v117 layout: F is the explicit first-person/OTS toggle alongside the
+    // mouse-wheel endpoint switch. P leaves the shipped controls. Migrate only
+    // the previous shipped P/F values so unrelated custom bindings remain custom.
+    if (keyLayout < 3)
+    {
+        bool migratedView = s_bindVk[KR_FP] == 'P';
+        bool migratedBlock = s_bindVk[KR_BLOCK] == 'F';
+        if (migratedView)
+        {
+            s_bindVk[KR_FP] = 'F'; s_uiBindVk[KR_FP] = 'F';
+            strcpy_s(s_bindCfgStr[KR_FP], sizeof(s_bindCfgStr[KR_FP]), "F");
+            WritePrivateProfileStringA("Keybinds", "FirstPerson", "F", path);
+        }
+        if (migratedBlock)
+        {
+            s_bindVk[KR_BLOCK] = 'Q'; s_uiBindVk[KR_BLOCK] = 'Q';
+            strcpy_s(s_bindCfgStr[KR_BLOCK], sizeof(s_bindCfgStr[KR_BLOCK]), "Q");
+            WritePrivateProfileStringA("Keybinds", "Block", "Q", path);
+        }
+        if (migratedView || migratedBlock)
+        {
+            char mbuf[160];
+            sprintf_s(mbuf, sizeof(mbuf),
+                "[WASDCombat] dc_keybinds_migrated_v117 view=%s block=%s",
+                s_bindCfgStr[KR_FP], s_bindCfgStr[KR_BLOCK]);
+            DebugLog(mbuf);
+        }
+        WritePrivateProfileStringA("Keybinds", "KeyLayout", "3", path);
     }
 
     for (int i = 0; i < KR_COUNT; ++i)
@@ -1626,20 +1984,15 @@ static void loadKeybinds()
         GetPrivateProfileStringA("Settings", "ManualBlock", "true",
                                  sbuf, sizeof(sbuf), path);
         s_settingManualBlock = parseBool(sbuf, true);
-        GetPrivateProfileStringA("Settings", "AiBlocksInManual", "true", sbuf, sizeof(sbuf), path);
-        s_settingAiBlocks = parseBool(sbuf, true);
+        GetPrivateProfileStringA("Settings", "DirectionalCombat", "true",
+                                 sbuf, sizeof(sbuf), path);
+        s_directionalCombat = parseBool(sbuf, true);
+        GetPrivateProfileStringA("Settings", "AiBlocksInManual", "false", sbuf, sizeof(sbuf), path);
+        s_settingAiBlocks = parseBool(sbuf, false);
         GetPrivateProfileStringA("Settings", "VerboseLog", "false", sbuf, sizeof(sbuf), path);
         s_verboseLog = parseBool(sbuf, false);
         {
             char pbuf[16] = "";
-            GetPrivateProfileStringA("Settings", "PerfectBlockWindowMs", "1000", pbuf, sizeof(pbuf), path);
-            float w = (float)atof(pbuf);
-            if (w < 100.0f) w = 100.0f;   if (w > 3000.0f) w = 3000.0f;
-            s_perfectWindowMs = w;
-            GetPrivateProfileStringA("Settings", "PerfectBlockRewardMs", "1200", pbuf, sizeof(pbuf), path);
-            float c = (float)atof(pbuf);
-            if (c < 0.0f) c = 0.0f;       if (c > 5000.0f) c = 5000.0f;
-            s_perfectRewardMs = c;
             GetPrivateProfileStringA("Settings", "BlockHoldMs", "1200", pbuf, sizeof(pbuf), path);
             float bh = (float)atof(pbuf);
             if (bh < 200.0f) bh = 200.0f;  if (bh > 5000.0f) bh = 5000.0f;
@@ -1648,14 +2001,6 @@ static void loadKeybinds()
             float bc = (float)atof(pbuf);
             if (bc < 0.0f) bc = 0.0f;      if (bc > 10000.0f) bc = 10000.0f;
             s_blockCooldownMs = bc;
-            GetPrivateProfileStringA("Settings", "DodgeWindowMs", "600", pbuf, sizeof(pbuf), path);
-            float dw = (float)atof(pbuf);
-            if (dw < 100.0f) dw = 100.0f;  if (dw > 3000.0f) dw = 3000.0f;
-            s_dodgeWindowMs = dw;
-            GetPrivateProfileStringA("Settings", "DodgeCooldownMs", "300", pbuf, sizeof(pbuf), path);
-            float dc = (float)atof(pbuf);
-            if (dc < 0.0f) dc = 0.0f;      if (dc > 10000.0f) dc = 10000.0f;
-            s_dodgeCooldownMs = dc;
             GetPrivateProfileStringA("Settings", "AimNameTag", "true", pbuf, sizeof(pbuf), path);
             s_settingAimName = parseBool(pbuf, true);
             GetPrivateProfileStringA("Settings", "WeaponGlint", "true", pbuf, sizeof(pbuf), path);
@@ -1680,10 +2025,6 @@ static void loadKeybinds()
             float ahp = (float)atof(pbuf);
             if (ahp < 10.0f) ahp = 10.0f;  if (ahp > 400.0f) ahp = 400.0f;
             s_aimHoverPx = ahp;
-            GetPrivateProfileStringA("Settings", "AttackApproachMs", "1500", pbuf, sizeof(pbuf), path);
-            float ap = (float)atof(pbuf);
-            if (ap < 0.0f) ap = 0.0f;      if (ap > 5000.0f) ap = 5000.0f;
-            s_attackApproachMs = ap;
             GetPrivateProfileStringA("Settings", "AttackWindowMs", "400", pbuf, sizeof(pbuf), path);
             float aw = (float)atof(pbuf);
             if (aw < 100.0f) aw = 100.0f;  if (aw > 2000.0f) aw = 2000.0f;
@@ -1696,14 +2037,6 @@ static void loadKeybinds()
             float ar = (float)atof(pbuf);
             if (ar < 0.0f) ar = 0.0f;      if (ar > 2000.0f) ar = 2000.0f;
             s_attackRecoveryMs = ar;
-            GetPrivateProfileStringA("Settings", "DodgeRecoveryMs", "400", pbuf, sizeof(pbuf), path);
-            float dr = (float)atof(pbuf);
-            if (dr < 0.0f) dr = 0.0f;      if (dr > 2000.0f) dr = 2000.0f;
-            s_dodgeRecoveryMs = dr;
-            GetPrivateProfileStringA("Settings", "DodgeSkillBonus", "20", pbuf, sizeof(pbuf), path);
-            float db = (float)atof(pbuf);
-            if (db < 0.0f) db = 0.0f;      if (db > 100.0f) db = 100.0f;
-            s_dodgeSkillBonus = db;
         }
 
         char mbuf[16] = "";
@@ -1713,14 +2046,14 @@ static void loadKeybinds()
         if (wsm < 0.1f) wsm = 0.1f;   if (wsm > 5.0f) wsm = 5.0f;
         s_settingWasdSpeedMult = wsm;
 
-        // OTS camera pose (CTRL toggle).
-        GetPrivateProfileStringA("Settings", "OtsDistance", "20", mbuf, sizeof(mbuf), path);
+        // V-mode OTS camera pose.
+        GetPrivateProfileStringA("Settings", "OtsDistance", "23", mbuf, sizeof(mbuf), path);
         float od = (float)atof(mbuf);
-        if (od < 5.0f) od = 5.0f;      if (od > 60.0f) od = 60.0f;
+        if (od < 5.0f) od = 5.0f;      if (od > OTS_ZOOM_MAX) od = OTS_ZOOM_MAX;
         s_otsCamDist = od;
-        GetPrivateProfileStringA("Settings", "OtsHeight", "15.0", mbuf, sizeof(mbuf), path);
+        GetPrivateProfileStringA("Settings", "OtsHeight", "18.0", mbuf, sizeof(mbuf), path);
         float oh = (float)atof(mbuf);
-        if (oh < -5.0f) oh = -5.0f;    if (oh > 20.0f) oh = 20.0f;
+        if (oh < -5.0f) oh = -5.0f;    if (oh > 28.0f) oh = 28.0f;
         s_otsCamHeight = oh;
         GetPrivateProfileStringA("Settings", "OtsSide", "4.0", mbuf, sizeof(mbuf), path);
         float os = (float)atof(mbuf);
@@ -1733,21 +2066,20 @@ static void loadKeybinds()
     }
 
     // [FirstPerson] tunables — read via the shared helper (also called on every
-    // P-enter for live re-tuning).  Missing keys/section fall back to shipped
+    // F-enter for live re-tuning).  Missing keys/section fall back to shipped
     // defaults, so existing users keep the defaults without touching their INI.
     loadFirstPersonConfig(path);
 
     char lbuf[420];
     sprintf_s(lbuf, sizeof(lbuf),
         "[WASDCombat] dc_keybinds_loaded toggle=%s(0x%02X) forward=%s(0x%02X)"
-        " back=%s(0x%02X) left=%s(0x%02X) right=%s(0x%02X) speed=%s(0x%02X)"
+        " back=%s(0x%02X) left=%s(0x%02X) right=%s(0x%02X)"
         " select=%s(0x%02X) inventoryFaceCam=%d",
         s_bindCfgStr[KR_TOGGLE],  s_bindVk[KR_TOGGLE],
         s_bindCfgStr[KR_FORWARD], s_bindVk[KR_FORWARD],
         s_bindCfgStr[KR_BACK],    s_bindVk[KR_BACK],
         s_bindCfgStr[KR_LEFT],    s_bindVk[KR_LEFT],
         s_bindCfgStr[KR_RIGHT],   s_bindVk[KR_RIGHT],
-        s_bindCfgStr[KR_SPEED],   s_bindVk[KR_SPEED],
         s_bindCfgStr[KR_SELECT],  s_bindVk[KR_SELECT],
         s_settingInventoryFaceCam ? 1 : 0);
     DebugLog(lbuf);
@@ -1775,7 +2107,7 @@ static void loadKeybinds()
 //
 //  Persistence: dcOptionsWatch (called every mainLoop frame; touches only
 //  our statics, no GUI calls) detects changes and immediately writes the
-//  INI key, so the P-enter INI reload (loadFirstPersonConfig) always
+//  INI key, so the F-enter INI reload (loadFirstPersonConfig) always
 //  reads back exactly what the UI set — the two config paths can never
 //  disagree.
 //
@@ -1806,71 +2138,15 @@ static DcOptRow s_dcOptRows[] =
     { "Settings", "WasdSpeedMult", NULL, &s_settingWasdSpeedMult, 0.1f, 3.0f, 2, 1.0f,
       "Movement speed multiplier",
       "Scales how fast your character moves with the movement keys. 1.0 = the game's normal speed." },
-    { "Settings", "WasdSpeedCap", &s_settingWasdSpeedCap, NULL, 0, 0, 0, 1,
-      "Cap speed at the character's real max",
-      "On: injuries, heavy loads and shackles slow you down exactly as they would in normal play." },
-    { "Settings", "EnemyPursuit", &s_settingEnemyPursuit, NULL, 0, 0, 0, 1,
-      "Enemies chase and hit a moving player",
-      "On: enemies run you down and attack a moving character. Off: the old behaviour, where enemies stall against a moving player." },
-    { "Settings", "InventoryFaceCam", &s_settingInventoryFaceCam, NULL, 0, 0, 0, 1,
-      "Camera faces character in inventory",
-      "Off: the camera stays put and you can keep moving with the movement keys while looting or trading." },
-
-    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - ATTACK", NULL },
-    { "Settings", "AttackApproachMs", NULL, &s_attackApproachMs, 0.0f, 5000.0f, 0, 1500.0f,
-      "Step-in time when out of reach (ms)",
-      "Press Attack on an enemy that is too far away and your character walks in for up to this long, then swings. 0 = swing at the air instead." },
-    { "Settings", "AttackWindowMs", NULL, &s_attackWindowMs, 100.0f, 2000.0f, 0, 400.0f,
-      "Attack press kept for (ms)",
-      "If your character cannot swing the instant you press (still turning, just stopped moving), the press is kept for this long." },
-    { "Settings", "AttackRecoveryMs", NULL, &s_attackRecoveryMs, 0.0f, 2000.0f, 0, 400.0f,
-      "Pause after a swing (ms)",
-      "After a swing ends, Attack presses are ignored for this long so the swing finishes naturally instead of being cut short." },
-
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - BLOCK", NULL },
-    { "Settings", "ManualBlock", &s_settingManualBlock, NULL, 0, 0, 0, 1,
-      "Enable the Block and Dodge keys",
-      "Off: Block and Dodge do nothing and your character defends on their own as in normal play." },
-    { "Settings", "AiBlocksInManual", &s_settingAiBlocks, NULL, 0, 0, 0, 1,
-      "Character still blocks on their own",
-      "On: your character blocks automatically as usual, and your Block key adds the timed guard and the perfect block on top. Off: only your own Block and Dodge presses stop hits." },
-    { "Settings", "BlockHoldMs", NULL, &s_blockHoldMs, 200.0f, 5000.0f, 0, 1200.0f,
-      "Max time a held Block guards (ms)",
-      "Holding Block guards for at most this long, then the guard drops even if you keep holding. Stops endless turtling." },
-    { "Settings", "BlockCooldownMs", NULL, &s_blockCooldownMs, 0.0f, 10000.0f, 0, 800.0f,
-      "Block cooldown (ms)",
-      "Counted from the moment a guard ends. Letting go and pressing again right away keeps the same guard instead of starting this wait." },
-    { "Settings", "PerfectBlockWindowMs", NULL, &s_perfectWindowMs, 100.0f, 3000.0f, 0, 1000.0f,
-      "Perfect block window after tap (ms)",
-      "Tap Block and any hit from the front that lands within this time is stopped no matter your skill. Follow-up strikes of the same attack are covered too." },
-    { "Settings", "PerfectBlockRewardMs", NULL, &s_perfectRewardMs, 0.0f, 5000.0f, 0, 1200.0f,
-      "Perfect block reward window (ms)",
-      "After a perfect block your weapon glows blue: for this long the next Block press counts at once, with no cooldown, so perfect blocks can be chained." },
-
-    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - DODGE", NULL },
-    { "Settings", "DodgeWindowMs", NULL, &s_dodgeWindowMs, 100.0f, 3000.0f, 0, 600.0f,
-      "Dodge press kept for (ms)",
-      "Press Dodge up to this long before an attack arrives and the dodge still fires when it does. Whether it succeeds is a Dodge skill roll, as in normal play." },
-    { "Settings", "DodgeSkillBonus", NULL, &s_dodgeSkillBonus, 0.0f, 100.0f, 0, 20.0f,
-      "Dodge skill bonus for a timed press",
-      "Added to your Dodge skill for the roll when you press at the right time. 20 matches the bonus the game's own Block mode gives to defence." },
-    { "Settings", "DodgeCooldownMs", NULL, &s_dodgeCooldownMs, 0.0f, 10000.0f, 0, 300.0f,
-      "Dodge cooldown (ms)",
-      "A new dodge is never possible until the current one finishes; this adds extra time on top." },
-    { "Settings", "DodgeRecoveryMs", NULL, &s_dodgeRecoveryMs, 0.0f, 2000.0f, 0, 400.0f,
-      "Pause after a dodge (ms)",
-      "After a dodge ends, Dodge presses are ignored for this long so the dodge finishes naturally." },
+    { "Settings", "AiBlocksInManual", &s_settingAiBlocks, NULL, 0, 0, 0, 0,
+      "Automatic block (AI chooses direction)",
+      "Off: hold right mouse and choose the matching direction. On: hold right mouse to request a guard while Kenshi's combat AI chooses the direction; releasing it stops the request." },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - TARGETING & FEEL", NULL },
     { "Settings", "AimConeDeg", NULL, &s_aimConeDeg, 5.0f, 90.0f, 0, 35.0f,
       "Crosshair target cone (degrees)",
       "In first person and the third-person camera, the enemy nearest the crosshair within this cone is the one your character fights." },
-    { "Settings", "AimHoverPx", NULL, &s_aimHoverPx, 10.0f, 400.0f, 0, 70.0f,
-      "Cursor target radius (pixels)",
-      "In the normal camera, an enemy this close to the mouse cursor on screen becomes the one your character fights. Right-click an enemy to pick one at any distance." },
-    { "Settings", "InputRepeatGuardMs", NULL, &s_inputRepeatGuardMs, 0.0f, 1000.0f, 0, 250.0f,
-      "Ignore double-presses within (ms)",
-      "A second press of the same combat key this soon after the first is ignored, so a nervous double-tap never restarts a move." },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "MANUAL COMBAT - ON-SCREEN CUES", NULL },
     { "Settings", "AimNameTag", &s_settingAimName, NULL, 0, 0, 0, 1,
@@ -1878,93 +2154,34 @@ static DcOptRow s_dcOptRows[] =
       "The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head." },
     { "Settings", "WeaponGlint", &s_settingGlint, NULL, 0, 0, 0, 1,
       "Glint on weapons swinging at you",
-      "An enemy's weapon lights up while their attack is coming at you, brightest just before it lands - your cue to block, dodge or counter." },
-    { "Settings", "GlintLeadMs", NULL, &s_glintLeadMs, 50.0f, 2000.0f, 0, 700.0f,
-      "Glint peaks after swing start (ms)",
-      "The glint reaches full brightness this long after the enemy starts their swing. Most swings land around 850 ms, so 700 peaks just before the hit." },
+      "An enemy's weapon lights up while their attack is coming at you, brightest just before it lands - your cue to guard or counter." },
     { "Settings", "GlintPx", NULL, &s_glintPx, 6.0f, 96.0f, 0, 22.0f,
       "Glint size (pixels)",
       NULL },
-    { "Settings", "GlintColourTiers", &s_glintColourTiers, NULL, 0, 0, 0, 0,
-      "Colour glints by defence (experimental)",
-      "Off: every glint is white. On: white = a Block tap stops it (front arc), orange = from the side or behind, dodge it, red = heavy-weapon strike, dodge preferred." },
 
-    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "THIRD PERSON CAMERA (CTRL)", NULL },
-    { "Settings", "OtsDistance", NULL, &s_otsCamDist, 5.0f, 60.0f, 0, 20.0f,
-      "Distance behind your character",
-      "How far back the shoulder camera sits. The mouse wheel zooms while it is active." },
-    { "Settings", "OtsHeight", NULL, &s_otsCamHeight, -5.0f, 20.0f, 1, 15.0f,
+    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "THIRD PERSON CAMERA (V)", NULL },
+    { "Settings", "OtsHeight", NULL, &s_otsCamHeight, -5.0f, 28.0f, 1, 18.0f,
       "Camera focus height",
       "Height of the point the camera looks at. Higher looks over the shoulder; lower looks at the back." },
-    { "Settings", "OtsSide", NULL, &s_otsCamSide, -8.0f, 8.0f, 1, 4.0f,
-      "Shoulder offset",
-      "Positive = over the right shoulder, negative = over the left. The swap-shoulder key flips it in play." },
-    { "Settings", "OtsNearClip", NULL, &s_otsNearClipMin, 0.05f, 2.0f, 2, 0.15f,
-      "Close-up clipping distance",
-      "Used when a wall pushes the camera in close. Lower keeps your character's body intact at point-blank range; higher sees through nearby walls sooner." },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "FIRST PERSON", NULL },
     { "FirstPerson", "Sensitivity", NULL, &s_fpSensitivityFP, 0.1f, 5.0f, 2, 1.0f,
       "Mouse look sensitivity",
       "How fast the view turns with the mouse." },
-    { "FirstPerson", "FOV", NULL, &s_fpFovDegFP, 50.0f, 110.0f, 0, 75.0f,
+    { "FirstPerson", "FOV", NULL, &s_fpFovDegFP, 50.0f, 110.0f, 0, 90.0f,
       "Field of view (degrees)",
       "Wider shows more of your surroundings. Applies instantly." },
-    { "FirstPerson", "NeckLimit", NULL, &s_uiNeckLimitDeg, 30.0f, 170.0f, 0, 100.0f,
-      "Free-look range (degrees)",
-      "How far you can look to each side of your body before the body turns to follow the view." },
-    { "FirstPerson", "LookSmooth", NULL, &s_fpLookSmooth, 0.0f, 0.9f, 2, 0.4f,
-      "Look smoothing",
-      "Softens mouse look. 0 = raw and snappy, higher = smoother but slightly delayed." },
     { "FirstPerson", "HeadPixelHide", &s_fpHeadPixelHide, NULL, 0, 0, 0, 1,
       "Hide your own head",
       "Erases your head so it never blocks the view. Leave on unless a modded race looks wrong." },
-    { "FirstPerson", "HideHead", &s_fpHideHead, NULL, 0, 0, 0, 0,
-      "Hide head (legacy shrink)",
-      "Only for modded races that render wrong with the normal hide. Takes effect the next time you enter first person." },
-    { "FirstPerson", "HideHeadgear", &s_fpHideHeadgear, NULL, 0, 0, 0, 1,
-      "Hide hats and beard",
-      "Headgear and beards would otherwise sit in front of the lens." },
-    { "FirstPerson", "HideHair", &s_fpHideHair, NULL, 0, 0, 0, 1,
-      "Hide hair", NULL },
-    { "FirstPerson", "HideInjuryOverlay", &s_fpHideInjuryOverlay, NULL, 0, 0, 0, 1,
-      "Hide hand-to-wound poses",
-      "Stops the hand-on-head and hand-on-wound animations covering the view when hurt." },
-    { "FirstPerson", "FloorRevealBelow", &s_fpFloorRevealBelow, NULL, 0, 0, 0, 1,
-      "Show floors below you in buildings",
-      "Inside buildings, keeps the storeys below you drawn so stairs and balconies do not open onto nothing." },
 
-    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "FIRST PERSON - EYE POSITION (advanced)", NULL },
+    { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "FIRST PERSON - EYE POSITION", NULL },
     { "FirstPerson", "EyeDrop", NULL, &s_fpEyeDrop, -4.0f, 8.0f, 2, -0.2f,
       "Eye drop below head bone",
       "Fine-tunes eye level. Negative raises the eye slightly." },
-    { "FirstPerson", "EyeUpAdjust", NULL, &s_fpEyeUpAdjust, -6.0f, 6.0f, 2, 0.0f,
-      "Extra eye raise",
-      "Added on top of the drop above, for races with unusual heads." },
-    { "FirstPerson", "ForwardOffset", NULL, &s_fpFwdOffset, 0.0f, 10.0f, 2, 1.0f,
+    { "FirstPerson", "ForwardOffset", NULL, &s_fpFwdOffset, 0.0f, 10.0f, 2, 0.0f,
       "Eye forward of the head",
       "Keeps the view out of the inside of the skull. Raise if you see your own face." },
-    { "FirstPerson", "JogForward", NULL, &s_fpJogForward, 0.0f, 20.0f, 1, 2.0f,
-      "Forward push while jogging",
-      "The jog animation leans the body into the view; this pushes the eye ahead of it." },
-    { "FirstPerson", "RunForward", NULL, &s_fpRunForward, 0.0f, 20.0f, 1, 4.0f,
-      "Forward push while running",
-      "Same as above for the run animation." },
-    { "FirstPerson", "SideLookForward", NULL, &s_fpSideLookFwd, 0.0f, 6.0f, 1, 1.0f,
-      "Forward push when looking sideways",
-      "Keeps the shoulder out of view when you look to the side." },
-    { "FirstPerson", "ActionClearForward", NULL, &s_fpActionClearFwd, 0.0f, 8.0f, 1, 2.0f,
-      "Forward push during attacks",
-      "Clears the arms and weapon from the view while swinging." },
-    { "FirstPerson", "NearClip", NULL, &s_fpNearClipFP, 0.05f, 2.0f, 2, 1.0f,
-      "Clipping distance",
-      "Anything closer than this to the eye is not drawn. Lower shows more of your own body but makes distant grass shimmer when you turn; higher is the reverse. 1.0 is the balance." },
-    { "FirstPerson", "DownNearClip", NULL, &s_fpDownNearClip, 0.02f, 2.0f, 2, 0.05f,
-      "Clipping distance while down",
-      "Used while knocked down, ragdolled or getting up, when the horizon does not matter: low enough that your own body stays solid in front of the lens." },
-    { "FirstPerson", "BodySolidInside", &s_fpBodySolidInside, NULL, 0, 0, 0, 1,
-      "Body is solid from the inside",
-      "Draws your own body double-sided in first person, so a head pressed into the chest sees cloth and skin instead of a hollow shell." },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "TROUBLESHOOTING", NULL },
     { "Settings", "VerboseLog", &s_verboseLog, NULL, 0, 0, 0, 0,
@@ -1977,8 +2194,8 @@ static const int DC_OPT_ROW_COUNT = sizeof(s_dcOptRows) / sizeof(s_dcOptRows[0])
 // model as the sliders).  These CANNOT use the native press-a-key rows:
 // Kenshi's command system is one-command-per-key and vanilla camera panning
 // owns W/S/A/D (registering them stole the camera — June hard lesson).
-// Toggle + Speed Cycle are NOT here: they are real native commands and get
-// genuine KeyConfig rows in the tab.
+// Toggle and the vanilla movement-speed cycle are not here: both get genuine
+// KeyConfig rows in the tab. Only the toggle is plugin-owned.
 struct DcBindRow { int role; const char* label; const char* tip; };   // role < 0 = section header
 static const DcBindRow s_dcBindRows[] =
 {
@@ -1989,14 +2206,12 @@ static const DcBindRow s_dcBindRows[] =
     { KR_RIGHT,   "Move right",          NULL },
     { KR_SELECT,  "Control hovered character", "Press with the mouse over one of your characters to control them instead." },
     { -1,         "CAMERA KEYS",         NULL },
-    { KR_FP,      "First person (toggle)", "Puts the camera in your character's eyes. Press again to leave. The CTRL key toggles the third-person shoulder camera." },
+    { KR_FP,      "First person (toggle)", "Puts the camera in your character's eyes. Press again to return to the shoulder camera started by V." },
     { KR_OTS_SHOULDER, "Swap camera shoulder", "Moves the third-person camera to the other shoulder." },
     { KR_SNEAK,   "Sneak (SHIFT + key)", "Hold SHIFT and press this key to toggle sneaking in first person or the third-person camera." },
     { -1,         "MANUAL COMBAT KEYS",  NULL },
-    { KR_MANUAL,  "Manual combat (toggle)", "On: your character only swings when you press Attack and fights whoever you point at. Off: normal AI combat." },
-    { KR_ATTACK,  "Attack (press)",      "Manual combat only. One press = one swing at the enemy you are pointing at. Out of reach, your character steps in first." },
-    { KR_BLOCK,   "Block (hold / tap)",  "Manual combat only. Hold to guard with your Block skill. Tap just as a hit lands for a perfect block that always stops it." },
-    { KR_DODGE,   "Dodge (press)",       "Manual combat only. Press as an attack comes in to dodge it. Success depends on your Dodge skill plus a timing bonus." },
+    { KR_ATTACK,  "Interact / keyboard attack", "Directional mode: interacts with the nearby automatically selected target. Keyboard mode uses this key to attack." },
+    { KR_BLOCK,   "Block / guard",  "Manual combat only. Hold to guard; in directional mode the incoming direction must match." },
 };
 static const int DC_BIND_ROW_COUNT = sizeof(s_dcBindRows) / sizeof(s_dcBindRows[0]);
 
@@ -2056,8 +2271,9 @@ static float s_dcOptLast[DC_OPT_ROW_COUNT];
 static DatapanelGUI* s_dcOptPanel = nullptr;
 static int           s_dcOptCat   = 0;
 
-// Reset every bound setting to its shipped default (DcOptRow::def = the user's
-// dialed-in preference), then refresh the widgets.  dcOptionsWatch picks up
+// Reset every setting visible on this page to its shipped default
+// (DcOptRow::def), then refresh the widgets. INI-only advanced compatibility
+// values are deliberately left alone. dcOptionsWatch picks up
 // the changed statics next frame → persists each to the INI + live-applies
 // FOV/NearClip, exactly as if the player had moved every control by hand.
 static void dcOnDefaultsPressed(MyGUI::Widget* /*sender*/)
@@ -2069,16 +2285,12 @@ static void dcOnDefaultsPressed(MyGUI::Widget* /*sender*/)
         if (r.bp)      *r.bp = (r.def != 0.0f);
         else if (r.fp) *r.fp = r.def;
     }
-    // NeckLimit slider edits degrees; keep the radian value it drives in step
-    // immediately (dcOptionsWatch also does this, but not until next frame).
-    s_fpNeckLimitRad = s_uiNeckLimitDeg * 3.14159265f / 180.0f;
-
     if (s_dcOptPanel)
         for (int i = 0; i < DC_OPT_ROW_COUNT; i++)
         {
             const DcOptRow& r = s_dcOptRows[i];
             if (!r.key) continue;
-            DataPanelLine* ln = s_dcOptPanel->getLine(r.label, s_dcOptCat);
+            DataPanelLine* ln = s_dcOptPanel->getLine(dcZh(r.label), s_dcOptCat);
             if (ln) ln->refresh();   // pull the reset value into the widget
         }
     DebugLog("[WASDCombat] dc_opt_reset_to_defaults");
@@ -2110,27 +2322,19 @@ static void dcOptionsWatch()
         if (cur == s_dcOptLast[i]) continue;
         s_dcOptLast[i] = cur;
 
-        // Unit conversion: the NeckLimit slider edits degrees.
-        if (r.fp == &s_uiNeckLimitDeg)
-            s_fpNeckLimitRad = cur * 3.14159265f / 180.0f;
-
-        // Live re-apply: FOV/NearClip are only pushed to the camera at FP
-        // enter — re-push so slider drags show instantly in first person.
-        if ((r.fp == &s_fpFovDegFP || r.fp == &s_fpNearClipFP)
-            && s_firstPersonActive && ou && ou->player
+        // FOV is normally pushed at first-person entry; re-push so its visible
+        // slider applies instantly.
+        if (r.fp == &s_fpFovDegFP && s_firstPersonActive && ou && ou->player
             && ou->player->camera && ou->player->camera->camera)
         {
             Ogre::Camera* ocOpt = ou->player->camera->camera;
-            if (r.fp == &s_fpFovDegFP)
-                ocOpt->setFOVy(Ogre::Radian(Ogre::Degree(s_fpFovDegFP)));
-            else
-                ocOpt->setNearClipDistance(s_fpNearClipFP);
+            ocOpt->setFOVy(Ogre::Radian(Ogre::Degree(s_fpFovDegFP)));
         }
 
         // Persist immediately.  [Settings] is parsed with parseBool
         // (true/false); [FirstPerson] with GetPrivateProfileIntA/atof
         // (numeric).  Floats always write 3 decimals so the value
-        // round-trips through the P-enter INI reload bit-stable.
+        // round-trips through the F-enter INI reload bit-stable.
         char path[MAX_PATH];
         getConfigPath(path, sizeof(path));
         char val[32];
@@ -2201,7 +2405,7 @@ static void dcInjectSettingsTab(OptionsWindow* self)
 {
     if (!gui || !self->tabs)
         return;
-    if (self->tabs->findItemWith(MyGUI::UString("Direct Control")) != NULL)
+    if (self->tabs->findItemWith(MyGUI::UString(dcZh("Direct Control"))) != NULL)
         return;   // already present (re-entry guard)
 
     size_t tabCount = self->tabs->getItemCount();
@@ -2223,7 +2427,7 @@ static void dcInjectSettingsTab(OptionsWindow* self)
     // Index 5 = right after Controls, before Mods (KEP's slot choice).
     size_t index = (tabCount < 5) ? tabCount : 5;
     MyGUI::TabItem* tab =
-        self->tabs->insertItemAt(index, MyGUI::UString("Direct Control"));
+        self->tabs->insertItemAt(index, MyGUI::UString(dcZh("Direct Control")));
     if (!tab)
     {
         DebugLog("[WASDCombat] dc_opt_tab_insert_failed");
@@ -2242,19 +2446,15 @@ static void dcInjectSettingsTab(OptionsWindow* self)
 
     // ---- KEYBINDS (first section — no leading addSpace, it renders as a
     // large empty gap; Controls-rows field finding 2026-06) ----
-    panel->setLineText("DIRECT CONTROL KEYS", "DIRECT CONTROL KEYS", cat, false,
+    panel->setLineText(dcZh("DIRECT CONTROL KEYS"), dcZh("DIRECT CONTROL KEYS"), cat, false,
                        MyGUI::Align(MyGUI::Align::Left));
-    // Native press-a-key rows (moved here from the Controls tab per user req
-    // 2026-09-02).  The game's capture flow (clickButton -> OptionsWindow::
-    // setKey) is panel-agnostic; rebinds persist via the existing saveOptions
-    // hook.  dc_toggle is the mod's own command; cycle_run_speed is VANILLA's
-    // — editing it here rebinds the exact command the vanilla Controls tab
-    // uses, so the two rows stay in sync for free (SPEEDSYNC-TWEAK).
+    // Native press-a-key row. The game's capture flow (clickButton ->
+    // OptionsWindow::setKey) is panel-agnostic; rebinds persist via the
+    // existing saveOptions hook. Vanilla movement-speed controls remain only
+    // on the vanilla Controls page instead of being duplicated here.
     panel->addCustomLine(new DataPanelLine_KeyConfig(
-        "dc_toggle",        "Direct Control on / off", cat));
-    panel->addCustomLine(new DataPanelLine_KeyConfig(
-        "cycle_run_speed",  "Cycle walk / jog / run", cat));
-    built += 2;
+        "dc_toggle",        dcZh("Direct Control on / off"), cat));
+    built += 1;
     // INI-polled hotkeys: key-picker dropdowns (see s_dcBindRows).
     for (int i = 0; i < DC_BIND_ROW_COUNT; i++)
     {
@@ -2262,12 +2462,12 @@ static void dcInjectSettingsTab(OptionsWindow* self)
         if (b.role < 0)
         {
             panel->addSpace(cat, 0.35f);
-            panel->setLineText(b.label, b.label, cat, false, MyGUI::Align(MyGUI::Align::Left));
+            panel->setLineText(dcZh(b.label), dcZh(b.label), cat, false, MyGUI::Align(MyGUI::Align::Left));
             built++;
             continue;
         }
         DataPanelLine_DropBox* db = panel->setLineDropBox(
-            b.label, cat, &s_uiBindVk[b.role], false, 0.7f);
+            dcZh(b.label), cat, &s_uiBindVk[b.role], false, 0.7f);
         if (!db) continue;
         char one[2] = { 0, 0 };
         for (char c = 'A'; c <= 'Z'; c++)
@@ -2287,11 +2487,11 @@ static void dcInjectSettingsTab(OptionsWindow* self)
             db->addAValue(std::string(fbuf), VK_F1 + f);
         }
         for (int k = 0; k < DC_KEY_CHOICE_COUNT; k++)
-            db->addAValue(std::string(s_dcKeyChoices[k].label),
+            db->addAValue(std::string(dcZh(s_dcKeyChoices[k].label)),
                           s_dcKeyChoices[k].vk);
         db->refresh();   // select the currently-bound key
         if (b.tip)
-            db->setToolTip(std::string(b.tip), self->tooltip);
+            db->setToolTip(std::string(dcZh(b.tip)), self->tooltip);
         built++;
     }
 
@@ -2308,26 +2508,26 @@ static void dcInjectSettingsTab(OptionsWindow* self)
             if (!firstHeader)
                 panel->addSpace(cat, 0.35f);
             firstHeader = false;
-            panel->setLineText(r.label, r.label, cat, false,
+            panel->setLineText(dcZh(r.label), dcZh(r.label), cat, false,
                                MyGUI::Align(MyGUI::Align::Left));
             continue;
         }
         DataPanelLine* line = NULL;
         if (r.bp)
         {
-            line = panel->setLineCheckbox(r.label, r.bp, cat);
+            line = panel->setLineCheckbox(dcZh(r.label), r.bp, cat);
         }
         else if (r.fp)
         {
             DataPanelLine_SliderEditable* sl = panel->setLineSliderEditable(
-                r.label, cat, true, r.mn, r.mx, r.fp);
+                dcZh(r.label), cat, true, r.mn, r.mx, r.fp);
             if (sl) sl->setPrecision(r.prec);
             line = sl;
         }
         if (line)
         {
             if (r.tip)
-                line->setToolTip(std::string(r.tip), self->tooltip);
+                line->setToolTip(std::string(dcZh(r.tip)), self->tooltip);
             built++;
         }
     }
@@ -2340,7 +2540,7 @@ static void dcInjectSettingsTab(OptionsWindow* self)
     s_dcOptCat   = cat;
     panel->addSpace(cat, 0.35f);
     DataPanelLine_Button* resetBtn =
-        panel->setLineButton("Reset all settings to defaults", "Reset", cat);
+        panel->setLineButton(dcZh("Reset visible settings to defaults"), dcZh("Reset"), cat);
     if (resetBtn && resetBtn->button)
     {
         resetBtn->button->eventMouseButtonClick += MyGUI::newDelegate(dcOnDefaultsPressed);
@@ -2373,6 +2573,11 @@ static void handleTogglePress()
     {
         s_userWantsDC = false;
         s_userWantsFP = false;   // FP requires DC; leaving DC clears the FP intent too
+        s_wheelFirstPersonActive = false;
+        s_otsResumeZoomPending = false;
+        manualAttackClearAimInput(false, true);
+        manualAttackClearQueuedInput(true);
+        manualAttackClearNeutralIntent();
         setMode(MODE_VANILLA);
         DebugLog("[WASDCombat] dc_user_intent_off_manual");
     }
@@ -2382,14 +2587,6 @@ static void handleTogglePress()
         setMode(MODE_FREE_MOVE);
         DebugLog("[WASDCombat] dc_user_intent_on");
     }
-}
-
-static void handleSpeedPress()
-{
-    if (s_lootUiSuspendActive)
-        return;
-    if (s_mode == MODE_FREE_MOVE)
-        s_xPressed = true;
 }
 
 static void handleSelectPress()
@@ -2420,7 +2617,7 @@ static void handleSneakPress()
     // does nothing, so a bare C press can never collide with vanilla or other
     // mod uses of the key.  Final gating (live anchor, FP still active) happens
     // on the game thread where the edge is consumed.
-    if (s_mode != MODE_FREE_MOVE || !(s_firstPersonActive || s_otsCamActive))   // FP or the CTRL third-person view (user req 2026-09-18)
+    if (s_mode != MODE_FREE_MOVE || !(s_firstPersonActive || s_otsCamActive))
         return;
     if (!(GetAsyncKeyState(VK_SHIFT) & 0x8000))
         return;
@@ -2439,11 +2636,12 @@ static void handleOtsShoulderPress()
 static void onPress(int role)
 {
     if (role == KR_TOGGLE)       handleTogglePress();
-    else if (role == KR_SPEED)   handleSpeedPress();
     else if (role == KR_SELECT)  handleSelectPress();
     else if (role == KR_FP)      handleFirstPersonPress();
     else if (role == KR_SNEAK)   handleSneakPress();
     else if (role == KR_OTS_SHOULDER) handleOtsShoulderPress();
+    else if (role == KR_ATTACK && s_directionalCombat && s_mode == MODE_FREE_MOVE)
+        s_interactionRequested = true;
 }
 
 // -----------------------------------------------------------------------
@@ -2454,13 +2652,12 @@ static PollKey s_keys[] =
 {
     { KR_FORWARD, false }, { KR_LEFT,   false },
     { KR_BACK,    false }, { KR_RIGHT,  false },
-    { KR_TOGGLE,  false }, { KR_SPEED,  false },
-    { KR_SELECT,  false }, { KR_FP,     false },
+    { KR_TOGGLE,  false }, { KR_SELECT,  false },
+    { KR_FP,      false },
     { KR_SNEAK,   false }, { KR_OTS_SHOULDER, false },
-    { KR_BLOCK,   false }, { KR_DODGE,  false }, { KR_ATTACK, false },
-    { KR_MANUAL,  false },
+    { KR_BLOCK,   false }, { KR_ATTACK, false },
 };
-static const int NUM_KEYS = 14;
+static const int NUM_KEYS = 11;
 
 static bool isKenshiForeground()
 {
@@ -2475,8 +2672,18 @@ static DWORD WINAPI PollThread(LPVOID)
 {
     while (true)
     {
-        Sleep(50);
-        if (!isKenshiForeground()) continue;
+        Sleep(10);  // capture short mouse clicks and configurable key edges
+        if (!isKenshiForeground())
+        {
+            if (s_mouseBlockHeld) s_blockHeld = false;
+            s_mouseBlockHeld = false;
+            s_recentMouseLastMs = 0;
+            InterlockedExchange(&s_combatGestureDirection, CUT_DEFAULT);
+            s_attackAimHeld = false;
+            s_attackAimCancelled = false;
+            s_attackHeld = false;
+            continue;
+        }
         // Movement roles are ALWAYS VK-polled (INI-configurable) — the
         // native keybind system is one-command-per-key and vanilla camera
         // owns W/S/A/D, so DC movement cannot live there.  Toggle/speed
@@ -2486,7 +2693,7 @@ static DWORD WINAPI PollThread(LPVOID)
         {
             int role = s_keys[i].role;
             if (s_nativeCommandsRegistered
-                && (role == KR_TOGGLE || role == KR_SPEED))
+                && role == KR_TOGGLE)
                 continue;
             bool down = (GetAsyncKeyState(s_bindVk[role]) & 0x8000) != 0;
             if (down == s_keys[i].prev) continue;
@@ -2498,31 +2705,181 @@ static DWORD WINAPI PollThread(LPVOID)
                 case KR_BACK:    s_sHeld = down; break;
                 case KR_RIGHT:   s_dHeld = down; break;
                 case KR_BLOCK:                                 // manual block (hold + timed press)
-                    s_blockHeld = down;
-                    if (down) s_blockPressMs = GetTickCount64();
-                    break;
-                case KR_DODGE:                                 // manual dodge (press)
-                    s_dodgeHeld = down;
-                    if (down) s_dodgePressMs = GetTickCount64();
+                    if (!s_directionalCombat) {
+                        s_blockHeld = down;
+                        if (down) s_blockPressMs = GetTickCount64();
+                    }
                     break;
                 case KR_ATTACK:                                // manual attack (press)
-                    s_attackHeld = down;
-                    if (down) s_attackPressMs = GetTickCount64();
+                    if (!s_directionalCombat) {
+                        s_attackHeld = down;
+                        if (down) s_attackPressMs = GetTickCount64();
+                    }
                     break;
-                case KR_MANUAL: if (down) s_manualPressMs = GetTickCount64(); break;  // manual-attack toggle edge
             }
             if (!wasWasd && (s_wHeld || s_aHeld || s_sHeld || s_dHeld))
                 s_wasdTapStartMs = GetTickCount64();
             if (down) onPress(role);
         }
+        // The same physical buttons remain vanilla UI clicks outside manual
+        // FP/OTS combat. The edge flags below are also used by old DC features.
+        bool mouseCombat = mouseCombatContext();
+        bool lmbDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        bool rmbDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (s_directionalCombat && s_mode == MODE_FREE_MOVE
+            && ((lmbDown && !s_lmbPrev) || (rmbDown != s_rmbPrev)))
+        {
+            ULONGLONG age = s_recentMouseLastMs ? GetTickCount64() - s_recentMouseLastMs : 0;
+            char tb[220];
+            sprintf_s(tb, sizeof(tb), "[IronwindTrace] mouse_input l=%d r=%d context=%d manual=%d ots=%d fp=%d ui=%d dir=%d mouse_age=%llu",
+                      lmbDown ? 1 : 0, rmbDown ? 1 : 0, mouseCombat ? 1 : 0,
+                      s_manualAttackOn ? 1 : 0, s_otsCamActive ? 1 : 0,
+                      s_firstPersonActive ? 1 : 0, s_cameraUiOpen ? 1 : 0,
+                      (int)combatRecentDirection(), age);
+            VerbLog(tb);
+        }
+        if (mouseCombat)
+        {
+            ULONGLONG inputNow = GetTickCount64();
+            bool lmbPressed = lmbDown && !s_lmbPrev;
+            bool lmbReleased = !lmbDown && s_lmbPrev;
+            bool rmbPressed = rmbDown && !s_rmbPrev;
+            CutDirection recent = combatRecentDirection();
+
+            bool hitReactionLocked = InterlockedCompareExchange(
+                &s_hitReactionInputLock, 0, 0) != 0;
+            if (hitReactionLocked)
+            {
+                // Original Kenshi reaction owns the body.  Mouse edges during
+                // it are dropped, not buffered for the first recovery frame.
+                if (lmbPressed || lmbReleased || rmbPressed)
+                    VerbLog("[Ironwind] hit_reaction_input_dropped");
+                s_attackAimHeld = false;
+                s_attackAimCancelled = true;
+                s_attackAimGestureSeen = false;
+                s_attackAimStartedMs = 0;
+                s_attackHeld = false;
+                s_rmbCombatEdgeMs = 0;
+                s_mouseBlockHeld = false;
+                s_blockHeld = false;
+                s_blockGestureSeen = false;
+            }
+            else
+            {
+                if (lmbPressed)
+                {
+                    s_attackAimHeld = true;
+                    s_attackAimCancelled = false;
+                    s_attackHeld = true;
+                    s_attackAimStartedMs = inputNow;
+                    s_attackAimHoldLocked = false;
+                    s_attackAimGestureSeen = recent != CUT_DEFAULT;
+                    s_attackAimDirection = s_attackAimGestureSeen
+                        ? recent : (CutDirection)s_lastAttackDirection;
+                    char tb[144]; sprintf_s(tb, sizeof(tb),
+                        "[Ironwind] attack_aim_begin dir=%d gesture=%d",
+                        (int)s_attackAimDirection, s_attackAimGestureSeen ? 1 : 0);
+                    VerbLog(tb);
+                }
+                if (lmbDown && s_attackAimHeld && recent != CUT_DEFAULT)
+                {
+                    // v38 sticky preview: the FIRST gesture of a hold selects
+                    // freely (12-count deadzone as before); after that, small
+                    // return strokes (recentering the hand / camera-look drift in
+                    // a fresh gesture window) must not flip the shown direction
+                    // before release - changing it needs a deliberate, much
+                    // larger stroke in the current window (user 2026-10-20).
+                    bool canChange = !s_attackAimHoldLocked
+                                  || s_attackAimDirection == CUT_DEFAULT
+                                  || recent == (CutDirection)s_attackAimDirection;
+                    if (!canChange)
+                    {
+                        LONG gx = InterlockedCompareExchange(&s_recentMouseX, 0, 0);
+                        LONG gy = InterlockedCompareExchange(&s_recentMouseY, 0, 0);
+                        if (gx * gx + gy * gy >= 40 * 40) canChange = true;
+                    }
+                    if (canChange)
+                    {
+                        s_attackAimDirection = recent;
+                        s_attackAimGestureSeen = true;
+                        s_attackAimHoldLocked = true;
+                    }
+                }
+
+                // A right press during the input-only aim is a feint/cancel.  The
+                // same press continues into the normal guard path below, so the
+                // transition is immediate without starting or truncating a clip.
+                if (rmbPressed && s_attackAimHeld)
+                {
+                    s_attackAimHeld = false;
+                    s_attackAimCancelled = true;
+                    s_attackHeld = false;
+                    VerbLog(s_settingAiBlocks
+                        ? "[Ironwind] attack_aim_cancel mode=automatic_ai"
+                        : "[Ironwind] attack_aim_cancel_to_guard");
+                }
+
+                if (lmbReleased)
+                {
+                    s_attackHeld = false;
+                    if (s_attackAimHeld && !s_attackAimCancelled)
+                    {
+                        CutDirection commit = (CutDirection)s_attackAimDirection;
+                        if (commit == CUT_DEFAULT) commit = recent;
+                        if (commit == CUT_DEFAULT) commit = (CutDirection)s_lastAttackDirection;
+                        if (commit == CUT_DEFAULT) commit = CUT_DOWNWARD;
+                        s_attackDesired = commit;
+                        s_lastAttackDirection = commit;
+                        s_attackPressMs = inputNow;
+                        char tb[176]; sprintf_s(tb, sizeof(tb),
+                            "[Ironwind] attack_release_commit dir=%d held_ms=%llu",
+                            (int)commit, inputNow - s_attackAimStartedMs);
+                        VerbLog(tb);
+                    }
+                    s_attackAimHeld = false;
+                    s_attackAimCancelled = false;
+                    s_attackAimStartedMs = 0;
+                    s_attackAimGestureSeen = false;
+                }
+                // In the combat layer RMB is always guard. The game thread owns
+                // the edge so block state is never mutated from the poll thread.
+                if (rmbPressed)
+                    s_rmbCombatEdgeMs = inputNow;
+                else if (!rmbDown && s_rmbPrev)
+                {
+                    s_mouseBlockHeld = false;
+                    s_blockHeld = false;
+                    s_blockGestureSeen = false;
+                }
+            }
+        }
+        else
+        {
+            if (s_mouseBlockHeld) s_blockHeld = false;
+            s_mouseBlockHeld = false;
+            s_blockGestureSeen = false;
+            s_attackAimGestureSeen = false;
+            s_recentMouseLastMs = 0;
+            InterlockedExchange(&s_combatGestureDirection, CUT_DEFAULT);
+            s_attackAimHeld = false;
+            s_attackAimCancelled = false;
+            s_attackHeld = false;
+            if (s_mode != MODE_FREE_MOVE || !s_manualAttackOn || s_dcShutdownInProgress)
+            {
+                s_attackQueuedAtMs = 0;
+                s_attackQueuedDirection = CUT_DEFAULT;
+            }
+        }
 
         // RMB press edge — earliest player-click signal (see global note).
         {
-            bool rmbDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-            if (rmbDown && !s_rmbPrev)
+            if (rmbDown && !s_rmbPrev && !mouseCombat)
             {
                 s_rmbPressedEdge = true;
-                s_rmbAimPressMs  = GetTickCount64();   // right-click focus (manual combat)
+                // Native interaction owns this click completely.  In ordinary
+                // non-combat cursor contexts the old right-click focus remains.
+                if (!s_interactionMenuByE)
+                    s_rmbAimPressMs = GetTickCount64();
             }
             s_rmbPrev = rmbDown;
         }
@@ -2533,8 +2890,7 @@ static DWORD WINAPI PollThread(LPVOID)
         // 400ms apart); a single click sets only s_lastLmbDownMs and never the
         // double-click timestamp.
         {
-            bool lmbDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-            if (lmbDown && !s_lmbPrev)
+            if (lmbDown && !s_lmbPrev && !mouseCombat && !s_interactionMenuByE)
             {
                 ULONGLONG nowLB = GetTickCount64();
                 if (s_lastLmbDownMs > 0
@@ -2546,31 +2902,12 @@ static DWORD WINAPI PollThread(LPVOID)
             }
             s_lmbPrev = lmbDown;
         }
-
-        // CTRL press edge — toggles camera-rotate mode while DC is active (the
-        // apply lives in cameraUpdate_hook).  Only flips in DC so the toggle
-        // state never desyncs from any out-of-DC CTRL use.
-        {
-            bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            // Do NOT toggle while a UI is open — CTRL is used for menu actions
-            // (CTRL+click to move stacks in trade/inventory); flipping the crosshair
-            // toggle there corrupts it (field 2026-06-21).
-            if (ctrlDown && !s_ctrlPrevPoll && s_mode == MODE_FREE_MOVE && !s_camRotateUiOpen)
-                s_camRotateToggle = !s_camRotateToggle;
-            s_ctrlPrevPoll = ctrlDown;
-        }
     }
 }
 
 // -----------------------------------------------------------------------
 // HUD — disabled for reload stability
 // -----------------------------------------------------------------------
-struct HudWidget { MyGUI::TextBox* label; bool shown; const char* tag;
-    HudWidget() : label(nullptr), shown(false), tag("") {} };
-static HudWidget s_vHud;
-static bool      s_hudReady = false;
-static void hudUpdate() {}
-
 // -----------------------------------------------------------------------
 // World state — main thread only
 // -----------------------------------------------------------------------
@@ -2591,6 +2928,16 @@ static CharMovement* s_anchorMovement = nullptr;
 static volatile bool s_loadGuardActive      = false;
 static int           s_stabilizationCountdown = 0;
 static bool          s_postLoadReacquire   = false;
+
+// Stable, read-only interoperability boundary. Other plugins may use this to
+// hand an existing autonomous order back exactly when Ironwind stops owning a
+// character. It exposes no internal combat state and performs no mutation.
+extern "C" __declspec(dllexport) bool __cdecl
+IronwindCombat_IsManualControlActive(Character* character)
+{
+    return character && character == s_freeMoveAnchor &&
+        s_mode == MODE_FREE_MOVE && !s_dcShutdownInProgress && !s_loadGuardActive;
+}
 
 // DC pointer-loss state — entered when any load signal fires while s_userWantsDC is true.
 // Injection pauses; mode stays FREE_MOVE; reacquire loop runs until pointers are valid.
@@ -2834,7 +3181,6 @@ static void clearAllState()
     s_aHeld             = false;
     s_sHeld             = false;
     s_dHeld             = false;
-    s_camRotateToggle   = false;
     s_lmbDoubleClickMs  = 0;
     s_fSelectEdge       = false;
     s_selectedCharacter = nullptr;
@@ -2849,7 +3195,6 @@ static void clearAllState()
     s_enemyTargetingLogged = false;
     s_lastScanTick      = 0;
     s_fmTrackedMode     = MODE_VANILLA;
-    s_xPressed          = false;
     s_syncSpeedToAnchor = false;   // SPEEDSYNC-TWEAK
     s_stabilizationCountdown = 0;
     s_wasPrevInCombat   = false;
@@ -2870,48 +3215,87 @@ static void clearAllState()
     s_retreatLockGoSuppressed     = false;
     s_retreatLockEverActive       = false;
     s_blockHeld                   = false;   // manual block: drop everything on teardown
+    s_mouseBlockHeld              = false;
+    InterlockedExchange(&s_recentMouseX, 0);
+    InterlockedExchange(&s_recentMouseY, 0);
+    InterlockedExchange(&s_combatGestureDirection, CUT_DEFAULT);
+    s_recentMouseStartMs          = 0;
+    s_recentMouseLastMs           = 0;
+    s_attackDesired               = CUT_DEFAULT;
+    s_attackDesiredForSwing       = CUT_DEFAULT;
+    s_blockDesired                = CUT_DEFAULT;
+    manualAttackClearAimInput(false, true);
+    s_blockGestureSeen            = false;
+    s_rmbCombatEdgeMs             = 0;
+    s_rmbCombatEdgeSeenMs         = 0;
+    manualInteractionClearRuntime(true);
+    s_allowTalkCursor             = false;
+    s_xhairTint                   = 0;
+    s_hitMarkerUntilMs            = 0;
+    s_lastAttackDirection         = CUT_DOWNWARD;
     s_blockHeldPrev               = false;   // (never dereference s_blockOrderChar here -
     s_blockOrderApplied           = false;   //  the world may be gone; the order is save
     s_blockOrderChar              = nullptr; //  state the player can also clear by button)
-    s_perfectCooldownUntilMs      = 0;
-    s_perfectRewardUntilMs        = 0;
-    s_perfectUsedPressMs          = 0;
-    s_perfectLastHitMs            = 0;
     s_blockInjectedPressMs        = 0;
+    s_autoBlockAttemptWho         = nullptr;
+    s_autoBlockAttemptStartMs     = 0;
+    s_autoBlockActiveTech         = nullptr;
     s_blockAcceptedPressMs        = 0;
     s_blockSeenPressMs            = 0;
     s_blockCooldownUntilMs        = 0;
     s_blockHoldStartMs            = 0;
     s_blockReleaseMs              = 0;
-    s_dodgeHeld                   = false;
-    s_dodgeCooldownUntilMs        = 0;
-    s_dodgeRecoveryUntilMs        = 0;
-    s_dodgeAcceptedPressMs        = 0;
     s_staggerStartMs              = 0;
+    manualHitReactionClearRuntime();
+    s_hitReactionSerial           = 0;
     s_staggerRawSinceMs           = 0;
-    s_dodgeInjectedPressMs        = 0;
-    s_dodgeActiveTech             = nullptr;
-    s_dodgeRollOk                 = false;
-    s_dodgeCommitUntilMs          = 0;
-    s_dodgeSeenPressMs            = 0;
+    s_freeBlockPressMs            = 0;
+    s_freeGuardUpperIdle          = false;
+    s_freeGuardCombatOwned         = false;
+    s_freeBlockTech               = nullptr;
+    s_freeAnimCombatMode          = false;
+    s_weaponDrawAttemptMs         = 0;
+    s_weaponMissingLogged         = false;
+    s_weaponDrawInProgress        = false;
     s_attackHeld                  = false;
     s_attackCommitUntilMs         = 0;
     s_attackSeenPressMs           = 0;
     s_attackInjectedPressMs       = 0;
     s_attackAcceptedPressMs       = 0;
-    s_attackActive                = false;
-    s_attackSawChop               = false;
+    s_attackEngagePressMs         = 0;
+    manualAttackClearActiveRuntime();
     s_attackRecoveryUntilMs       = 0;
-    s_attackRetryPressMs          = 0;
-    s_attackAfterDodgeMs          = 0;
-    s_attackRetries               = 0;
+    manualAttackClearQueuedInput(true);
+    for (int i = 0; i < 4; ++i) s_dirMoveAvailable[i] = -1;   // live attack-direction availability cache
+    s_dirMoveCheckedMs           = 0;
+    s_dirMoveAnchor              = nullptr;
+    s_dirMoveWeaponType          = -2;
+    s_dirMoveHands               = -1;
+    s_freeAttackTech              = nullptr;
+    s_freeAttackStartMs           = 0;
+    s_freeAttackSeenAnim          = false;
+    s_freeAttackLastProgress      = -1.0f;
+    s_freeAttackLastAdvanceMs     = 0;
+    s_lastFreeAttackTech          = nullptr;
+    s_attackIntentTarget          = nullptr;
+    manualAttackClearNeutralIntent();
+    for (int wi = 0; wi < 8; ++wi)
+    {
+        s_attackWorldNotified[wi] = nullptr;
+        s_attackNeutralContact[wi] = nullptr;
+        s_victimResponseVictim[wi] = nullptr;
+        s_victimResponseAttacker[wi] = nullptr;
+        s_victimResponseSource[wi] = nullptr;
+    }
+    s_freeAttackPressMs           = 0;
+    s_freeAttackImpactPassed      = false;
+    s_attackIntentPressMs         = 0;
     s_manualAttackOn              = false;   // runtime state: re-toggle after a load
-    s_manualSeenPressMs           = 0;
     s_lockTarget                  = nullptr;
     s_aimLogged                   = nullptr;
     s_aimClicked                  = false;
     s_rmbAimSeenMs                = 0;
-    for (int gi = 0; gi < GLINT_MAX; ++gi) s_glint[gi].who = nullptr;   // widgets stay; hidden by the update
+    for (int gi = 0; gi < INCOMING_ATTACK_MAX; ++gi) s_incomingAttack[gi].who = nullptr; // widgets stay; hidden by the update
     s_wasdDownedMovementActive    = false;
     s_slaveOrderActive            = false;
     s_slaveModeLogged             = false;
@@ -2935,6 +3319,8 @@ static void clearAllState()
         s_fpOptRangeSaved     = false;
     }
     s_firstPersonActive           = false;
+    s_wheelFirstPersonActive      = false;
+    s_otsResumeZoomPending       = false;
     s_fpToggleRequested           = false;
     s_sneakToggleRequested        = false;
     s_fpEnemyClearSmooth          = 1.0f;
@@ -3086,11 +3472,31 @@ static bool computeWASDDirection(bool bW, bool bA, bool bS, bool bD, Ogre::Vecto
 // extra hard clamp while chained/shackled so the Rebirth shackle escape is a shuffle.
 // The turn-responsiveness boost still applies briefly on direction changes for snappy
 // turns.  Cap off (WasdSpeedCap=false) → the old uncapped limit.
+static bool manualAttackMovementSlow()
+{
+    return s_mode == MODE_FREE_MOVE && s_manualAttackOn
+        && (s_freeAttackTech != nullptr || s_attackActive);
+}
+
+static bool manualBlockMovementSlow()
+{
+    return s_mode == MODE_FREE_MOVE && s_manualAttackOn
+        && s_settingManualBlock && s_blockHeldPrev;
+}
+
+static bool manualCombatMovementSlow()
+{
+    return manualAttackMovementSlow() || manualBlockMovementSlow();
+}
+
 static float wasdMoveLimit(bool turning)
 {
     const float turnBoost = turning ? g_loco.wasdTurnResponsiveness : 1.0f;
+    // A live V-mode swing or held guard keeps WASD responsive at 20% speed.
+    // Apply this after the turn boost so changing direction cannot bypass it.
+    const float actionScale = manualCombatMovementSlow() ? 0.20f : 1.0f;
     if (!s_settingWasdSpeedCap || !s_freeMoveAnchor)
-        return 99.0f * g_loco.wasdAccelerationMultiplier * turnBoost;
+        return 99.0f * g_loco.wasdAccelerationMultiplier * turnBoost * actionScale;
 
     float legit = 99.0f;
     CharStats* st = s_freeMoveAnchor->getStats();
@@ -3127,23 +3533,78 @@ static float wasdMoveLimit(bool turning)
             s_spdLogTick = t;
             char b[160];
             sprintf_s(b, sizeof(b),
-                "[WASDCombat] wasd_speed maxRun=%.1f chained=%d mult=%.2f limit=%.1f",
+                "[WASDCombat] wasd_speed maxRun=%.1f chained=%d mult=%.2f attack=%d block=%d limit=%.1f",
                 st ? st->getMaxRunSpeed() : -1.0f,
                 s_freeMoveAnchor->isChainedMode() ? 1 : 0,
-                s_settingWasdSpeedMult, legit * turnBoost);
+                s_settingWasdSpeedMult, manualAttackMovementSlow() ? 1 : 0,
+                manualBlockMovementSlow() ? 1 : 0,
+                legit * turnBoost * actionScale);
             DebugLog(b);
         }
     }
-    return legit * turnBoost;
+    return legit * turnBoost * actionScale;
 }
 
 // applyPlayerMovement — halt() + setDirectMovement in camera-relative WASD.
 // -----------------------------------------------------------------------
+// v44: true only while vanilla owns the body through a real reaction state or
+// a native stumble transition queued by _getHit(..., stumble=true).  No fixed
+// duration is imposed: light hits remain light, and a real STUMBLE ends on the
+// exact frame the native state machine leaves it.
+static bool manualHitReactionLive(Character* ch)
+{
+    if (!ch || ch != s_freeMoveAnchor)
+    {
+        InterlockedExchange(&s_hitReactionInputLock, 0);
+        return false;
+    }
+    CombatClass* cc = ch->getCombatClass();
+    if (!cc)
+    {
+        s_hitReactionPending = false;
+        InterlockedExchange(&s_hitReactionInputLock, 0);
+        return false;
+    }
+    swordStateEnum state = cc->getCombatState();
+    bool inNativeState = state == STUMBLE || state == REACTION_BLOCK;
+    bool nativeQueued = s_hitReactionPending;
+    if (inNativeState) s_hitReactionPending = false;
+    bool live = inNativeState || nativeQueued;
+    InterlockedExchange(&s_hitReactionInputLock, live ? 1 : 0);
+    return live;
+}
+
+// V-mode reaction ownership is narrower than the character's native reaction
+// state.  Leaving V must never carry our pending/input latch into a later V
+// session (for example after KO auto-exit).  Re-entry follows the character's
+// current native state instead of a clock: a live STUMBLE/REACTION_BLOCK keeps
+// the lock, every other state starts clean.
+static void manualHitReactionSyncVBoundary(Character* ch, bool entering)
+{
+    bool wasLocked = InterlockedCompareExchange(&s_hitReactionInputLock, 0, 0) != 0;
+    if (!entering)
+    {
+        manualHitReactionClearRuntime();
+        if (wasLocked)
+            VerbLog("[WASDCombat] hit_reaction_lock_cleared_v_exit");
+        return;
+    }
+
+    CombatClass* cc = ch ? ch->getCombatClass() : nullptr;
+    swordStateEnum state = cc ? cc->getCombatState() : COMBAT_FINISHED;
+    bool nativeLive = state == STUMBLE || state == REACTION_BLOCK;
+    s_hitReactionPending = false;
+    InterlockedExchange(&s_hitReactionInputLock, nativeLive ? 1 : 0);
+    if (wasLocked && !nativeLive)
+        VerbLog("[WASDCombat] hit_reaction_stale_lock_cleared_v_enter");
+}
+
 static bool applyPlayerMovement(bool bW, bool bA, bool bS, bool bD)
 {
     CharMovement* mv = s_freeMoveAnchor ? s_freeMoveAnchor->movement : nullptr;
     if (!s_freeMoveAnchor || !mv) return false;
     if (!ou || !ou->player || !ou->player->camera) return false;
+    if (manualHitReactionLive(s_freeMoveAnchor)) return false;   // v40: let the stagger play
 
     Ogre::Vector3 move;
     if (!computeWASDDirection(bW, bA, bS, bD, move)) return false;
@@ -3155,6 +3616,7 @@ static bool applyPlayerMovement(bool bW, bool bA, bool bS, bool bD)
 
     mv->halt();
     mv->setDesiredSpeed(mv->speedOrders);
+    if (manualCombatMovementSlow()) mv->setDesiredSpeed(limit);
     mv->setDirectMovement(move, limit);
     s_prevWasdDir = move;
     return true;
@@ -3199,6 +3661,7 @@ static bool isCommittedAction(Character* ch)
 {
     ScopeTimer _tCA(s_prof_committedAct);
     if (!ch) return false;
+    if (ch == s_freeMoveAnchor && s_freeAttackTech) return true;
 
 #define _LOG_COMMITTED(reason) \
     if (g_log.debugVerbose) DebugLog("[WASDCombat] committed_action_true reason=" reason)
@@ -3263,13 +3726,45 @@ static bool isCommittedAction(Character* ch)
 // attacks, so the player must be able to move/retreat through them.  Gated on
 // combatModeActive (stale post-combat states must not count — v1.8.4 lesson).
 // -----------------------------------------------------------------------
-static bool manualDodgeCommitLive();   // fwd decl (manual combat, below)
 static bool manualAttackCommitLive();  // fwd decl (manual combat, below)
 static void manualAimTick();           // fwd decl (manual combat, below)
+
+// A chosen automatic guard is a native one-shot action, not an idle AI
+// decision. Only the exact BLOCK initialisation state is admitted here. Kenshi
+// does not expose the normal block clip through the Animation lookup used by
+// free actions (v96 field log: clip_progress=-1 on every successful HIT_SWORD),
+// so do not guess its lifetime or reset the pose on the state edge. v97 instead
+// gives held guard exclusive stationary ownership in charMovUpdate_hook; the
+// original animation system can then start and finish the pose undisturbed.
+static bool manualAutoGuardBlockLive(Character* ch)
+{
+    if (!ch || ch != s_freeMoveAnchor || !s_autoBlockActiveTech) return false;
+    CombatClass* cc = ch->getCombatClass();
+    if (cc && cc->combatModeActive && cc->getCombatState() == BLOCK
+        && cc->currentTechnique == s_autoBlockActiveTech) return true;
+
+    s_autoBlockActiveTech = nullptr;
+    char b[128];
+    sprintf_s(b, sizeof(b), "[Ironwind] ai_guard_state_exit state=%d held=%d",
+        cc ? (int)cc->getCombatState() : -1, s_blockHeldPrev ? 1 : 0);
+    VerbLog(b);
+    return false;
+}
+
 static bool isCommittedCombatClip(Character* ch)
 {
     if (!ch) return false;
-    if (ch == s_freeMoveAnchor && (manualDodgeCommitLive() || manualAttackCommitLive())) return true;   // manual action in flight
+    // V's free swing is driven by manualFreeActionTick, not CombatClass::go.
+    // Let WASD through during it.  Only an actual hit reaction owns locomotion.
+    if (ch == s_freeMoveAnchor && s_mode == MODE_FREE_MOVE && s_manualAttackOn)
+    {
+        CombatClass* manualCC = ch->getCombatClass();
+        if (!manualCC || !manualCC->combatModeActive) return false;
+        swordStateEnum manualState = manualCC->getCombatState();
+        return manualState == STUMBLE || manualState == REACTION_BLOCK
+            || manualAutoGuardBlockLive(ch);
+    }
+    if (ch == s_freeMoveAnchor && (manualAttackCommitLive() || s_freeAttackTech)) return true;
     CombatClass* cc = ch->getCombatClass();
     if (!cc || !cc->combatModeActive) return false;
     swordStateEnum st = cc->getCombatState();
@@ -3548,6 +4043,7 @@ static IDirectInputDevice8A* s_diMouse      = nullptr;
 static bool                  s_diReady      = false;
 static volatile LONG         s_diAccX       = 0;
 static volatile LONG         s_diAccY       = 0;
+static volatile LONG         s_diAccZ       = 0;
 static HANDLE                s_diThread     = nullptr;
 static volatile LONG         s_diThreadRun  = 0;
 
@@ -3594,6 +4090,37 @@ static DWORD WINAPI fpDInputPollThread(void*)
             {
                 if (st.lX) InterlockedAdd(&s_diAccX, st.lX);
                 if (st.lY) InterlockedAdd(&s_diAccY, st.lY);
+                if (st.lZ) InterlockedAdd(&s_diAccZ, st.lZ);
+                if (st.lX || st.lY)
+                {
+                    ULONGLONG now = GetTickCount64();
+                    if (!s_recentMouseStartMs || now - s_recentMouseStartMs > 180
+                        || !s_recentMouseLastMs || now - s_recentMouseLastMs > 220)
+                    {
+                        // v39: only the accumulators restart here. Clearing
+                        // s_combatGestureDirection too made the idle preview
+                        // arrow blink at every 180 ms window boundary and
+                        // dropped strokes that began right after a restart
+                        // (user 2026-10-20: right arrow flickered; log showed
+                        // dir=0 with fresh mouse_age at every press). The kept
+                        // direction seeds the new window; the radial deadzone
+                        // and the diagonal hysteresis in
+                        // combatDirectionFromDelta already absorb jitter.
+                        InterlockedExchange(&s_recentMouseX, 0);
+                        InterlockedExchange(&s_recentMouseY, 0);
+                        s_recentMouseStartMs = now;
+                    }
+                    if (st.lX) InterlockedAdd(&s_recentMouseX, st.lX);
+                    if (st.lY) InterlockedAdd(&s_recentMouseY, st.lY);
+                    LONG gx = InterlockedCompareExchange(&s_recentMouseX, 0, 0);
+                    LONG gy = InterlockedCompareExchange(&s_recentMouseY, 0, 0);
+                    CutDirection previous = (CutDirection)InterlockedCompareExchange(
+                        &s_combatGestureDirection, CUT_DEFAULT, CUT_DEFAULT);
+                    CutDirection selected = combatDirectionFromDelta(gx, gy, previous);
+                    if (selected != CUT_DEFAULT)
+                        InterlockedExchange(&s_combatGestureDirection, (LONG)selected);
+                    s_recentMouseLastMs = now;
+                }
             }
             else s_diMouse->Acquire();   // lost (alt-tab): re-acquire, skip this poll
         }
@@ -3777,15 +4304,15 @@ static bool isOwnInventoryOpen()
         && gui->getNumOpenInventoryWindows() >= 1;
 }
 
-// Inventory move-through eligibility (see s_invMoveThroughActive).  Opt-in via
-// InventoryFaceCam=false: DC stays live (movement + camera lock, game running)
-// while ANY inventory window is open, EXCEPT during dialogue (which keeps its
-// vanilla pause).  Gated on an active DC anchor so we never touch a non-DC frame.
+// Inventory move-through eligibility (see s_invMoveThroughActive).  Manual V
+// combat always keeps direct control and the user's camera when Tab opens;
+// legacy DC can still opt in with InventoryFaceCam=false.  Dialogue and the
+// character editor keep their own UI behavior.
 static bool invMoveThroughEligible()
 {
     return s_mode == MODE_FREE_MOVE
         && s_freeMoveAnchor
-        && !s_settingInventoryFaceCam            // opt-in
+        && (s_manualAttackOn || !s_settingInventoryFaceCam)
         && gui && gui->isAnyInventoryWindowOpen()
         && !gui->inDialogue()                    // dialogue still pauses everything
         && !gui->isCharacterEditorMode();
@@ -4286,30 +4813,29 @@ static bool fpGetHeadWorld(Ogre::Vector3& out)
 }
 
 // UNIFY (2026-09-04): ONE source of truth for "does a UI/menu currently need
-// the free cursor?" — used by FP (fpDriveFrame), CTRL-OTS (cameraUpdate_hook)
+// the free cursor?" — used by FP (fpDriveFrame), V-OTS (cameraUpdate_hook)
 // and the shared crosshair, so all three suspend/free the cursor IDENTICALLY.
 // Previously each path re-derived this from a slightly different set of terms,
 // which is why fixing one mode kept breaking the other.  Superset of every
 // prior condition; broader = safer (never leaves the cursor locked in a menu).
 static bool dcUiWantsCursor()
 {
-    // Pause FREES the cursor (user model 2026-09-06): pausing shows/releases the
-    // cursor from centre so you can click around while paused; unpausing returns
-    // it to centre + hides + locks (the rising-edge recentre in dcUpdateCrosshair).
-    // If a UI is still open when you unpause, the other conditions below keep the
-    // cursor free until it closes.
-    if (ou && ou->isPaused())                             return true; // SPACE + ESC/menu screens
+    // Pause has cursor priority.  In v102, treating a bare world pause as a
+    // camera-look state kept recentering and hiding the pointer; on this Kenshi
+    // build the Esc menu does not reliably clear CameraClass::controlEnabled
+    // either, so both Space pause and Esc could leave the player mouse-locked.
+    // One authoritative pause test here releases FP, OTS and crosshair capture
+    // together.  Unpausing re-centres once through dcUpdateCrosshair's edge.
+    if (ou && ou->isPaused())                             return true;
     if (s_lootUiSuspendActive)                            return true; // loot / trade
     if (ou && ou->player && ou->player->contextMenu.isVisible()) return true; // RMB interaction menu
     ManagementScreen* m = ManagementScreen::getSingleton();
     if (m && m->getVisible())                             return true; // map / factions / tech / squad
-    if (gui && (gui->isStatsWindowOpen() || gui->inDialogue() || gui->isPaused())) return true; // UIs
-    // Inventory MOVE-THROUGH (InventoryFaceCam=false, user 2026-10-08): the
-    // view keeps looking while you walk with the inventory open - hold ALT
-    // for the cursor to click items.  Every other inventory still frees it.
-    if (gui && gui->isAnyInventoryWindowOpen() && !s_invMoveThroughActive) return true;
-    // ALT held in first / third person = free cursor (HUD, squad bar, items).
-    if ((s_firstPersonActive || s_otsCamActive) && (GetAsyncKeyState(VK_MENU) & 0x8000)) return true;
+    if (gui && (gui->isStatsWindowOpen() || gui->inDialogue())) return true; // UIs
+    // Tab owns the pointer whenever an inventory is open.  WASD can keep
+    // controlling the character, but the camera must stop recentering the
+    // mouse so items and inventory buttons remain clickable without Alt.
+    if (gui && gui->isAnyInventoryWindowOpen()) return true;
     return false;
 }
 // (fpShowCrosshair — the old sand-coloured FP-only "+" — REMOVED in the 2026-09-04
@@ -4398,7 +4924,7 @@ static void enterFirstPerson()
     if (!ou || !ou->player || !ou->player->camera
         || !s_freeMoveAnchor || !s_freeMoveAnchor->movement) return;
     // FP and the detached OTS are mutually exclusive — both detach the same
-    // camera.  If OTS is up (e.g. P pressed while CTRL-OTS active), tear it
+    // camera. If OTS is up (for example when P is pressed), tear it
     // down first so the camera is back on the rig before FP re-detaches it.
     if (s_otsCamActive) exitOtsCam(true);
 
@@ -4530,7 +5056,7 @@ static void fpDriveFrame(CameraClass* thisptr, bool uiOpen)
         // RawMouse: ensure the 1kHz DirectInput look device is running.  Its poll
         // thread accumulates hardware deltas off the frame loop; we consume them
         // below.  Falls back to cursor-warp until the device is acquired.
-        bool useRaw = s_fpRawMouse;
+        bool useRaw = s_fpRawMouse || (s_directionalCombat && s_manualAttackOn);
         if (useRaw) { fpStartDInputThread(); fpEnsureDInput(); }
 
         HWND fg = GetForegroundWindow();
@@ -5097,17 +5623,113 @@ static void fpDriveFrame(CameraClass* thisptr, bool uiOpen)
     }
 }
 
+static const int DIRECTION_ARROW_PX = 64;
+// Distance from the crosshair to the visual centre of the selected arrow.
+// v50 adds another clearly visible 40 px after the field test showed that the
+// v49 108 -> 148 change was too subtle beside a 64 px widget.
+static const int DIRECTION_ARROW_RADIUS_PX = 258;
+
+static float directionArrowSegmentDistance(float x, float y,
+                                            float ax, float ay, float bx, float by)
+{
+    float vx = bx - ax, vy = by - ay;
+    float wx = x - ax, wy = y - ay;
+    float vv = vx * vx + vy * vy;
+    float t = vv > 0.0001f ? (wx * vx + wy * vy) / vv : 0.0f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float dx = x - (ax + vx * t), dy = y - (ay + vy * t);
+    return sqrtf(dx * dx + dy * dy);
+}
+
+// Four equal-size inward arrows generated from one geometry and rotated by 90
+// degrees.  v44 uses one runtime texture per direction and setImageTexture(),
+// the same binding path as the already-proven weapon glow.  The v43 atlas was
+// created successfully but Kenshi's MyGUI build rendered its setImageInfo()
+// widgets transparent in the field.
+static const char* const DIRECTION_ARROW_TEXTURES[4] = {
+    "ironwind_direction_arrow_left",
+    "ironwind_direction_arrow_right",
+    "ironwind_direction_arrow_up",
+    "ironwind_direction_arrow_down"
+};
+
+static bool directionArrowTextureCreate()
+{
+    if (s_directionArrowTexTried) return s_directionArrowTexOk;
+    s_directionArrowTexTried = true;
+    try
+    {
+        // Slots: left HUD points right, right HUD points left, top points down,
+        // bottom points up. Every texture uses the same 40 px shaft/28 px head.
+        const float dirX[4] = { 1.0f, -1.0f, 0.0f, 0.0f };
+        const float dirY[4] = { 0.0f, 0.0f, 1.0f, -1.0f };
+        const float centre = DIRECTION_ARROW_PX * 0.5f - 0.5f;
+        for (int slot = 0; slot < 4; ++slot)
+        {
+            MyGUI::ITexture* tex = MyGUI::RenderManager::getInstance().createTexture(
+                DIRECTION_ARROW_TEXTURES[slot]);
+            if (!tex) return false;
+            tex->createManual(DIRECTION_ARROW_PX, DIRECTION_ARROW_PX,
+                              MyGUI::TextureUsage::Static | MyGUI::TextureUsage::Write,
+                              MyGUI::PixelFormat::R8G8B8A8);
+            unsigned char* pixels = (unsigned char*)tex->lock(MyGUI::TextureUsage::Write);
+            if (!pixels) return false;
+            float dx = dirX[slot], dy = dirY[slot];
+            float px = -dy, py = dx;
+            float startX = centre - dx * 20.0f, startY = centre - dy * 20.0f;
+            float tipX = centre + dx * 20.0f, tipY = centre + dy * 20.0f;
+            float headX = tipX - dx * 14.0f, headY = tipY - dy * 14.0f;
+            float wing1X = headX + px * 14.0f, wing1Y = headY + py * 14.0f;
+            float wing2X = headX - px * 14.0f, wing2Y = headY - py * 14.0f;
+            for (int y = 0; y < DIRECTION_ARROW_PX; ++y)
+            for (int x = 0; x < DIRECTION_ARROW_PX; ++x)
+            {
+                float fx = x + 0.5f, fy = y + 0.5f;
+                float d = directionArrowSegmentDistance(fx, fy, startX, startY, tipX, tipY);
+                float h1 = directionArrowSegmentDistance(fx, fy, tipX, tipY, wing1X, wing1Y);
+                float h2 = directionArrowSegmentDistance(fx, fy, tipX, tipY, wing2X, wing2Y);
+                if (h1 < d) d = h1;
+                if (h2 < d) d = h2;
+                // Keep the length/head dimensions; v50 retains the v49
+                // and v48 at an approximately 3 px antialiased stroke.
+                float alpha = 1.75f - d;
+                if (alpha < 0.0f) alpha = 0.0f;
+                if (alpha > 1.0f) alpha = 1.0f;
+                size_t offset = ((size_t)y * DIRECTION_ARROW_PX + x) * 4;
+                pixels[offset + 0] = 255;
+                pixels[offset + 1] = 255;
+                pixels[offset + 2] = 255;
+                pixels[offset + 3] = (unsigned char)(alpha * 255.0f + 0.5f);
+            }
+            tex->unlock();
+        }
+        s_directionArrowTexOk = true;
+        DebugLog("[Ironwind] direction_arrow_textures_created count=4");
+        return true;
+    }
+    catch (...)
+    {
+        DebugLog("[Ironwind] direction_arrow_textures_create_failed");
+        return false;
+    }
+}
+
 // XHAIR-TWEAK: show/hide the fixed crosshair + game pointer.  `want` = FP or
 // OTS engaged and no UI suspending it.  Runs on the UI thread (called from
 // cameraUpdate_hook post-orig).  Lazily creates the two WhiteSkin bars; if
 // creation throws (bad skin/layer on some setup) it degrades to leaving the
 // normal cursor — never crashes, never hides the pointer without a crosshair.
 // "Manual Attack" HUD label: a small fixed text box (no fade) shown while the
-// mode is on.  Kenshi's own small standard text skin; top centre, out of the
-// way of the orders panel and the portraits.
+// mode is on. The currently selected direction is drawn: green = a native
+// attack is currently eligible, white = unavailable/unchecked. Every one of
+// the four directions can therefore appear. Four red slash glyphs make a
+// short-lived broken-X hit marker only after the native melee callback
+// reports a real hit (not a block or dodge).
 static void manualAttackHudUpdate()
 {
     bool want = s_manualAttackOn && s_mode == MODE_FREE_MOVE && !s_loadGuardActive;
+    if (!want) s_hitMarkerUntilMs = 0;   // V exit / load guard: never carry a flash into the next session
     if (want && !s_manualHud && !s_manualHudTried)
     {
         s_manualHudTried = true;
@@ -5115,13 +5737,13 @@ static void manualAttackHudUpdate()
         {
             MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
             MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();
-            const int W = 120, H = 18;
+            const int W = 260, H = 18;
             if (g)
                 s_manualHud = g->createWidget<MyGUI::TextBox>("Kenshi_TextboxStandardText_Small",
                                   v.width / 2 - W / 2, 34, W, H, MyGUI::Align::Default, "Top", "dc_manual_attack_hud");
             if (s_manualHud)
             {
-                s_manualHud->setCaption("Manual Attack");
+                s_manualHud->setCaption(dcZh("Manual Attack"));
                 s_manualHud->setTextAlign(MyGUI::Align::Center);
                 s_manualHud->setTextColour(MyGUI::Colour::White);
                 s_manualHud->setNeedMouseFocus(false);
@@ -5131,14 +5753,205 @@ static void manualAttackHudUpdate()
         }
         catch (...) { s_manualHud = nullptr; DebugLog("[WASDCombat] manual_attack_hud_create_failed"); }
     }
-    if (!s_manualHud) return;
-    if (want)
+    bool directionWant = want && s_directionalCombat
+        && (s_firstPersonActive || s_otsCamActive) && !dcUiWantsCursor();
+    if (directionWant && !s_directionHudTried)
+    {
+        s_directionHudTried = true;
+        try
+        {
+            MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
+            const char* names[4] = { "dc_dir_left", "dc_dir_right", "dc_dir_up", "dc_dir_down" };
+            if (g && directionArrowTextureCreate())
+                for (int i = 0; i < 4; ++i)
+                {
+                    s_directionHud[i] = g->createWidget<MyGUI::ImageBox>(
+                        "ImageBox", 0, 0, DIRECTION_ARROW_PX, DIRECTION_ARROW_PX,
+                        MyGUI::Align::Default, "Top", names[i]);
+                    if (s_directionHud[i])
+                    {
+                        s_directionHud[i]->setImageTexture(DIRECTION_ARROW_TEXTURES[i]);
+                        s_directionHud[i]->setAlpha(0.96f);
+                        s_directionHud[i]->setNeedMouseFocus(false);
+                        s_directionHud[i]->setVisible(false);
+                    }
+                }
+            bool complete = s_directionHud[0] && s_directionHud[1]
+                && s_directionHud[2] && s_directionHud[3];
+            DebugLog(complete
+                ? "[Ironwind] direction_hud_created style=uniform_textures widgets=4"
+                : "[Ironwind] direction_hud_create_failed incomplete_widgets");
+        }
+        catch (...)
+        {
+            for (int i = 0; i < 4; ++i) s_directionHud[i] = nullptr;
+            DebugLog("[Ironwind] direction_hud_create_failed");
+        }
+    }
+    if (directionWant && !s_hitMarkerHudTried)
+    {
+        s_hitMarkerHudTried = true;
+        try
+        {
+            MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
+            const char* names[4] = {
+                "dc_hit_marker_nw", "dc_hit_marker_ne", "dc_hit_marker_sw", "dc_hit_marker_se"
+            };
+            const char* captions[4] = { "\\", "/", "/", "\\" };
+            if (g)
+                for (int i = 0; i < 4; ++i)
+                {
+                    s_hitMarkerHud[i] = g->createWidget<MyGUI::TextBox>(
+                        "Kenshi_TextboxStandardText_Small", 0, 0, 28, 28,
+                        MyGUI::Align::Default, "Top", names[i]);
+                    if (s_hitMarkerHud[i])
+                    {
+                        s_hitMarkerHud[i]->setCaption(captions[i]);
+                        s_hitMarkerHud[i]->setTextAlign(MyGUI::Align::Center);
+                        s_hitMarkerHud[i]->setTextColour(MyGUI::Colour(1.00f, 0.08f, 0.04f));
+                        // Keep the four-stroke broken-X layout, but give each
+                        // slash a one-pixel dark-red shoulder and a slightly
+                        // heavier glyph. Widget alpha below keeps the result
+                        // visibly translucent rather than a solid HUD stamp.
+                        s_hitMarkerHud[i]->setTextShadow(true);
+                        s_hitMarkerHud[i]->setTextShadowColour(MyGUI::Colour(0.62f, 0.02f, 0.01f));
+                        try { s_hitMarkerHud[i]->setFontHeight(26); } catch (...) {}
+                        s_hitMarkerHud[i]->setNeedMouseFocus(false);
+                        s_hitMarkerHud[i]->setVisible(false);
+                    }
+                }
+            DebugLog("[Ironwind] hit_marker_hud_created");
+        }
+        catch (...)
+        {
+            for (int i = 0; i < 4; ++i) s_hitMarkerHud[i] = nullptr;
+            DebugLog("[Ironwind] hit_marker_hud_create_failed");
+        }
+    }
+    if (s_manualHud && want)
     {
         MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();   // follows resolution changes
-        s_manualHud->setPosition(v.width / 2 - 60, 34);
+        s_manualHud->setPosition(v.width / 2 - 130, 34);
+        bool interactionPrompt = s_directionalCombat && s_interactionAutoTarget
+            && !s_attackAimHeld && !s_attackActive && !s_mouseBlockHeld;
+        s_manualHud->setTextColour(interactionPrompt
+            ? MyGUI::Colour(0.95f, 0.82f, 0.18f) : MyGUI::Colour::White);
+        if (interactionPrompt)
+            s_manualHud->setCaption(std::string(dcZh("Interact: "))
+                + s_interactionAutoTarget->getName());
+        else if (s_directionalCombat && s_settingAiBlocks && s_mouseBlockHeld)
+            s_manualHud->setCaption(dcZh("Guard: AI"));
+        else if (s_directionalCombat && !s_settingAiBlocks && s_mouseBlockHeld)
+            s_manualHud->setCaption(std::string(dcZh("Guard: ")) + dcZh(combatDirectionLabel((CutDirection)s_blockDesired)));
+        else if (s_directionalCombat && s_attackAimHeld)
+            s_manualHud->setCaption(std::string(dcZh("Release to attack: "))
+                + dcZh(combatDirectionLabel((CutDirection)s_attackAimDirection)));
+        else if (s_directionalCombat && s_attackQueuedAtMs)
+            s_manualHud->setCaption(std::string(dcZh("Queued: "))
+                + dcZh(combatDirectionLabel((CutDirection)s_attackQueuedDirection)));
+        else if (s_directionalCombat)
+            s_manualHud->setCaption(std::string(dcZh("Direction: ")) + dcZh(combatDirectionLabel(combatRecentDirection())));
+        else
+            s_manualHud->setCaption(dcZh("Manual Attack"));
         if (!s_manualHud->getVisible()) s_manualHud->setVisible(true);
     }
-    else if (s_manualHud->getVisible()) s_manualHud->setVisible(false);
+    else if (s_manualHud && s_manualHud->getVisible()) s_manualHud->setVisible(false);
+
+    bool haveDirectionHud = s_directionHud[0] && s_directionHud[1]
+        && s_directionHud[2] && s_directionHud[3];
+    if (haveDirectionHud)
+    {
+        if (directionWant)
+        {
+            MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();
+            int cx = v.width / 2, cy = v.height / 2;
+            // Keep all four boxes at one explicit visual-centre radius so a
+            // later HUD-distance tune cannot make one axis drift from another.
+            const int halfArrow = DIRECTION_ARROW_PX / 2;
+            s_directionHud[0]->setPosition(cx - DIRECTION_ARROW_RADIUS_PX - halfArrow, cy - halfArrow);
+            s_directionHud[1]->setPosition(cx + DIRECTION_ARROW_RADIUS_PX - halfArrow, cy - halfArrow);
+            s_directionHud[2]->setPosition(cx - halfArrow, cy - DIRECTION_ARROW_RADIUS_PX - halfArrow);
+            s_directionHud[3]->setPosition(cx - halfArrow, cy + DIRECTION_ARROW_RADIUS_PX - halfArrow);
+            CutDirection selected = CUT_DEFAULT;
+            bool showSelected = false;
+            if (s_settingAiBlocks && s_mouseBlockHeld)
+            {
+                // Automatic guard has no player-selected direction to display.
+                showSelected = false;
+            }
+            else if (!s_settingAiBlocks && s_mouseBlockHeld && s_blockGestureSeen)
+            {
+                selected = combatGuardDirectionFromGesture((CutDirection)s_blockDesired);
+                showSelected = selected != CUT_DEFAULT;
+            }
+            else if (s_attackAimHeld && s_attackAimGestureSeen)
+            {
+                selected = (CutDirection)s_attackAimDirection;
+                showSelected = selected != CUT_DEFAULT;
+            }
+            else if (s_attackQueuedAtMs)
+            {
+                selected = (CutDirection)s_attackQueuedDirection;
+                showSelected = selected != CUT_DEFAULT;
+            }
+            else
+            {
+                selected = combatRecentDirection();
+                showSelected = selected != CUT_DEFAULT;
+            }
+            // v50: show only the selected arrow, but never hide it merely
+            // because that attack is unavailable. Green means available;
+            // white means unavailable/unchecked. Guard uses the same colours.
+            const CutDirection map[4] = { CUT_RIGHT, CUT_LEFT, CUT_DOWNWARD, CUT_THRUST };
+            for (int i = 0; i < 4; ++i)
+            {
+                bool on = showSelected && map[i] == selected;
+                if (!on)
+                {
+                    if (s_directionHud[i]->getVisible()) s_directionHud[i]->setVisible(false);
+                    continue;
+                }
+                int slot = combatDirectionSlot(map[i]);
+                bool available = slot >= 0 && s_dirMoveAvailable[slot] == 1;
+                s_directionHud[i]->setColour(available
+                    ? MyGUI::Colour(0.45f, 1.00f, 0.55f)
+                    : MyGUI::Colour::White);
+                if (!s_directionHud[i]->getVisible()) s_directionHud[i]->setVisible(true);
+            }
+        }
+        else
+            for (int i = 0; i < 4; ++i)
+                if (s_directionHud[i]->getVisible()) s_directionHud[i]->setVisible(false);
+    }
+
+    bool haveHitMarkerHud = s_hitMarkerHud[0] && s_hitMarkerHud[1]
+        && s_hitMarkerHud[2] && s_hitMarkerHud[3];
+    if (haveHitMarkerHud)
+    {
+        ULONGLONG now = GetTickCount64();
+        bool hitMarkerWant = directionWant && now < s_hitMarkerUntilMs;
+        if (hitMarkerWant)
+        {
+            MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();
+            int cx = v.width / 2, cy = v.height / 2;
+            // Keep the 28px glyphs.  Pull their visual centres from ~16px to ~8px.
+            s_hitMarkerHud[0]->setPosition(cx - 22, cy - 22);
+            s_hitMarkerHud[1]->setPosition(cx - 6,  cy - 22);
+            s_hitMarkerHud[2]->setPosition(cx - 22, cy - 6);
+            s_hitMarkerHud[3]->setPosition(cx - 6,  cy - 6);
+            float remaining = (float)(s_hitMarkerUntilMs - now) / (float)HIT_MARKER_VISIBLE_MS;
+            float alpha = 0.22f + 0.60f * remaining;
+            if (alpha > 0.82f) alpha = 0.82f;
+            for (int i = 0; i < 4; ++i)
+            {
+                s_hitMarkerHud[i]->setAlpha(alpha);
+                if (!s_hitMarkerHud[i]->getVisible()) s_hitMarkerHud[i]->setVisible(true);
+            }
+        }
+        else
+            for (int i = 0; i < 4; ++i)
+                if (s_hitMarkerHud[i]->getVisible()) s_hitMarkerHud[i]->setVisible(false);
+    }
 }
 
 static bool focusTargetLoaded(Character* t);   // fwd decl (manual combat, below)
@@ -5261,36 +6074,51 @@ static MyGUI::ImageBox* focusGlowBox(const char* name)
 }
 static bool focusHealthBarsCreate()
 {
-    if (s_hbTried) return s_hbFill[0] != nullptr;
+    if (s_hbTried) return s_hbLayer[0][0] != nullptr;
     s_hbTried = true;
     try
     {
         MyGUI::Gui* g = MyGUI::Gui::getInstancePtr();
         if (!g) return false;
-        static const MyGUI::Colour FILL[HB_COUNT] = {
-            MyGUI::Colour(0.85f, 0.12f, 0.12f),   // blood   - red
-            MyGUI::Colour(0.95f, 0.95f, 0.95f),   // head    - white
-            MyGUI::Colour(0.40f, 0.85f, 0.40f),   // chest   - green
-            MyGUI::Colour(0.40f, 0.85f, 0.40f) }; // stomach - green
-        static const char* const LABEL[HB_COUNT] = { "blood", "head", "chest", "stomach" };
+        static const char* const LABEL[HB_COUNT] = { "B", "H", "C", "S", "LA", "RA", "LL", "RL" };
+        // Exact skins from Kenshi_MainPanel.layout. Segment lengths below use
+        // the same HealthPartStatus fields as vanilla; there is no custom RGB
+        // approximation or health-threshold palette.
+        static const char* const LAYER_SKIN[HBL_COUNT] = {
+            "Kenshi_LifeBarSkin",        // healthy organic
+            "Kenshi_LifeBarRobotSkin",   // healthy Skeleton / robotic limb
+            "Kenshi_LifeBarStunnedSkin", // blunt / stun damage
+            "Kenshi_LifeBarHurtSkin",    // untreated cut damage
+            "Kenshi_LifeBarHealedSkin",  // bandaged / repaired cut damage
+            "Kenshi_LifeBarCrushedSkin", // robotic wear-and-tear cap
+            "Kenshi_LifeBarSplintSkin"   // splinted usable health overlay
+        };
         for (int i = 0; i < HB_COUNT; ++i)
         {
-            char nb[32], nf[32];
-            sprintf_s(nb, sizeof(nb), "dc_hb_bg_%d", i); sprintf_s(nf, sizeof(nf), "dc_hb_fill_%d", i);
-            s_hbBg[i]   = g->createWidget<MyGUI::Widget>("WhiteSkin", 0, 0, HB_W, HB_H, MyGUI::Align::Default, "Top", nb);
-            s_hbFill[i] = g->createWidget<MyGUI::Widget>("WhiteSkin", 0, 0, HB_W, HB_H, MyGUI::Align::Default, "Top", nf);
-            if (!s_hbBg[i] || !s_hbFill[i]) { DebugLog("[WASDCombat] aim_health_bars_create_failed"); return false; }
-            s_hbBg[i]->setColour(MyGUI::Colour(0.05f, 0.05f, 0.05f)); s_hbBg[i]->setAlpha(0.6f);
+            char nb[32];
+            sprintf_s(nb, sizeof(nb), "dc_hb_bg_%d", i);
+            s_hbBg[i]   = g->createWidget<MyGUI::Widget>("WhiteSkin", 0, 0, HB_BAR_W, HB_H, MyGUI::Align::Default, "Top", nb);
+            if (!s_hbBg[i]) { DebugLog("[WASDCombat] aim_health_bars_create_failed"); return false; }
+            s_hbBg[i]->setColour(MyGUI::Colour(0.04f, 0.04f, 0.04f)); s_hbBg[i]->setAlpha(0.78f);
             s_hbBg[i]->setNeedMouseFocus(false); s_hbBg[i]->setVisible(false);
-            s_hbFill[i]->setColour(FILL[i]); s_hbFill[i]->setAlpha(0.95f);
-            s_hbFill[i]->setNeedMouseFocus(false); s_hbFill[i]->setVisible(false);
+            for (int layer = 0; layer < HBL_COUNT; ++layer)
+            {
+                char nf[40]; sprintf_s(nf, sizeof(nf), "dc_hb_%d_layer_%d", i, layer);
+                s_hbLayer[i][layer] = g->createWidget<MyGUI::Widget>(LAYER_SKIN[layer], 0, 0,
+                    HB_BAR_W - 2, HB_H - 2, MyGUI::Align::Default, "Top", nf);
+                if (!s_hbLayer[i][layer]) { DebugLog("[WASDCombat] aim_health_bars_create_failed"); return false; }
+                s_hbLayer[i][layer]->setColour(MyGUI::Colour::White);
+                s_hbLayer[i][layer]->setAlpha(0.98f);
+                s_hbLayer[i][layer]->setNeedMouseFocus(false);
+                s_hbLayer[i][layer]->setVisible(false);
+            }
             char nl[32]; sprintf_s(nl, sizeof(nl), "dc_hb_label_%d", i);
-            s_hbLabel[i] = g->createWidget<MyGUI::TextBox>("Kenshi_TextboxStandardText_Small", 0, 0, HB_LW, HB_LH,
+            s_hbLabel[i] = g->createWidget<MyGUI::TextBox>("Kenshi_TextboxStandardText_Small", 0, 0, HB_LABEL_W, HB_LH,
                                                              MyGUI::Align::Default, "Top", nl);
             if (!s_hbLabel[i]) { DebugLog("[WASDCombat] aim_health_bars_create_failed"); return false; }
-            s_hbLabel[i]->setCaption(LABEL[i]);
+            s_hbLabel[i]->setCaption(dcZh(LABEL[i]));
             s_hbLabel[i]->setTextAlign(MyGUI::Align::Right | MyGUI::Align::VCenter);
-            s_hbLabel[i]->setTextColour(MyGUI::Colour(0.85f, 0.85f, 0.85f));
+            s_hbLabel[i]->setTextColour(MyGUI::Colour(0.78f, 0.78f, 0.76f));
             s_hbLabel[i]->setTextShadow(true);
             s_hbLabel[i]->setTextShadowColour(MyGUI::Colour::Black);
             try { s_hbLabel[i]->setFontHeight(9); } catch (...) {}
@@ -5301,38 +6129,127 @@ static bool focusHealthBarsCreate()
     }
     catch (...) { DebugLog("[WASDCombat] aim_health_bars_create_failed"); return false; }
 }
-// 0..1 fill levels for blood / head / chest / stomach (negative health = empty).
-static void focusHealthLevels(Character* t, float out[HB_COUNT])
+static std::string focusAsciiLower(const std::string& value)
 {
-    for (int i = 0; i < HB_COUNT; ++i) out[i] = 0.0f;
+    std::string out = value;
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = (char)tolower((unsigned char)out[i]);
+    return out;
+}
+
+// Resolve anatomy from stable FCS IDs and language-independent type/side data,
+// never from translated display names.  Canonical IDs keep chest/stomach apart;
+// type + side also supports custom races with their own limb records.
+static int focusHealthSlot(const GameData* part, const MedicalSystem::HealthPartStatus& hp)
+{
+    if (!part) return -1;
+    std::string id = focusAsciiLower(part->stringID);
+    // Kenshi's canonical anatomy records use numeric FCS IDs. Keep semantic
+    // fallbacks for custom anatomy records whose authors supplied named IDs.
+    if (id == "32-gamedata.quack" || id.find("head") != std::string::npos
+        || hp.whatAmI == MedicalSystem::HealthPartStatus::PART_HEAD) return HB_HEAD;
+    if (id == "101-gamedata.quack" || id.find("chest") != std::string::npos) return HB_CHEST;
+    if (id == "100-gamedata.quack" || id.find("stomach") != std::string::npos) return HB_STOMACH;
+    if (id == "28-gamedata.quack") return HB_LEFT_ARM;
+    if (id == "29-gamedata.quack") return HB_RIGHT_ARM;
+    if (id == "30-gamedata.quack") return HB_LEFT_LEG;
+    if (id == "31-gamedata.quack") return HB_RIGHT_LEG;
+    if (hp.whatAmI == MedicalSystem::HealthPartStatus::PART_ARM)
+        return hp.side == SIDE_LEFT ? HB_LEFT_ARM : HB_RIGHT_ARM;
+    if (hp.whatAmI == MedicalSystem::HealthPartStatus::PART_LEG)
+        return hp.side == SIDE_LEFT ? HB_LEFT_LEG : HB_RIGHT_LEG;
+    return -1;
+}
+
+struct FocusHealthState
+{
+    bool present;
+    bool robotic;
+    float healthyEnd;    // flesh - fleshStun
+    float fleshEnd;      // current flesh (end of blunt/stun segment)
+    float bandagedEnd;   // flesh + bandaging
+    float effectiveEnd;  // base maximum minus robotic wear
+    float splintStart;
+    float splintEnd;     // juryRigging overlay
+};
+static float focusHealthClamp01(float v)
+{
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+// Reconstruct the medical composition shown by Kenshi's own health panel:
+// green/robot-blue live health, grey stun, red untreated cut, yellow bandaged
+// cut, white splint, and the crushed wear cap. Endpoints are normalised to the
+// original age/HPMult maximum so robotic wear remains visible.
+static void focusHealthStates(Character* t, FocusHealthState out[HB_COUNT])
+{
+    memset(out, 0, sizeof(FocusHealthState) * HB_COUNT);
+    if (!t) return;
     MedicalSystem* med = &t->medical;
     float maxB = med->getMaxBlood();
-    if (maxB > 0.0f) out[0] = med->blood / maxB;
-    std::string names;
+    if (maxB > 0.0f)
+    {
+        out[HB_BLOOD].present = true;
+        out[HB_BLOOD].healthyEnd = focusHealthClamp01(med->blood / maxB);
+    }
     for (auto it = med->status.begin(); it != med->status.end(); ++it)
     {
         GameData* gd = it->first;
-        const MedicalSystem::HealthPartStatus& hp = it->second;
+        MedicalSystem::HealthPartStatus& hp = it->second;
         if (!gd) continue;
-        std::string nm = gd->name;
-        for (size_t k = 0; k < nm.size(); ++k) nm[k] = (char)tolower((unsigned char)nm[k]);
-        if (!s_hbNamesLogged) { names += nm; names += ' '; }
-        int slot = -1;
-        if (nm.find("head") != std::string::npos)         slot = 1;
-        else if (nm.find("chest") != std::string::npos)   slot = 2;
-        else if (nm.find("stomach") != std::string::npos) slot = 3;
+        int slot = focusHealthSlot(gd, hp);
+        if (!s_hbNamesLogged)
+        {
+            char b[640];
+            sprintf_s(b, sizeof(b), "[WASDCombat] aim_health_part id=%s name=%s type=%d side=%d slot=%d flesh=%.1f stun=%.1f bandage=%.1f rig=%.1f wear=%.1f max=%.1f robot=%d",
+                      gd->stringID.c_str(), gd->name.c_str(), (int)hp.whatAmI, (int)hp.side,
+                      slot, hp.flesh, hp.fleshStun, hp.bandaging, hp.juryRigging,
+                      hp.wearDamage, hp._maxHealth, hp.isRobotic() ? 1 : 0);
+            VerbLog(b);
+        }
         if (slot < 0) continue;
-        float mx = hp._maxHealth;
-        out[slot] = mx > 0.0f ? hp.flesh / mx : 0.0f;
+        float baseMax = hp._maxHealth * hp.age * hp.HPMult;
+        if (baseMax <= 0.0f) baseMax = hp._maxHealth;
+        if (baseMax <= 0.0f) continue;
+        float effectiveMax = baseMax - hp.wearDamage;
+        if (effectiveMax < 0.0f) effectiveMax = 0.0f;
+        if (effectiveMax > baseMax) effectiveMax = baseMax;
+        FocusHealthState& s = out[slot];
+        s.present = true;
+        s.robotic = hp.isRobotic();
+        s.effectiveEnd = focusHealthClamp01(effectiveMax / baseMax);
+        s.healthyEnd = focusHealthClamp01((hp.flesh - hp.fleshStun) / baseMax);
+        s.fleshEnd = focusHealthClamp01(hp.flesh / baseMax);
+        s.bandagedEnd = focusHealthClamp01((hp.flesh + hp.bandaging) / baseMax);
+        if (s.healthyEnd > s.effectiveEnd) s.healthyEnd = s.effectiveEnd;
+        if (s.fleshEnd < s.healthyEnd) s.fleshEnd = s.healthyEnd;
+        if (s.fleshEnd > s.effectiveEnd) s.fleshEnd = s.effectiveEnd;
+        if (s.bandagedEnd < s.fleshEnd) s.bandagedEnd = s.fleshEnd;
+        if (s.bandagedEnd > s.effectiveEnd) s.bandagedEnd = s.effectiveEnd;
+        s.splintStart = s.healthyEnd;
+        s.splintEnd = focusHealthClamp01((hp.flesh - hp.fleshStun + hp.juryRigging) / baseMax);
+        if (s.splintEnd < s.splintStart) s.splintEnd = s.splintStart;
+        if (s.splintEnd > s.effectiveEnd) s.splintEnd = s.effectiveEnd;
     }
     if (!s_hbNamesLogged)
     {
         s_hbNamesLogged = true;
-        char b[256];
-        sprintf_s(b, sizeof(b), "[WASDCombat] aim_health_parts names=%s", names.c_str());
-        VerbLog(b);
+        VerbLog("[WASDCombat] aim_health_parts_resolved");
     }
-    for (int i = 0; i < HB_COUNT; ++i) { if (out[i] < 0.0f) out[i] = 0.0f; if (out[i] > 1.0f) out[i] = 1.0f; }
+}
+static void focusHealthLayerPlace(int slot, int layer, int x, int y, int startPx, int endPx, bool on)
+{
+    MyGUI::Widget* w = s_hbLayer[slot][layer];
+    if (!w) return;
+    int width = endPx - startPx;
+    if (on && width > 0)
+    {
+        w->setCoord(x + startPx, y, width, HB_H - 2);
+        w->setVisible(true);
+    }
+    else if (w->getVisible()) w->setVisible(false);
 }
 static bool focusNameTagCreate()
 {
@@ -5362,7 +6279,7 @@ static bool focusGlintCreate()
     s_glintTried = true;
     try
     {
-        for (int i = 0; i < GLINT_MAX; ++i)
+        for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
         {
             char nm[32]; sprintf_s(nm, sizeof(nm), "dc_glint_%d", i);
             s_glintBox[i] = focusGlowBox(nm);
@@ -5379,17 +6296,41 @@ static bool focusGlintCreate()
 static void (*s_attackingYouOrig)(Character* self, Character* attacker, bool so, bool doAwarenessCheck);
 static void attackingYou_hook(Character* self, Character* attacker, bool so, bool doAwarenessCheck)
 {
+    // Direct AttackState announces its intended victim while it is being
+    // initialised.  For an actor that was neutral at LMB-down, forwarding that
+    // announcement here creates an incoherent half-commit: the victim can turn
+    // locally hostile and retaliate even if the swing later misses, while the
+    // campaign/faction layer is (correctly) still waiting for _getHit.  Defer
+    // this one exact notification.  A confirmed _getHit replays the complete
+    // native campaign + awareness + victim-response transaction through
+    // manualAttackProvokeVictim; already-hostile combat remains untouched.
+    if (s_attackDirectInitialising && s_attackActive && s_manualAttackOn
+        && s_mode == MODE_FREE_MOVE && !s_dcShutdownInProgress && !s_loadGuardActive
+        && self && self == s_attackNeutralIntentTarget
+        && attacker && attacker == s_freeMoveAnchor && attacker != self)
+    {
+        VerbLog("[Ironwind] neutral_precontact_notice_deferred");
+        return;
+    }
+
     s_attackingYouOrig(self, attacker, so, doAwarenessCheck);
-    if (!s_settingGlint || !self || self != s_freeMoveAnchor || !attacker || attacker == self
+    // Record native incoming attacks independently of visual settings. The
+    // optional weapon glint and player-authorised automatic guard are separate
+    // consumers of this event stream.
+    if (!self || self != s_freeMoveAnchor || !attacker || attacker == self
         || s_mode != MODE_FREE_MOVE || s_dcShutdownInProgress || s_loadGuardActive) return;
     ULONGLONG now = GetTickCount64();
     int slot = -1;
-    for (int i = 0; i < GLINT_MAX; ++i) if (s_glint[i].who == attacker) { slot = i; break; }
-    if (slot < 0) for (int i = 0; i < GLINT_MAX; ++i) if (!s_glint[i].who) { slot = i; break; }
-    if (slot < 0) { slot = 0; for (int i = 1; i < GLINT_MAX; ++i) if (s_glint[i].startMs < s_glint[slot].startMs) slot = i; }
-    s_glint[slot].who = attacker; s_glint[slot].startMs = now; s_glint[slot].chopMs = 0; s_glint[slot].impactMs = 0; s_glint[slot].tier = 0;
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i) if (s_incomingAttack[i].who == attacker) { slot = i; break; }
+    if (slot < 0) for (int i = 0; i < INCOMING_ATTACK_MAX; ++i) if (!s_incomingAttack[i].who) { slot = i; break; }
+    if (slot < 0) { slot = 0; for (int i = 1; i < INCOMING_ATTACK_MAX; ++i) if (s_incomingAttack[i].startMs < s_incomingAttack[slot].startMs) slot = i; }
+    s_incomingAttack[slot].who = attacker;
+    s_incomingAttack[slot].startMs = now;
+    s_incomingAttack[slot].chopMs = 0;
+    s_incomingAttack[slot].impactMs = 0;
 }
-// Which defence works against this attacker's current swing (see GlintSlot).
+// Which defence works against this attacker's current swing. This classification
+// is visual-only and is not stored in the native incoming-attack tracker.
 static int glintTier(Character* me, Character* who, float* powerOut, int* catOut)
 {
     if (powerOut) *powerOut = 0.0f;
@@ -5427,11 +6368,19 @@ static int glintTier(Character* me, Character* who, float* powerOut, int* catOut
 }
 // Is any tracked swing still coming at us?  (Used by the idle pin so the AI's
 // own block logic is never suppressed while a hit is on the way.)
-static bool glintIncoming()
+static bool incomingAttackLive()
 {
     ULONGLONG now = GetTickCount64();
-    for (int i = 0; i < GLINT_MAX; ++i)
-        if (s_glint[i].who && s_glint[i].impactMs == 0 && now - s_glint[i].startMs < 1500) return true;
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
+    {
+        IncomingAttackSlot& g = s_incomingAttack[i];
+        if (!g.who || g.impactMs != 0 || now - g.startMs >= 4000
+            || !focusTargetLoaded(g.who)) continue;
+        CombatClass* cc = g.who->getCombatClass();
+        swordStateEnum st = cc ? cc->getCombatState() : COMBAT_FINISHED;
+        if (cc && cc->combatModeActive && (st == STARTUP_STATE || st == CHOP_WEAPON))
+            return true;
+    }
     return false;
 }
 // The attacker whose swing is coming at us right now (earliest live swing), or
@@ -5440,13 +6389,13 @@ static bool glintIncoming()
 // front-facing pose injected for the aimed enemy could sit in the BLOCK state
 // while the real swing came from behind, and vanilla could not choose a rear
 // block until that clip ended).
-static Character* glintIncomingAttacker()
+static Character* incomingAttackAttacker()
 {
     ULONGLONG now = GetTickCount64();
     Character* best = nullptr; ULONGLONG bestStart = 0;
-    for (int i = 0; i < GLINT_MAX; ++i)
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
     {
-        const GlintSlot& g = s_glint[i];
+        const IncomingAttackSlot& g = s_incomingAttack[i];
         if (!g.who || g.impactMs != 0 || now - g.startMs >= 1500) continue;
         if (!focusTargetLoaded(g.who) || g.who->isDead() || g.who->isUnconcious()) continue;
         if (!best || g.startMs < bestStart) { best = g.who; bestStart = g.startMs; }
@@ -5495,17 +6444,18 @@ static int bubbleTopNear(int sx, int sy)
 }
 // The hit landed (or was blocked): flash the glint out.  Logged for tuning
 // GlintLeadMs (swing start -> impact, per attacker technique).
-static void glintImpact(Character* who)
+static void incomingAttackImpact(Character* who)
 {
     if (!who) return;
     ULONGLONG now = GetTickCount64();
-    for (int i = 0; i < GLINT_MAX; ++i)
-        if (s_glint[i].who == who)
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
+        if (s_incomingAttack[i].who == who)
         {
-            bool first = s_glint[i].impactMs == 0;
-            if (first) s_glint[i].impactMs = now;
+            IncomingAttackSlot& incoming = s_incomingAttack[i];
+            bool first = incoming.impactMs == 0;
+            if (first) incoming.impactMs = now;
             float pw = 0.0f; int cat = -1;
-            glintTier(s_freeMoveAnchor, who, &pw, &cat);
+            int tier = glintTier(s_freeMoveAnchor, who, &pw, &cat);
             char b[160];
             unsigned skills = 0;
             {
@@ -5514,8 +6464,8 @@ static void glintImpact(Character* who)
                 if (at) for (int k = 0; k < 0x16; ++k) if (at->skillTypes[k]) skills |= (1u << k);
             }
             sprintf_s(b, sizeof(b), "[WASDCombat] glint_impact ms=%llu chop_ms=%llu followup=%d tier=%d power=%.0f cat=%d skills=0x%X",
-                      now - s_glint[i].startMs, s_glint[i].chopMs ? now - s_glint[i].chopMs : 0ULL, first ? 0 : 1,
-                      s_glint[i].tier, pw, cat, skills);
+                      now - incoming.startMs, incoming.chopMs ? now - incoming.chopMs : 0ULL, first ? 0 : 1,
+                      tier, pw, cat, skills);
             VerbLog(b);
         }
 }
@@ -5552,29 +6502,60 @@ static void focusMarkersUpdate(CameraClass* thisptr)
             {
                 // vanilla speech text up over this enemy? step the group above it
                 int bubbleTop = bubbleTopNear(sx, headY);
-                int groupBottom = sy + 1 + HB_COUNT * (HB_H + HB_GAP);
+                int groupBottom = sy + 1 + (HB_ROWS - 1) * HB_ROW_H + HB_LH;
                 if (bubbleTop >= 0 && groupBottom + 4 > bubbleTop)
                     sy -= (groupBottom + 4 - bubbleTop);
             }
             s_nameTag->setCoord(sx - W / 2, sy - H, W, H);
             tagOn = true;
-            // health bars, stacked just under the name
-            if (s_hbFill[0] || focusHealthBarsCreate())
+            // Compact two-row anatomy panel.  Every short strip is the actual
+            // blood/body-part value; row two is exclusively the four limbs.
+            if (s_hbLayer[0][0] || focusHealthBarsCreate())
             {
-                float lv[HB_COUNT];
-                focusHealthLevels(tagTgt, lv);
+                FocusHealthState health[HB_COUNT];
+                focusHealthStates(tagTgt, health);
                 for (int i = 0; i < HB_COUNT; ++i)
                 {
-                    int by = sy + 1 + i * (HB_H + HB_GAP);
-                    int fw = (int)(HB_W * lv[i] + 0.5f);
-                    s_hbBg[i]->setCoord(sx - HB_W / 2, by, HB_W, HB_H);
-                    s_hbFill[i]->setCoord(sx - HB_W / 2, by, fw < 1 ? 1 : fw, HB_H);
-                    s_hbFill[i]->setVisible(fw >= 1);
-                    if (!s_hbBg[i]->getVisible()) s_hbBg[i]->setVisible(true);
+                    int row = i / HB_COLS, col = i % HB_COLS;
+                    int cellX = sx - HB_PANEL_W / 2 + col * (HB_CELL_W + HB_GAP);
+                    int rowY = sy + 1 + row * HB_ROW_H;
+                    int bx = cellX + HB_LABEL_W + 1;
+                    int by = rowY + (HB_LH - HB_H) / 2;
+                    s_hbBg[i]->setCoord(bx, by, HB_BAR_W, HB_H);
+                    s_hbBg[i]->setVisible(health[i].present);
+                    const int inner = HB_BAR_W - 2;
+                    int healthyEnd = (int)(inner * health[i].healthyEnd + 0.5f);
+                    int fleshEnd = (int)(inner * health[i].fleshEnd + 0.5f);
+                    int bandagedEnd = (int)(inner * health[i].bandagedEnd + 0.5f);
+                    int effectiveEnd = (int)(inner * health[i].effectiveEnd + 0.5f);
+                    int splintStart = (int)(inner * health[i].splintStart + 0.5f);
+                    int splintEnd = (int)(inner * health[i].splintEnd + 0.5f);
+                    int px = bx + 1, py = by + 1;
+                    if (i == HB_BLOOD)
+                    {
+                        focusHealthLayerPlace(i, HBL_CUT, px, py, 0, healthyEnd, health[i].present);
+                        for (int layer = 0; layer < HBL_COUNT; ++layer)
+                            if (layer != HBL_CUT) focusHealthLayerPlace(i, layer, px, py, 0, 0, false);
+                    }
+                    else
+                    {
+                        focusHealthLayerPlace(i, HBL_HEALTHY, px, py, 0, healthyEnd,
+                                              health[i].present && !health[i].robotic);
+                        focusHealthLayerPlace(i, HBL_ROBOT, px, py, 0, healthyEnd,
+                                              health[i].present && health[i].robotic);
+                        focusHealthLayerPlace(i, HBL_STUN, px, py, healthyEnd, fleshEnd, health[i].present);
+                        focusHealthLayerPlace(i, HBL_BANDAGED, px, py, fleshEnd, bandagedEnd, health[i].present);
+                        focusHealthLayerPlace(i, HBL_CUT, px, py, bandagedEnd, effectiveEnd, health[i].present);
+                        focusHealthLayerPlace(i, HBL_WEAR, px, py, effectiveEnd, inner,
+                                              health[i].present && health[i].robotic);
+                        // Splint is an overlay, just as in the original panel;
+                        // it marks usable rigged HP without deleting the wound.
+                        focusHealthLayerPlace(i, HBL_SPLINT, px, py, splintStart, splintEnd, health[i].present);
+                    }
                     if (s_hbLabel[i])
                     {
-                        s_hbLabel[i]->setCoord(sx - HB_W / 2 - 4 - HB_LW, by + HB_H / 2 - HB_LH / 2, HB_LW, HB_LH);
-                        if (!s_hbLabel[i]->getVisible()) s_hbLabel[i]->setVisible(true);
+                        s_hbLabel[i]->setCoord(cellX, rowY, HB_LABEL_W, HB_LH);
+                        s_hbLabel[i]->setVisible(health[i].present);
                     }
                 }
             }
@@ -5587,20 +6568,21 @@ static void focusMarkersUpdate(CameraClass* thisptr)
         for (int i = 0; i < HB_COUNT; ++i)
         {
             if (s_hbBg[i]    && s_hbBg[i]->getVisible())    s_hbBg[i]->setVisible(false);
-            if (s_hbFill[i]  && s_hbFill[i]->getVisible())  s_hbFill[i]->setVisible(false);
+            for (int layer = 0; layer < HBL_COUNT; ++layer)
+                if (s_hbLayer[i][layer] && s_hbLayer[i][layer]->getVisible()) s_hbLayer[i][layer]->setVisible(false);
             if (s_hbLabel[i] && s_hbLabel[i]->getVisible()) s_hbLabel[i]->setVisible(false);
         }
     }
 
     // weapon glints
-    for (int i = 0; i < GLINT_MAX; ++i)
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
     {
-        GlintSlot& g = s_glint[i];
+        IncomingAttackSlot& g = s_incomingAttack[i];
         bool on = false;
-        if (live && s_settingGlint && g.who)
+        bool drop = false;
+        if (g.who)
         {
-            bool drop = false;
-            if (!focusTargetLoaded(g.who) || g.who->isDead() || g.who->isUnconcious()) drop = true;
+            if (!live || !focusTargetLoaded(g.who) || g.who->isDead() || g.who->isUnconcious()) drop = true;
             else
             {
                 CombatClass* cc = g.who->getCombatClass();
@@ -5611,77 +6593,40 @@ static void focusMarkersUpdate(CameraClass* thisptr)
                 if (g.impactMs != 0 && now - g.impactMs > 180) drop = true;
                 if (now - g.startMs > 4000) drop = true;                                         // bounded
             }
-            if (drop) g.who = nullptr;
-            else if (s_glintBox[i] || focusGlintCreate())
+        }
+        if (drop) g.who = nullptr;
+        if (live && s_settingGlint && g.who && (s_glintBox[i] || focusGlintCreate()))
+        {
+            Ogre::Vector3 wp;
+            if (focusBonePos(g.who, "Bip01 Prop2", 12.0f, wp) && focusProject(cam, wp, 1.0f, sx, sy))
             {
-                Ogre::Vector3 wp;
-                if (focusBonePos(g.who, "Bip01 Prop2", 12.0f, wp) && focusProject(cam, wp, 1.0f, sx, sy))
+                float k;                                                            // 0..1 intensity
+                if (g.impactMs != 0) k = 1.0f - (float)(now - g.impactMs) / 180.0f; // flash out
+                else
                 {
-                    float k;                                                            // 0..1 intensity
-                    if (g.impactMs != 0) k = 1.0f - (float)(now - g.impactMs) / 180.0f; // flash out
-                    else
-                    {
-                        float lead = s_glintLeadMs > 1.0f ? s_glintLeadMs : 1.0f;
-                        k = 0.30f + 0.70f * (float)(now - g.startMs) / lead;            // ramp up, hold
-                        if (k > 1.0f) k = 1.0f;
-                    }
-                    if (k < 0.0f) k = 0.0f;
-                    float shimmer = 0.85f + 0.15f * sinf((float)(now % 160) / 160.0f * 6.2831853f);
-                    if (g.impactMs == 0) g.tier = s_glintColourTiers ? glintTier(s_freeMoveAnchor, g.who, nullptr, nullptr) : 0;   // live until the hit (white unless colour tiers are on)
-                    static const MyGUI::Colour TIER_COL[3] = {
-                        MyGUI::Colour(1.00f, 1.00f, 1.00f),     // block  - white
-                        MyGUI::Colour(1.00f, 0.58f, 0.12f),     // dodge  - orange
-                        MyGUI::Colour(0.95f, 0.18f, 0.18f) };   // heavy  - red
-                    s_glintBox[i]->setColour(TIER_COL[g.tier < 0 ? 0 : (g.tier > 2 ? 2 : g.tier)]);
-                    int px = (int)(s_glintPx * (0.6f + 0.7f * k));
-                    if (px < 4) px = 4;
-                    s_glintBox[i]->setCoord(sx - px / 2, sy - px / 2, px, px);
-                    s_glintBox[i]->setAlpha(k * shimmer);
-                    on = true;
+                    float lead = s_glintLeadMs > 1.0f ? s_glintLeadMs : 1.0f;
+                    k = 0.30f + 0.70f * (float)(now - g.startMs) / lead;            // ramp up, hold
+                    if (k > 1.0f) k = 1.0f;
                 }
+                if (k < 0.0f) k = 0.0f;
+                float shimmer = 0.85f + 0.15f * sinf((float)(now % 160) / 160.0f * 6.2831853f);
+                int tier = (g.impactMs == 0 && s_glintColourTiers)
+                         ? glintTier(s_freeMoveAnchor, g.who, nullptr, nullptr) : 0;
+                static const MyGUI::Colour TIER_COL[3] = {
+                    MyGUI::Colour(1.00f, 1.00f, 1.00f),     // block  - white
+                    MyGUI::Colour(1.00f, 0.58f, 0.12f),     // side/rear threat - orange
+                    MyGUI::Colour(0.95f, 0.18f, 0.18f) };   // heavy  - red
+                s_glintBox[i]->setColour(TIER_COL[tier < 0 ? 0 : (tier > 2 ? 2 : tier)]);
+                int px = (int)(s_glintPx * (0.6f + 0.7f * k));
+                if (px < 4) px = 4;
+                s_glintBox[i]->setCoord(sx - px / 2, sy - px / 2, px, px);
+                s_glintBox[i]->setAlpha(k * shimmer);
+                on = true;
             }
         }
         if (s_glintBox[i] && s_glintBox[i]->getVisible() != on) s_glintBox[i]->setVisible(on);
     }
 
-    // Perfect-block reward: YOUR weapon glows blue while the next Block press
-    // is free (user 2026-10-08).  Same soft glow as the enemy glint; pulses,
-    // fades over the last third.  Off-screen weapon (first person, arm out of
-    // view) -> the glow sits on the crosshair instead so the cue is never lost.
-    {
-        bool on = false;
-        if (live && s_manualAttackOn && now < s_perfectRewardUntilMs)
-        {
-            if (!s_rewardGlow && !s_rewardGlowTried)
-            {
-                s_rewardGlowTried = true;
-                try { s_rewardGlow = focusGlowBox("dc_perfect_reward_glow"); } catch (...) { s_rewardGlow = nullptr; }
-            }
-            if (s_rewardGlow)
-            {
-                MyGUI::IntSize v = MyGUI::RenderManager::getInstance().getViewSize();
-                Ogre::Vector3 wp;
-                bool placed = focusBonePos(s_freeMoveAnchor, "Bip01 Prop2", 12.0f, wp)
-                           && focusProject(cam, wp, 1.0f, sx, sy)
-                           && sx >= 0 && sy >= 0 && sx < v.width && sy < v.height;
-                if (!placed && (s_firstPersonActive || s_otsCamActive))
-                { sx = v.width / 2; sy = v.height / 2; placed = true; }
-                if (placed)
-                {
-                    float left = (float)(s_perfectRewardUntilMs - now) / (s_perfectRewardMs > 1.0f ? s_perfectRewardMs : 1.0f);   // 1 -> 0
-                    float k = left > 0.33f ? 1.0f : left / 0.33f;
-                    float pulse = 0.75f + 0.25f * sinf((float)(now % 300) / 300.0f * 6.2831853f);
-                    int px = (int)(s_glintPx * 1.3f);
-                    if (px < 8) px = 8;
-                    s_rewardGlow->setColour(MyGUI::Colour(0.30f, 0.70f, 1.00f));   // bright blue
-                    s_rewardGlow->setCoord(sx - px / 2, sy - px / 2, px, px);
-                    s_rewardGlow->setAlpha(k * pulse);
-                    on = true;
-                }
-            }
-        }
-        if (s_rewardGlow && s_rewardGlow->getVisible() != on) s_rewardGlow->setVisible(on);
-    }
 }
 
 static void dcUpdateCrosshair(bool want)
@@ -5710,12 +6655,17 @@ static void dcUpdateCrosshair(bool want)
     bool have = (s_xhH && s_xhV);
     if (!have) return;   // no crosshair → leave the normal cursor alone
 
-    // XHAIR-INDICATOR: while a look-mode is live and the game picked a
-    // contextual cursor under the crosshair, the real icon IS the indicator —
-    // it renders at the pinned centre, so the "+" yields to it.
+    // Only a verified player-talk bubble may replace the reticle.  Neutral
+    // "green"/yellow arrows stay hidden behind the "+".
     bool iconWanted = want && dcPointerIsContextual();
-    s_xhH->setVisible(want && !iconWanted);
-    s_xhV->setVisible(want && !iconWanted);
+    bool showReticle = want && !iconWanted;
+    MyGUI::Colour tint = MyGUI::Colour::White;
+    if (s_xhairTint == 1) tint = MyGUI::Colour(0.95f, 0.82f, 0.18f);      // neutral
+    else if (s_xhairTint == 2) tint = MyGUI::Colour(0.35f, 0.85f, 0.35f);  // ally
+    s_xhH->setColour(tint);
+    s_xhV->setColour(tint);
+    s_xhH->setVisible(showReticle);
+    s_xhV->setVisible(showReticle);
 
     // XHAIR-TWEAK: the crosshair IS the cursor while a look-mode is active.
     // (1) RETURN-TO-CENTER on the rising edge (want false->true) — the moment a
@@ -5815,8 +6765,12 @@ static void enterOtsCam()
     d.y = 0.0f; float dl = d.length();
     if (dl > 0.001f) { d /= dl; s_otsYaw = atan2f(-d.x, -d.z); }
     s_otsPitch = -0.25f;               // negative pitch = look DOWN (over-shoulder)
-    s_otsZoomCur = s_otsCamDist;        // base zoom from the slider
-    s_otsCollDistSm = s_otsCamDist;     // collision distance starts at full
+    // Returning from a wheel-entered first-person view keeps the distance the
+    // wheel reached.  A fresh V/F entry still begins at the configured base.
+    if (!s_otsResumeZoomPending) s_otsZoomCur = s_otsCamDist;
+    s_otsResumeZoomPending = false;
+    InterlockedExchange(&s_diAccZ, 0); // discard wheel movement from earlier UIs
+    s_otsCollDistSm = s_otsZoomCur;
     s_otsCamDistApplied = s_otsCamDist;
     s_otsCursorCaptured = false;
     s_otsLastStreamValid = false;   // rig coherence: teleport on the first drive frame
@@ -5934,7 +6888,7 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
     // --- mouse-look (we own it; suspended while a UI needs the cursor) ---
     if (!uiOpen && isKenshiForegroundMain())
     {
-        bool useRaw = s_fpRawMouse;
+        bool useRaw = s_fpRawMouse || (s_directionalCombat && s_manualAttackOn);
         if (useRaw) { fpStartDInputThread(); fpEnsureDInput(); }
         HWND fg = GetForegroundWindow(); RECT rc;
         if (fg && GetClientRect(fg, &rc))
@@ -5963,11 +6917,41 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
     // --- zoom: base from slider, wheel steps the session zoom (we own it) ---
     if (s_otsCamDistApplied != s_otsCamDist)
     { s_otsZoomCur = s_otsCamDist; s_otsCamDistApplied = s_otsCamDist; }
-    if (wheelPre != 0)
+    // The detached view cannot rely on CameraClass::update's wheel field: in
+    // this build it is already zero by the time this hook runs.  The existing
+    // nonexclusive DirectInput device sees the physical Z axis independently.
+    int rawWheel = (int)InterlockedExchange(&s_diAccZ, 0);
+    int wheel = !uiOpen && isKenshiForegroundMain()
+        ? (rawWheel != 0 ? rawWheel : wheelPre) : 0;
+    if (wheel != 0)
     {
-        s_otsZoomCur -= (float)wheelPre / 120.0f * 3.0f;
-        if (s_otsZoomCur < 3.0f)  s_otsZoomCur = 3.0f;
-        if (s_otsZoomCur > 60.0f) s_otsZoomCur = 60.0f;
+        s_otsZoomCur -= (float)wheel / 120.0f * 3.0f;
+        if (s_otsZoomCur < OTS_ZOOM_FP_ENTER) s_otsZoomCur = OTS_ZOOM_FP_ENTER;
+        if (s_otsZoomCur > OTS_ZOOM_MAX) s_otsZoomCur = OTS_ZOOM_MAX;
+        char zb[160];
+        sprintf_s(zb, sizeof(zb),
+                  "[Ironwind] ots_zoom wheel=%d raw=%d game=%d distance=%.2f",
+                  wheel, rawWheel, wheelPre, s_otsZoomCur);
+        VerbLog(zb);
+    }
+    if (wheel > 0 && s_otsZoomCur <= OTS_ZOOM_FP_ENTER)
+    {
+        // Only a deliberate wheel-in changes the view mode.  A wall pushing
+        // the camera close does not make first-person flicker in a doorway.
+        float yaw = s_otsYaw, pitch = s_otsPitch;
+        enterFirstPerson();
+        if (s_firstPersonActive)
+        {
+            s_fpYaw = yaw;
+            s_fpPitch = pitch;
+            s_fpBodyYaw = yaw;
+            s_fpSmValid = false;
+            s_fpLastMouseMoveMs = GetTickCount64();
+            s_userWantsFP = true; // retain this view through ordinary streaming
+            s_wheelFirstPersonActive = true;
+            DebugLog("[Ironwind] ots_zoom_enter_first_person");
+            return;
+        }
     }
 
     // --- orbit geometry ---
@@ -6029,20 +7013,54 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
     const float OTS_CAM_RADIUS = 0.4f;
     const float OTS_CAM_START   = 2.5f;     // skip the character's own body/gear
     const float OTS_CAM_MIN     = 4.5f;     // closest the lens may sit to the pivot
+    // A long outdoor orbit usually passes through the building's cutaway roof.
+    // Keep the player's wheel distance for outdoors, but use a useful room-size
+    // orbit while inside instead of trying to place the lens beyond the room.
+    CharMovement* anchorMove = s_freeMoveAnchor->movement;
+    bool indoors = stableIndoors(anchorMove);
+    const float OTS_INDOOR_MAX = 35.0f;
+    float desiredDist = indoors && s_otsZoomCur > OTS_INDOOR_MAX
+                      ? OTS_INDOOR_MAX : s_otsZoomCur;
     Ogre::Vector3 origin = pivot - fwd * OTS_CAM_START;
-    Ogre::Vector3 sweep  = -fwd * (s_otsZoomCur - OTS_CAM_START);
+    Ogre::Vector3 sweep  = -fwd * (desiredDist - OTS_CAM_START);
     physHit hit(true, false, 0.0f);
-    if (s_otsZoomCur > OTS_CAM_START)
+    if (desiredDist > OTS_CAM_START)
         UtilityT::sphereTrace(hit, origin, sweep, OTS_CAM_RADIUS, 0xFFFFFFFF, true);
-    float targetDist = s_otsZoomCur;
-    if (hit.hit)
+    // The interior roof is already hidden by dcDriveFloorReveal.  Its physics
+    // shell can still be hit immediately behind the pivot, producing the 4.5u
+    // lens distance seen in the log.  Ignore that ceiling hit only inside the
+    // controlled character's building; ordinary walls and exterior geometry
+    // still pull the camera in to avoid looking through them.
+    Building* ownBuilding = indoors ? anchorMove->building.getBuilding() : nullptr;
+    bool ownRoofHit = hit.hit && indoors && hit.normal.y < -0.55f
+                   && ((ownBuilding && hit.getBuilding() == ownBuilding)
+                       || hit.distance <= 0.5f);
+    float targetDist = desiredDist;
+    if (hit.hit && !ownRoofHit)
     {
         targetDist = OTS_CAM_START + hit.distance;      // total from the pivot
         if (targetDist < OTS_CAM_MIN) targetDist = OTS_CAM_MIN;
     }
-    if (targetDist < s_otsCollDistSm) s_otsCollDistSm += (targetDist - s_otsCollDistSm) * 0.5f;   // in quick
-    else                             s_otsCollDistSm += (targetDist - s_otsCollDistSm) * 0.30f;   // out steady
+    if (targetDist < s_otsCollDistSm) s_otsCollDistSm = targetDist; // never leave the lens beyond a wall
+    else                             s_otsCollDistSm += (targetDist - s_otsCollDistSm) * 0.30f;
     Ogre::Vector3 camPos = pivot - fwd * s_otsCollDistSm;
+    if (s_verboseLog)
+    {
+        static ULONGLONG s_lastOtsTraceMs = 0;
+        ULONGLONG nowTrace = GetTickCount64();
+        if (nowTrace - s_lastOtsTraceMs >= 1000)
+        {
+            s_lastOtsTraceMs = nowTrace;
+            char tb[320];
+            sprintf_s(tb, sizeof(tb), "[IronwindTrace] camera height=%.2f scale=%.2f root_y=%.2f pivot_above=%.2f lens_above=%.2f dist=%.2f target=%.2f zoom=%.2f indoor=%d hit=%d roof=%d hit_dist=%.2f normal_y=%.2f pitch=%.2f ui=%d",
+                      s_otsCamHeight, hScale, root.y, pivot.y - root.y,
+                      camPos.y - root.y, s_otsCollDistSm, targetDist,
+                      s_otsZoomCur, indoors ? 1 : 0, hit.hit ? 1 : 0,
+                      ownRoofHit ? 1 : 0, hit.hit ? hit.distance : -1.0f,
+                      hit.hit ? hit.normal.y : 0.0f, s_otsPitch, uiOpen ? 1 : 0);
+            VerbLog(tb);
+        }
+    }
 
     // Near-clip vs pull-in (user 2026-09-11, wall-hug clipping): at close
     // range the vanilla near plane slices the character open (hair/shoulder
@@ -6126,7 +7144,7 @@ static void dcDriveFloorReveal()
     // Force the cutaway to "everything up to the anchor's floor" — the same
     // reveal restrictPosition would compute — AFTER that pass so this is the
     // frame's final word.  INI FloorRevealBelow=0 restores the old behaviour
-    // (re-read on every P-enter, so it's revertible without a rebuild).
+    // (re-read on every F-enter, so it's revertible without a rebuild).
     //
     // Outside-building reveal (user 2026-08-05): vanilla only cuts a building
     // away while the tracked character is INSIDE one, but neither pass here
@@ -6192,8 +7210,8 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
     // the vanilla keys return the moment DC is off.
     if (s_mode == MODE_FREE_MOVE && key)
     {
-        if (s_bindVk[KR_DODGE] == 'Q' || s_bindVk[KR_BLOCK] == 'Q' || s_bindVk[KR_ATTACK] == 'Q') key->rotLeft  = false;
-        if (s_bindVk[KR_DODGE] == 'E' || s_bindVk[KR_BLOCK] == 'E' || s_bindVk[KR_ATTACK] == 'E') key->rotRight = false;
+        if (s_bindVk[KR_BLOCK] == 'Q' || s_bindVk[KR_ATTACK] == 'Q') key->rotLeft  = false;
+        if (s_bindVk[KR_BLOCK] == 'E' || s_bindVk[KR_ATTACK] == 'E') key->rotRight = false;
     }
 
     // (2026-09-06) The old engine-rotate OTS force (key->rotate = true) was
@@ -6291,13 +7309,9 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
     if (!ou || !ou->player || thisptr != ou->player->camera)
         return;
 
-    // ANY open UI fully DISABLES the CTRL camera-rotate toggle (user req 2026-06-21
-    // — simpler + robust): the moment a menu (dialogue, trade, loot, inventory,
-    // pause, anything) is up, turn the toggle OFF and actively release the cursor.
-    // The player re-presses CTRL after closing the menu.  `controlEnabled` (the
-    // game's own "a UI has focus" flag) is the universal signal; the gui checks are
-    // belt-and-suspenders.  s_camRotateUiOpen also gates the poll thread so CTRL+
-    // click inside a menu can't re-toggle it.
+    // Any open UI suspends V-camera input and releases the cursor. `controlEnabled`
+    // is the game's own "a UI has focus" signal; the gui checks are
+    // belt-and-suspenders.
     // The world MAP and the character STATS window do NOT flip controlEnabled and
     // are not inventory/dialogue/pause — so in FP the cursor stayed pinned to
     // center inside them (field 2026-07-25).  Add them explicitly: the map lives
@@ -6305,34 +7319,64 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
     // UNIFY (2026-09-04): single suspend signal shared with FP + the crosshair
     // (dcUiWantsCursor covers map/stats/dialogue/pause/inventory/loot/context-
     // menu); controlEnabled adds the game's own "UI has focus" catch-all.
-    // (move-through: the open inventory drops controlEnabled, but the view
-    //  must keep looking - dcUiWantsCursor still catches every real UI)
+    // Move-through keeps WASD active, while dcUiWantsCursor releases the
+    // mouse to the open inventory until Tab closes it.
     bool uiOpenNow = (!controlEnabled && !s_invMoveThroughActive) || dcUiWantsCursor();
     // OTS engagement + cursor are handled by the DEDICATED DETACHED CAMERA
     // now (enterOtsCam / otsCamDrive / exitOtsCam, below) — the old
     // engine-rotate (key->rotate) path with its warp / lastMousePos / SendInput
     // flush was removed in the 2026-09-06 rebuild so OTS owns the cursor like
-    // FP does.  s_camRotateUiOpen still gates the poll-thread CTRL toggle.
-    s_camRotateUiOpen = uiOpenNow;
+    // FP does.
+    s_cameraUiOpen = uiOpenNow;
 
     // XHAIR-TWEAK (2026-09-06, user goal "just keep the cursor hidden"): drive
-    // crosshair + pointer visibility off a STABLE condition — a look-mode is
-    // TOGGLED (FP active or CTRL-OTS on) AND no real UI wants the cursor.  It
+    // crosshair + pointer visibility off the actual V-camera state and no real
+    // UI wanting the cursor. It
     // deliberately does NOT key off s_otsRotateEngaged: that flag blips off for
     // a frame during the engine's rotate re-engage (after a UI closes), which
     // let the real pointer flash back on at its last spot = the intermittent
-    // "cursor stuck" the user saw.  Tied to the toggle instead, the pointer
-    // stays hidden the whole time you're in the mode (except genuine UIs), so
+    // "cursor stuck" the user saw. The pointer stays hidden for the whole active
+    // V view (except genuine UIs), so
     // any residual engine cursor blip is never visible.  Look-drive still uses
     // its own suspend (wantRotate / fpDriveFrame) independently.
-    dcUpdateCrosshair((s_firstPersonActive || s_camRotateToggle) && !dcUiWantsCursor());
+    dcUpdateCrosshair((s_firstPersonActive || s_otsCamActive) && !uiOpenNow);
+
+    // A wheel-entered first-person view is the near end of the same V-camera
+    // zoom range.  One outward notch crosses the hysteresis gap back to OTS.
+    // Always drain raw Z here so scrolling an open menu cannot trigger a view
+    // switch when the menu closes.
+    if (s_wheelFirstPersonActive && s_firstPersonActive)
+    {
+        int rawWheel = (int)InterlockedExchange(&s_diAccZ, 0);
+        int wheel = rawWheel != 0 ? rawWheel : otsWheelPre;
+        if (!uiOpenNow && isKenshiForegroundMain() && wheel < 0)
+        {
+            float yaw = s_fpSmValid ? s_fpYawSm : s_fpYaw;
+            float pitch = s_fpSmValid ? s_fpPitchSm : s_fpPitch;
+            s_otsZoomCur = OTS_ZOOM_FP_ENTER - (float)wheel / 120.0f * 3.0f;
+            if (s_otsZoomCur < OTS_ZOOM_FP_EXIT) s_otsZoomCur = OTS_ZOOM_FP_EXIT;
+            if (s_otsZoomCur > OTS_ZOOM_MAX) s_otsZoomCur = OTS_ZOOM_MAX;
+            s_otsResumeZoomPending = true;
+            s_wheelFirstPersonActive = false;
+            s_userWantsFP = false;
+            exitFirstPerson(true);
+            enterOtsCam();
+            if (s_otsCamActive)
+            {
+                s_otsYaw = yaw;
+                s_otsPitch = pitch;
+                DebugLog("[Ironwind] ots_zoom_exit_first_person");
+            }
+            else s_otsResumeZoomPending = false;
+        }
+    }
 
     // OTS: drive the DEDICATED DETACHED CAMERA (2026-09-06 rebuild) — its own
     // camera node, own mouse-look, own cursor (like FP), no engine rotate.
-    // Engage on the CTRL toggle; otsCamDrive orbits behind the shoulder; exit
-    // re-attaches + restores the rig camera.
+    // V mode owns OTS whenever first person is not active; otsCamDrive orbits
+    // behind the shoulder, and V/FP teardown re-attaches the rig camera.
     {
-        bool wantOts = (s_mode == MODE_FREE_MOVE) && s_camRotateToggle
+        bool wantOts = (s_mode == MODE_FREE_MOVE)
                     && !s_fpActive && !s_firstPersonActive
                     && !s_dcShutdownInProgress;
         if (wantOts)
@@ -6441,6 +7485,7 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
                                 && nowFC - s_lastInCombatMs < FACECAM_COMBAT_GRACE_MS);
 
         bool softOK    = s_settingInventoryFaceCam
+                      && !invMoveThroughEligible()
                       && s_mode == MODE_FREE_MOVE
                       && s_freeMoveAnchor && s_freeMoveAnchor->movement
                       && isOwnInventoryOpen();
@@ -6482,7 +7527,12 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
         // (not OTS's zeroed detached pose, which corrupted the restore).  OTS
         // auto-re-engages via wantOts once the inventory closes.
         if (s_otsCamActive && faceCamWanted)
+        {
+            // A temporary inventory camera must never discard the distance
+            // the player set with the wheel when the OTS camera re-enters.
+            s_otsResumeZoomPending = true;
             exitOtsCam(true);
+        }
 
         if (faceCamWanted && !s_fpActive && !s_firstPersonActive)
             enterOTS();
@@ -6554,7 +7604,7 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
     // (field 2026-06-16, bail-NPC-out menu).  inDialogue covers NPC talk +
     // the prisoner/bail dialogue windows.
     bool inDialogue = (gui && gui->inDialogue());
-    bool captureOk  = !s_menuSuspendActive && !ctxVisible
+    bool captureOk  = !s_cameraUiOpen && !ctxVisible
                    && !s_lootUiSuspendActive && !anchorKO && !inDialogue
                    && isKenshiForegroundMain();
 
@@ -6830,6 +7880,25 @@ static bool slaveEscapeZone(Character* ch)
 static bool computeHoldDecision(Character* ch, const char** outReason)
 {
     if (!ch)                           { *outReason = "no_character";   return true; }
+    if (manualHitReactionLive(ch))     { *outReason = "hit_reaction";  return true; }
+    if (ch == s_freeMoveAnchor && s_freeAttackTech)
+                                       { *outReason = "manual_action"; return true; }
+    // Holding RMB is an explicit request to guard in V mode, even if there was
+    // no preceding WASD release.  Do not yield locomotion to a queued move or
+    // to the vanilla defensive-combat order while the feet have no WASD input.
+    if (ch == s_freeMoveAnchor && manualBlockMovementSlow()
+        && !s_healingJobActive && !s_cameraLockTurretSuspend && !s_menuSuspendActive
+        && !isDownedButMovable(ch) && !isProtectedAnimationState(ch)
+        && !slaveEscapeZone(ch))
+                                       { *outReason = "manual_guard"; return false; }
+    // Tab does not hand a manually controlled V-mode character back to queued
+    // jobs.  With no WASD input, park them where the inventory was opened;
+    // the WASD drive path clears this anchor while movement keys are held.
+    if (ch == s_freeMoveAnchor && s_manualAttackOn && invMoveThroughEligible()
+        && !s_healingJobActive && !s_cameraLockTurretSuspend && !s_menuSuspendActive
+        && !isDownedButMovable(ch) && !isProtectedAnimationState(ch)
+        && !slaveEscapeZone(ch))
+                                       { *outReason = "manual_inventory"; return false; }
     if (!s_wasdHoldActive)             { *outReason = "no_hold";        return true; }
     if (slaveEscapeZone(ch))           { *outReason = "slave";          return true; }
     if (s_playerPointClickActive)      { *outReason = "player_click";   return true; }
@@ -6987,6 +8056,26 @@ static void applySlaveMovement(bool bW, bool bA, bool bS, bool bD)
 // history is invalidated on every non-driving frame, and the WRITE happens only
 // at the end of the inject path after the original has moved the body.
 // -----------------------------------------------------------------------
+static AnimationClassBase::SingleAnimation* manualPlayingTechnique(AnimationClass* animation,
+                                                                    CombatTechniqueData* technique)
+{
+    if (!animation || !technique) return nullptr;
+    AnimationClassBase::SingleAnimation* playing = animation->getAnimationPlaying(technique);
+    if (!playing) playing = animation->getAnimationPlaying_datName(technique->animation);
+    if (!playing) playing = animation->getAnimationPlaying_animName(technique->animation);
+    return playing;
+}
+
+static float manualClipTimeline(AnimationClassBase::SingleAnimation* playing, float* lengthOut)
+{
+    if (lengthOut) *lengthOut = 0.0f;
+    if (!playing || !playing->mainState) return -1.0f;
+    float length = playing->mainState->getLength();
+    if (!(length > 0.01f && length < 60.0f)) return -1.0f;
+    if (lengthOut) *lengthOut = length;
+    return playing->mainState->getTimePosition() / length;
+}
+
 static void charMovUpdate_hook(CharMovement* thisptr, float time)
 {
     // Fast path: non-anchor characters exit immediately with no further work.
@@ -7036,13 +8125,49 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
     bool inVMode     = (s_frameMode == MODE_FREE_MOVE);
     bool lootSuspend = s_frameLootSuspend;
 
+    // v97 stable fallback: a held guard owns the body and WASD is ignored.
+    // Kenshi's native normal-block animation is not discoverable through the
+    // Animation lookup used by free actions, so moving and then trying to infer
+    // its visual lifetime produced repeated pose cuts in v95/v96. Keep the
+    // anchor stationary for the whole accepted RMB request, let the original
+    // movement update advance combat animation, then remove any AI/root-motion
+    // displacement. No timer and no combat-state write is involved.
+    if (inVMode && !lootSuspend && wasdHeld && manualBlockMovementSlow())
+    {
+        Ogre::Vector3 guardPos = thisptr->pos;
+        thisptr->halt();
+        thisptr->desiredMotion = Ogre::Vector3::ZERO;
+        thisptr->moveLimit = 0.0f;
+        thisptr->currentMotion = Ogre::Vector3::ZERO;
+        s_wasdMovementApplied = false;
+        s_prevWasdDir = Ogre::Vector3::ZERO;
+        s_charMovUpdateOrig(thisptr, time);
+        thisptr->pos.x = guardPos.x;
+        thisptr->pos.z = guardPos.z;
+        thisptr->desiredMotion.x = 0.0f;
+        thisptr->desiredMotion.z = 0.0f;
+        thisptr->currentMotion.x = 0.0f;
+        thisptr->currentMotion.z = 0.0f;
+        thisptr->currentSpeed = 0.0f;
+        static ULONGLONG lastGuardWasdBlockedMs = 0;
+        ULONGLONG guardNow = GetTickCount64();
+        if (guardNow - lastGuardWasdBlockedMs >= 1000)
+        {
+            lastGuardWasdBlockedMs = guardNow;
+            VerbLog("[Ironwind] guard_wasd_blocked");
+        }
+        return;
+    }
+
     // Combat WASD transition bridge: if we were just driving and a real key was
     // held within COMBAT_WASD_BRIDGE_MS, and the anchor is in combat, treat the
     // current no-key gap as still-driving (using the last direction) so a key
     // roll (W->A->S->D) doesn't hand the body to the AI to square up.  Does NOT
     // refresh s_wasdLastHeldMs (see the held branch), so it self-expires.
     bool combatBridge = false;
-    if (!wasdHeld && inVMode && !lootSuspend && s_wasdMovementApplied
+    if (!wasdHeld && inVMode && !lootSuspend
+        && !manualBlockMovementSlow()
+        && s_wasdMovementApplied
         && s_prevWasdDir.squaredLength() > 0.0001f)
     {
         Character* chB = thisptr->getCharacter();
@@ -7068,7 +8193,8 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
                 bool inGrace      = (graceMs > 0 &&
                                      s_wasdLastHeldMs > 0 &&
                                      (now - s_wasdLastHeldMs) < graceMs);
-                if (!inGrace && !isCommittedAction(chR))
+                if ((!inGrace || manualBlockMovementSlow())
+                    && (!isCommittedAction(chR) || manualBlockMovementSlow()))
                 {
                     Ogre::Vector3 velPre = thisptr->currentMotion;
                     thisptr->halt();
@@ -7111,16 +8237,61 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
                     s_holdPosValid = true;
                 }
                 thisptr->halt();
+                // A completed manual swing can leave CharMovement's animation
+                // override latched while the post-WASD hold takes over.  The
+                // next WASD press clears it in the drive path; do the same on
+                // the first truly idle frame so no extra keypress is needed.
+                bool restoreIdlePose = s_manualAttackOn && !manualBlockMovementSlow()
+                    && !s_freeAttackTech && !s_freeAnimCombatMode
+                    && !s_attackActive;
+                CombatClass* idleCC = restoreIdlePose && chR ? chR->getCombatClass() : nullptr;
+                if (restoreIdlePose)
+                {
+                    thisptr->animationOverride = false;
+                    if (idleCC && manualHitReactionLive(chR))
+                        idleCC->combatModeActive = true;
+                    else if (idleCC && idleCC->getCombatState() != STUMBLE
+                             && idleCC->getCombatState() != REACTION_BLOCK)
+                        idleCC->combatModeActive = false;
+                }
                 thisptr->movementMode  = MOVE_DIRECTION;   // path-following ignored
                 thisptr->desiredMotion = Ogre::Vector3::ZERO;
                 thisptr->moveLimit     = 0.0f;
                 thisptr->currentMotion = Ogre::Vector3::ZERO;
+                CombatClass* guardCC = (manualBlockMovementSlow() && chR)
+                    ? chR->getCombatClass() : nullptr;
+                if (guardCC && s_freeGuardUpperIdle && s_freeBlockTech)
+                    guardCC->combatModeActive = true;
                 if (!s_idleHoldEngaged)
                 {
                     s_idleHoldEngaged = true;
                     VerbLog("[WASDCombat] dc_wasd_hold_engaged");
                 }
+                if (manualBlockMovementSlow())
+                {
+                    static ULONGLONG lastGuardHoldLogMs = 0;
+                    ULONGLONG guardNow = GetTickCount64();
+                    if (guardNow - lastGuardHoldLogMs >= 1000)
+                    {
+                        lastGuardHoldLogMs = guardNow;
+                        VerbLog("[Ironwind] guard_stationary_hold");
+                    }
+                }
                 s_charMovUpdateOrig(thisptr, time);
+                if (restoreIdlePose)
+                {
+                    bool overrideAfter = thisptr->animationOverride;
+                    thisptr->animationOverride = false;
+                    if (idleCC && manualHitReactionLive(chR))
+                        idleCC->combatModeActive = true;
+                    else if (idleCC && idleCC->getCombatState() != STUMBLE
+                             && idleCC->getCombatState() != REACTION_BLOCK)
+                        idleCC->combatModeActive = false;
+                    if (overrideAfter)
+                        VerbLog("[Ironwind] free_action_idle_pose_restored");
+                }
+                if (guardCC && s_freeGuardUpperIdle && s_freeBlockTech)
+                    guardCC->combatModeActive = true;
                 thisptr->pos.x         = s_holdPos.x;
                 thisptr->pos.z         = s_holdPos.z;
                 thisptr->currentMotion = Ogre::Vector3::ZERO;
@@ -7270,15 +8441,22 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
     // FINISH-THE-CLIP buffer (user req 2026-06-21, broadened 2026-06-22): Kenshi can't
     // abort an animation clip, so cutting one with movement looks broken/stutters.
     // BUFFER movement while a committed combat clip plays — the character's own swing
-    // (windup/strike), a stagger from being hit (STUMBLE), or a parry (REACTION_BLOCK)
+    // (windup/strike), a native automatic BLOCK, a stagger from being hit
+    // (STUMBLE), or a parry (REACTION_BLOCK)
     // — and let it finish in place, THEN move.  go() is left running for these states
     // (so the clip completes + the state advances), then combatGo_hook suppresses it,
     // so no new attack chains and movement flows the instant the clip ends.  We touch
     // NO combat state here (no flip, no cut) — exactly one system drives the body, so
-    // nothing fights.  DECISION/BLOCK/CIRCLE/WAIT/HESITATE still yield to movement so
-    // you can always retreat.
-    if (dirOk && isCommittedCombatClip(thisptr->getCharacter()))
+    // nothing fights.  Generic DECISION/BLOCK/CIRCLE/WAIT/HESITATE still yield
+    // to movement; only the exact automatic-guard BLOCK technique is buffered.
+    if (dirOk && (isCommittedCombatClip(thisptr->getCharacter())
+                  || manualHitReactionLive(thisptr->getCharacter())))
     {
+        // v40: our own free swing does not outrank a hit reaction.  The free
+        // swing path returns false above for the anchor, so reaching this
+        // branch with a live free swing means the vanilla machine just
+        // entered a reaction (STUMBLE/REACTION_BLOCK) on top of it - buffer
+        // as usual, the reaction owns the body until the cleanup waits it out.
         s_wasdMovementApplied = false;   // the clip owns the body; do not inject
         static ULONGLONG s_clipBufTick = 0;
         ULONGLONG nowSB = GetTickCount64();
@@ -7294,6 +8472,20 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
         bool prevHasDir = (s_prevWasdDir.squaredLength() > 0.0001f);
         bool turning    = prevHasDir && (wasdDir.dotProduct(s_prevWasdDir) < 0.9f);
         float limit     = wasdMoveLimit(turning);
+        const bool attackSlow = manualAttackMovementSlow();
+        const bool combatSlow = attackSlow || manualBlockMovementSlow();
+        // A targeted swing reaches this branch only after the player's input
+        // synchronously started the native AttackState. Preserve that action
+        // layer while allowing the existing 20% WASD movement.
+        // Automatic guard has no Ironwind free-block technique: before/after a
+        // real native BLOCK it is represented by the held vanilla defensive
+        // request plus the normal combat idle. Preserve that combat layer
+        // during 20% WASD instead of clearing it as ordinary locomotion.
+        const bool autoGuardHeldPose = manualBlockMovementSlow()
+                                    && s_settingAiBlocks && s_blockHeldPrev;
+        const bool manualCombatPose = (attackSlow && (s_freeAttackTech || s_attackActive))
+                                   || (manualBlockMovementSlow() && s_freeGuardUpperIdle && s_freeBlockTech)
+                                   || autoGuardHeldPose;
 
         s_wasdMovementApplied = true;
         { ULONGLONG t = GetTickCount64();
@@ -7304,6 +8496,7 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
         thisptr->animationOverride = false;
         thisptr->movementMode      = MOVE_DIRECTION;
         thisptr->setDesiredSpeed(thisptr->speedOrders);
+        if (combatSlow) thisptr->setDesiredSpeed(limit);
         thisptr->setDirectMovement(wasdDir, limit);
 
         // Pre-charge currentMotion to jump-start acceleration ramp-up.
@@ -7330,9 +8523,10 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
             // (the setDirectMovement limit alone didn't bind because this velocity
             // write does).  Clamp the pre-charge to `limit` so the cap actually holds.
             float floorSpeed = thisptr->desiredSpeed;
-            if (s_settingWasdSpeedCap && floorSpeed > limit) floorSpeed = limit;
+            const bool capPrecharge = s_settingWasdSpeedCap || combatSlow;
+            if (capPrecharge && floorSpeed > limit) floorSpeed = limit;
             if (preSpeed < floorSpeed) preSpeed = floorSpeed;
-            if (s_settingWasdSpeedCap && preSpeed > limit) preSpeed = limit;
+            if (capPrecharge && preSpeed > limit) preSpeed = limit;
             thisptr->currentMotion = wasdDir * preSpeed;
         }
 
@@ -7353,9 +8547,52 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
         // you; combat (and its animations) resume the moment you stop driving.
         Character*   chFlip = thisptr->getCharacter();
         CombatClass* ccFlip = chFlip ? chFlip->getCombatClass() : nullptr;
-        if (ccFlip && ccFlip->combatModeActive)
+        // A free swing or held guard needs its combat animation layer while
+        // the feet move.  Clearing it lets walking override the action pose.
+        // During a native hit reaction FORCE the flag so vanilla owns its
+        // animation layer.  v44 bases this only on _getHit/state, never time.
+        if (ccFlip && (manualCombatPose
+                       || manualHitReactionLive(chFlip)))
+            ccFlip->combatModeActive = true;
+        else if (ccFlip && ccFlip->combatModeActive)
             ccFlip->combatModeActive = false;
+        Ogre::Vector3 attackMoveStart = thisptr->pos;
         s_charMovUpdateOrig(thisptr, time);
+
+        // The native update may restore the RUN order and accelerate after our
+        // pre-charge.  Bound all three live movement values again before the
+        // next integration frame.  Keep the vertical component (gravity) intact.
+        if (combatSlow)
+        {
+            float postLimit = wasdMoveLimit(false);
+            thisptr->setDesiredSpeed(postLimit);
+            float planar = sqrtf(thisptr->currentMotion.x * thisptr->currentMotion.x
+                               + thisptr->currentMotion.z * thisptr->currentMotion.z);
+            if (planar > postLimit && planar > 0.001f)
+            {
+                float factor = postLimit / planar;
+                thisptr->currentMotion.x *= factor;
+                thisptr->currentMotion.z *= factor;
+            }
+            if (thisptr->currentSpeed > postLimit) thisptr->currentSpeed = postLimit;
+            if (s_verboseLog)
+            {
+                static ULONGLONG lastAttackMoveTraceMs = 0;
+                ULONGLONG traceNow = GetTickCount64();
+                if (traceNow - lastAttackMoveTraceMs >= 350)
+                {
+                    lastAttackMoveTraceMs = traceNow;
+                    Ogre::Vector3 delta = thisptr->pos - attackMoveStart;
+                    float frameDistance = sqrtf(delta.x * delta.x + delta.z * delta.z);
+                    char b[192]; sprintf_s(b, sizeof(b),
+                        "[Ironwind] combat_move attack=%d block=%d limit=%.2f desired=%.2f current=%.2f motion=%.2f frame_dist=%.3f frame_time=%.3f",
+                        attackSlow ? 1 : 0, manualBlockMovementSlow() ? 1 : 0,
+                        postLimit, thisptr->desiredSpeed, thisptr->currentSpeed,
+                        thisptr->currentMotion.length(), frameDistance, time);
+                    VerbLog(b);
+                }
+            }
+        }
 
 
         // Post-original re-assert: the combat AI re-enables animationOverride /
@@ -7368,6 +8605,8 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
             CombatClass* ccPost = chPost ? chPost->getCombatClass() : nullptr;
             if (ccPost)
             {
+                if (manualCombatPose || manualHitReactionLive(chPost))
+                    ccPost->combatModeActive = true;   // v41: reaction needs the layer
                 // Re-assert MOVE_DIRECTION so the AI can never drag/circle/square the
                 // character while keys are held (absolute priority, user req
                 // 2026-06-20).  We do NOT cut the combat state here anymore: the
@@ -7447,7 +8686,9 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
 // -----------------------------------------------------------------------
 static bool manualBlockArmed(Character* self)
 {
-    return s_settingManualBlock && s_blockHeld
+    return s_settingManualBlock && !s_settingAiBlocks && s_blockHeld
+        && s_blockAcceptedPressMs != 0 && s_blockPressMs == s_blockAcceptedPressMs
+        && s_blockHoldStartMs != 0
         && !s_dcShutdownInProgress && !s_loadGuardActive
         && s_mode == MODE_FREE_MOVE
         && self && self == s_freeMoveAnchor;
@@ -7498,39 +8739,34 @@ static void manualBlockOrder(bool on)
     }
 }
 
-static bool manualDodgeCommitLive()
-{
-    return s_dodgeCommitUntilMs != 0 && GetTickCount64() < s_dodgeCommitUntilMs;
-}
-
-
 static bool verifyPatchSiteBytes(intptr_t addr, const unsigned char* expected, size_t len, const char* name);
-static void manualDodgeResolvePlayFn()
+static void nativeDefenceResolvePlayFn()
 {
-    if (s_dodgePlayChecked) return;
-    s_dodgePlayChecked = true;
+    if (s_defencePlayChecked) return;
+    s_defencePlayChecked = true;
     intptr_t base = (intptr_t)GetModuleHandleA(NULL);
-    intptr_t fn   = base + (intptr_t)DC_DODGE_PLAY_RVA;
+    intptr_t fn   = base + (intptr_t)DC_DEFENCE_PLAY_RVA;
     static const unsigned char PROLOGUE[16] = { 0x40,0x53,0x55,0x57,0x41,0x54,0x48,0x81,0xEC,0xC8,0x00,0x00,0x00,0x48,0xC7,0x44 };
     static const unsigned char ISDODGE_CMP[4] = { 0x80,0x7A,0x2D,0x00 };   // cmp byte ptr [rdx+0x2D],0 at +0x58
-    if (verifyPatchSiteBytes(fn, PROLOGUE, 16, "dodge technique-play")
-        && verifyPatchSiteBytes(fn + 0x58, ISDODGE_CMP, 4, "dodge technique-play (+0x58)"))
+    if (verifyPatchSiteBytes(fn, PROLOGUE, 16, "native defence technique-play")
+        && verifyPatchSiteBytes(fn + 0x58, ISDODGE_CMP, 4, "native defence technique-play (+0x58)"))
     {
-        s_dodgePlayFn = (DcTechPlayFn)fn;
-        VerbLog("[WASDCombat] dodge_play_fn verified");
+        s_defencePlayFn = (DcTechPlayFn)fn;
+        VerbLog("[WASDCombat] native_defence_play_fn verified");
     }
     else
-        ErrorLog("WASDCombatPlugin: dodge technique-play function not verified on this exe - manual dodge animation disabled");
+        ErrorLog("WASDCombatPlugin: native defence technique-play function not verified on this exe - native automatic dodge playback unavailable");
 }
 
-// Build the mod-owned dodge copies from the vanilla pool (one shot, guarded like
-// the dump).  A copy = the technique's bytes + its own std::string for the
+// Build only mod-owned block copies from the vanilla defence pool (one shot).
+// Dodge records are deliberately skipped: Ironwind no longer manufactures or
+// injects a player dodge. A copy = the technique's bytes + its own std::string for the
 // animation name; the impact list / event map internals are shared read-only
 // with the original (which lives for the whole process) and never freed.
-static void manualDodgeBuildCopies()
+static void manualBlockBuildCopies()
 {
-    if (s_dcDodgeBuilt) return;
-    s_dcDodgeBuilt = true;
+    if (s_dcBlockBuilt) return;
+    s_dcBlockBuilt = true;
     uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
     const int*  pCount = (const int*)(base + 0x2010F88);
     CombatTechniqueData* const* const* pArr = (CombatTechniqueData* const* const*)(base + 0x2010F90);
@@ -7541,57 +8777,75 @@ static void manualDodgeBuildCopies()
         if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) return false;
         return ((uintptr_t)a + n) <= ((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
     };
-    if (!readable(pCount, 4) || !readable(pArr, 8)) { DebugLog("[WASDCombat] dodge_copies_unreadable"); return; }
+    if (!readable(pCount, 4) || !readable(pArr, 8)) { DebugLog("[WASDCombat] block_copies_unreadable"); return; }
     int cnt = *pCount;
     CombatTechniqueData* const* arr = *pArr;
-    if (cnt <= 0 || cnt > 400 || !readable(arr, (size_t)cnt * 8)) { DebugLog("[WASDCombat] dodge_copies_insane"); return; }
+    if (cnt <= 0 || cnt > 400 || !readable(arr, (size_t)cnt * 8)) { DebugLog("[WASDCombat] block_copies_insane"); return; }
     const size_t objBytes = 0x100;   // > sizeof on 1.0.65 (impactPoints lektor ends ~0xC8)
     for (int i = 0; i < cnt; ++i)
     {
         CombatTechniqueData* t = arr[i];
         if (!readable(t, objBytes)) continue;
-        bool isD = t->isDodge, isB = t->isBlock && !t->isDodge;
-        if ((isD && s_dcDodgeCount >= 8) || (isB && s_dcBlockCount >= 8) || (!isD && !isB)) continue;
+        if (!t->isBlock || t->isDodge || s_dcBlockCount >= 8) continue;
         void* mem = malloc(objBytes + 64);
         if (!mem) break;
         memcpy(mem, t, objBytes);
         CombatTechniqueData* c = (CombatTechniqueData*)mem;
         new (&c->animation) std::string(t->animation);   // own name string (deep copy)
         char b[160];
-        if (isD)
-        {
-            DcDodgeCopy& d = s_dcDodge[s_dcDodgeCount++];
-            d.tech = c; d.stumbleOnly = t->stumbleDodge; d.weight = t->chanceMult > 0.0f ? t->chanceMult : 1.0f;
-            sprintf_s(b, sizeof(b), "[WASDCombat] dodge_copy[%d] anim=%s stumbleOnly=%d weight=%.2f", s_dcDodgeCount - 1,
-                      c->animation.c_str(), d.stumbleOnly ? 1 : 0, d.weight);
-        }
-        else
-        {
-            s_dcBlock[s_dcBlockCount++] = c;
-            sprintf_s(b, sizeof(b), "[WASDCombat] block_copy[%d] anim=%s dir0=%d", s_dcBlockCount - 1,
-                      c->animation.c_str(), c->numImpactPoints() > 0 ? (int)c->impactPoint(0)->direction : -1);
-        }
+        s_dcBlock[s_dcBlockCount++] = c;
+        sprintf_s(b, sizeof(b), "[WASDCombat] block_copy[%d] anim=%s dir0=%d", s_dcBlockCount - 1,
+                  c->animation.c_str(), c->numImpactPoints() > 0 ? (int)c->impactPoint(0)->direction : -1);
         VerbLog(b);
     }
 }
 
-// Pick one of our copies, weighted: the normal dodges when standing, the
-// stumble dodges (dodgefly / dodgeback-2) while staggered - same split the AI
-// uses (stumbleDodge must match isStumbling in the vanilla chooser).
-static CombatTechniqueData* manualDodgePick(bool stumbling)
+// CharStats keeps attacks in a different static list from defence techniques.
+// The block copy builder above intentionally reads only the defence list.
+// Attack techniques are process-owned and are never modified here.
+static void manualAttackLoadPool()
 {
-    float total = 0.0f;
-    for (int i = 0; i < s_dcDodgeCount; ++i) if (s_dcDodge[i].stumbleOnly == stumbling) total += s_dcDodge[i].weight;
-    if (total <= 0.0f) return nullptr;
-    float r = UtilityT::random() * total, acc = 0.0f;
-    CombatTechniqueData* last = nullptr;
-    for (int i = 0; i < s_dcDodgeCount; ++i)
+    if (s_dcAttackBuilt) return;
+    static bool unavailableLogged = false;
+    // KenshiLib declares CharStats::attacks at this 1.0.65 RVA but does not
+    // export its data symbol.  lektor's count and stuff sit at +8 and +16.
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    const unsigned int* pCount = (const unsigned int*)(base + 0x200EF80);
+    CombatTechniqueData* const* const* pArr = (CombatTechniqueData* const* const*)(base + 0x200EF88);
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(pCount, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT
+        || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) return;
+    unsigned int count = *pCount;
+    if (count == 0 || count > 1024)
     {
-        if (s_dcDodge[i].stumbleOnly != stumbling) continue;
-        last = s_dcDodge[i].tech; acc += s_dcDodge[i].weight;
-        if (r <= acc) return last;
+        if (!unavailableLogged)
+        {
+            unavailableLogged = true;
+            char b[96]; sprintf_s(b, sizeof(b), "[Ironwind] attack_pool_unavailable count=%u", count);
+            VerbLog(b);
+        }
+        return;
     }
-    return last;
+    if (VirtualQuery(pArr, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT
+        || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)) return;
+    CombatTechniqueData* const* attacks = *pArr;
+    if (!attacks || VirtualQuery(attacks, &mbi, sizeof(mbi)) != sizeof(mbi)
+        || mbi.State != MEM_COMMIT
+        || (mbi.Protect & PAGE_NOACCESS) || (mbi.Protect & PAGE_GUARD)
+        || (uintptr_t)attacks + count * sizeof(void*) > (uintptr_t)mbi.BaseAddress + mbi.RegionSize) return;
+    for (unsigned int i = 0; i < count && s_dcAttackCount < 256; ++i)
+    {
+        CombatTechniqueData* t = attacks[i];
+        if (!t || VirtualQuery(t, &mbi, sizeof(mbi)) != sizeof(mbi)
+            || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_NOACCESS)
+            || (mbi.Protect & PAGE_GUARD)
+            || (uintptr_t)t + 0x100 > (uintptr_t)mbi.BaseAddress + mbi.RegionSize) continue;
+        if (t->isBlock || t->isDodge || t->animation.empty()) continue;
+        s_dcAttack[s_dcAttackCount++] = t;
+    }
+    s_dcAttackBuilt = s_dcAttackCount > 0;
+    char b[112]; sprintf_s(b, sizeof(b), "[Ironwind] attack_pool native=%u usable=%d", count, s_dcAttackCount);
+    VerbLog(b);
 }
 
 // Staggered = the physical states (KO, playing dead, down, getting up) or the
@@ -7606,9 +8860,7 @@ static bool manualStaggered(Character* ch)
     return cc && cc->combatModeActive && cc->getCombatState() == STUMBLE;
 }
 // Once per frame (from manualBlockTick): stagger edges.  Start = pending
-// presses die (nothing buffers across a stagger; a dodge / swing already in
-// flight keeps its own bookkeeping).  End = inputs count again; a stagger
-// dodge that never found the STUMBLE state is dropped with it.
+// presses die (nothing buffers across a stagger). End = inputs count again.
 static void manualStaggerTick()
 {
     bool stag = s_mode == MODE_FREE_MOVE && s_freeMoveAnchor && !s_dcShutdownInProgress
@@ -7624,7 +8876,12 @@ static void manualStaggerTick()
         s_staggerStartMs   = s_staggerRawSinceMs;
         int dropped = 0;
         if (!s_attackActive && s_attackCommitUntilMs != 0) { s_attackCommitUntilMs = 0; ++dropped; }
-        if (!s_dodgeActiveTech && s_dodgeCommitUntilMs != 0) { s_dodgeCommitUntilMs = 0; ++dropped; }
+        if (s_attackQueuedAtMs != 0)
+        {
+            manualAttackClearQueuedInput(true);
+            ++dropped;
+        }
+        manualAttackClearAimInput(true, true);
         char b[96];
         sprintf_s(b, sizeof(b), "[WASDCombat] stagger_start pending_dropped=%d", dropped);
         VerbLog(b);
@@ -7638,62 +8895,32 @@ static void manualStaggerTick()
     }
 }
 
-// Main thread, once per frame: turn a fresh dodge press into a commit window.
-static void manualDodgePressTick()
-{
-    ULONGLONG press = s_dodgePressMs;
-    if (press == 0 || press == s_dodgeSeenPressMs) return;
-    s_dodgeSeenPressMs = press;
-    manualDodgeBuildCopies();   // one shot
-    manualDodgeResolvePlayFn(); // one shot
-    ULONGLONG now = GetTickCount64();
-    const char* why = nullptr;
-    if (!s_settingManualBlock || s_mode != MODE_FREE_MOVE || !s_freeMoveAnchor
-        || s_dcShutdownInProgress || s_loadGuardActive)          why = "not_dc";
-    else if (!s_manualAttackOn)                                   why = "manual_off";  // Q is a manual-combat control (user 2026-09-29)
-    else if (s_staggerStartMs != 0)                               why = "staggered";   // dropped, never buffered
-    else if (s_dodgeActiveTech)                                   why = "in_flight";   // one dodge until it finishes
-    else if (now < s_dodgeCooldownUntilMs)                        why = "cooldown";
-    else if (now < s_dodgeRecoveryUntilMs)                        why = "recovery";    // last dodge's follow-through
-    else if (s_dodgeAcceptedPressMs != 0 && press >= s_dodgeAcceptedPressMs
-             && press - s_dodgeAcceptedPressMs < (ULONGLONG)s_inputRepeatGuardMs) why = "repeat";  // accidental double-tap
-    else if (!s_freeMoveAnchor->isInCombatMode(true, true)
-             && (s_lastInCombatMs == 0 || now - s_lastInCombatMs > 1500)) why = "no_combat";
-    if (why)
-    {
-        char b[96];
-        sprintf_s(b, sizeof(b), "[WASDCombat] dodge_press_ignored reason=%s", why);
-        VerbLog(b);
-        return;
-    }
-    s_dodgeCommitUntilMs   = press + (ULONGLONG)s_dodgeWindowMs;
-    s_dodgeCooldownUntilMs = now + (ULONGLONG)s_dodgeCooldownMs;   // a wasted press costs the cooldown too
-    s_dodgeAcceptedPressMs = press;
-    char b[96];
-    sprintf_s(b, sizeof(b), "[WASDCombat] dodge_commit window=%.0f moving=%d",
-              s_dodgeWindowMs, (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0);
-    VerbLog(b);
-}
-
 // Is this Character* still a live, loaded, hostile target?  (identity pointer -
 // never trusted without this check; Rule 5)
-// Main thread, once per frame: the Z toggle edge.
+// Main thread, once per frame: V-mode owns manual combat automatically.
+static void manualEnsureWeaponReady(Character* me, CharStats* stats);
+static Character* manualAttackIntentPick(Character* me);
+static void manualAttackAimCaptureTick();
 static void manualAttackTick()
 {
-    ULONGLONG mp = s_manualPressMs;
-    if (mp != 0 && mp != s_manualSeenPressMs)
+    bool want = s_settingManualBlock && s_mode == MODE_FREE_MOVE && s_freeMoveAnchor
+             && !s_loadGuardActive && !s_dcShutdownInProgress;
+    if (s_manualAttackOn != want)
     {
-        s_manualSeenPressMs = mp;
-        if (s_mode == MODE_FREE_MOVE && s_freeMoveAnchor && !s_loadGuardActive)
+        s_manualAttackOn = want;
+        DebugLog(want ? "[WASDCombat] manual_attack_on_with_dc"
+                      : "[WASDCombat] manual_attack_off_with_dc");
+        if (want)
         {
-            s_manualAttackOn = !s_manualAttackOn;
-            DebugLog(s_manualAttackOn ? "[WASDCombat] manual_attack_on" : "[WASDCombat] manual_attack_off");
+            manualHitReactionSyncVBoundary(s_freeMoveAnchor, true);
+            CharStats* stats = s_freeMoveAnchor->getStats();
+            manualEnsureWeaponReady(s_freeMoveAnchor, stats);
+            CombatClass* cc = s_freeMoveAnchor->getCombatClass();
+            if (cc && cc->animation) cc->animation->setCombatMode(true);
+            VerbLog("[Ironwind] v_combat_stance_prearmed");
         }
-    }
-    if (s_manualAttackOn && (s_mode != MODE_FREE_MOVE || !s_freeMoveAnchor))
-    {
-        s_manualAttackOn = false;
-        DebugLog("[WASDCombat] manual_attack_off (dc_off)");
+        else
+            manualHitReactionSyncVBoundary(nullptr, false);
     }
 }
 
@@ -7719,13 +8946,15 @@ static intptr_t dcResolveKenshiLibExport(const char* mangled)
 // AttackState::_NV_initialise(state) - the ONE place a swing starts (state+8 =
 // CombatClass*).  In focus mode, the AI's own swings are denied here: the
 // initialiser reports failure exactly as it does when the target is out of
-// reach, and no technique is chosen or played.  Our E sets s_attackActive
-// first, so its swing passes.  Everything else forwards untouched.
+// reach, and no technique is chosen or played.  Direct player attacks call
+// initialiseAttack(target) themselves and therefore do not need a broad
+// s_attackActive exemption here.  Only the exact synchronous initializer scope
+// may pass if the engine re-enters this wrapper.
 static bool (*s_attackInitOrig)(void* state);
 static bool attackInit_hook(void* state)
 {
     CombatClass* cc = state ? *(CombatClass**)((char*)state + 8) : nullptr;
-    if (cc && s_manualAttackOn && !s_attackActive && s_mode == MODE_FREE_MOVE
+    if (cc && s_manualAttackOn && !s_attackDirectInitialising && s_mode == MODE_FREE_MOVE
         && !s_dcShutdownInProgress && !s_loadGuardActive && cc->me == s_freeMoveAnchor)
     {
         ULONGLONG nowD = GetTickCount64();
@@ -7733,8 +8962,8 @@ static bool attackInit_hook(void* state)
         {
             s_manualSuppressLogMs = nowD;
             char db[96];
-            sprintf_s(db, sizeof(db), "[WASDCombat] manual_ai_attack_denied from_state=%d pending=%d dodging=%d",
-                      s_anchorPrevState, manualAttackCommitLive() ? 1 : 0, s_dodgeActiveTech ? 1 : 0);
+            sprintf_s(db, sizeof(db), "[WASDCombat] manual_ai_attack_denied from_state=%d pending=%d",
+                      s_anchorPrevState, manualAttackCommitLive() ? 1 : 0);
             VerbLog(db);
         }
         return false;
@@ -7757,27 +8986,265 @@ template<typename Tag, typename Tag::type P> struct DcRob : DcRobResult<Tag>
 template<typename Tag, typename Tag::type P> typename DcRob<Tag, P>::Filler DcRob<Tag, P>::filler;
 struct DcSetCombatStateTag { typedef void (CombatClass::*type)(swordStateEnum); };
 template struct DcRob<DcSetCombatStateTag, &CombatClass::setCombatState>;
+struct DcGetStateClassTag { typedef CombatState* (CombatClass::*type)(swordStateEnum); };
+template struct DcRob<DcGetStateClassTag, &CombatClass::getStateClass>;
+struct DcWeaponReachTag { typedef float (CombatClass::*type)(); };
+template struct DcRob<DcWeaponReachTag, &CombatClass::weaponReach>;
+struct DcCameraUpdateAudioTag { typedef void (CameraClass::*type)(); };
+template struct DcRob<DcCameraUpdateAudioTag, &CameraClass::updateAudio>;
+
+// V-mode character-centred audio (v89).
+//
+// CameraClass::updateAudio builds the same 9-float transform accepted by the
+// engine's listener-submit routine: two orientation vectors followed by the
+// listener position.  Detached OTS/FP cameras are deliberately real render
+// cameras, so vanilla submits their remote lens position and nearby combat
+// sounds fade out as the player pulls the view back.  Hook the submit routine
+// itself and replace ONLY the position.  Orientation remains the rendered
+// camera orientation, preserving left/right/front/back spatialisation.
+struct DcAudioListenerTransform
+{
+    float orientationA[3];
+    float orientationB[3];
+    float position[3];
+};
+typedef int (*DcAudioListenerSubmitFn)(const DcAudioListenerTransform*, unsigned int);
+static DcAudioListenerSubmitFn s_audioListenerSubmitOrig = nullptr;
+static bool s_audioListenerAnchorLogged = false;
+static bool (*s_characterAudioEventOrig)(Character*, const char*, SoundRange) = nullptr;
+static ULONGLONG s_audioSourceBypassLogMs = 0;
+
+// Character::audioEvent performs its own camera-distance test before an event
+// is posted to Wwise.  Moving the listener in v87/v88 therefore happened too
+// late for sounds that had already been rejected here.  In V mode, only the
+// controlled character uses SOUNDRANGE_ALWAYS; every other character and every
+// sound outside V mode retains the vanilla range gate.  The listener hook below
+// then places that posted source at the player while preserving camera-facing
+// spatial orientation.
+static bool characterAudioEvent_hook(Character* self, const char* name, SoundRange range)
+{
+    bool controlled = self && self == s_freeMoveAnchor
+                   && s_mode == MODE_FREE_MOVE && self->movement && s_gwFrame
+                   && !s_dcShutdownInProgress && !s_loadGuardActive
+                   && dcInUpdateList(s_gwFrame, self);
+    if (controlled && range != SOUNDRANGE_ALWAYS)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (!s_audioSourceBypassLogMs || now - s_audioSourceBypassLogMs >= 3000)
+        {
+            s_audioSourceBypassLogMs = now;
+            char ab[240];
+            sprintf_s(ab, sizeof(ab),
+                "[WASDCombat] dc_audio_source_range_bypass event=%s native_range=%d",
+                name ? name : "<null>", (int)range);
+            VerbLog(ab);
+        }
+        range = SOUNDRANGE_ALWAYS;
+    }
+    return s_characterAudioEventOrig(self, name, range);
+}
+
+static int audioListenerSubmit_hook(const DcAudioListenerTransform* transform,
+                                    unsigned int listenerIndex)
+{
+    bool anchor = transform && listenerIndex == 0
+               && s_mode == MODE_FREE_MOVE && s_freeMoveAnchor
+               && s_freeMoveAnchor->movement && s_gwFrame
+               && !s_dcShutdownInProgress && !s_loadGuardActive
+               && dcInUpdateList(s_gwFrame, s_freeMoveAnchor);
+    if (!anchor)
+    {
+        if (s_audioListenerAnchorLogged)
+        {
+            s_audioListenerAnchorLogged = false;
+            VerbLog("[WASDCombat] dc_audio_listener_anchor_off");
+        }
+        return s_audioListenerSubmitOrig(transform, listenerIndex);
+    }
+
+    DcAudioListenerTransform local = *transform;
+    // Use the exact coordinate space Kenshi already submits for this
+    // character's Wwise emitter.  v87 derived an Ogre torso point; that hook
+    // ran, but remote-camera tests still had no audible character sound.  The
+    // emitter position avoids guessing axis order, origin and unit scaling.
+    const AkVector& emitter = s_freeMoveAnchor->audioData.Position;
+    bool emitterValid = emitter.X == emitter.X && emitter.Y == emitter.Y
+                     && emitter.Z == emitter.Z
+                     && fabsf(emitter.X) < 10000000.0f
+                     && fabsf(emitter.Y) < 10000000.0f
+                     && fabsf(emitter.Z) < 10000000.0f
+                     && (fabsf(emitter.X) + fabsf(emitter.Y) + fabsf(emitter.Z)) > 0.001f;
+    Ogre::Vector3 body = dcBodyRoot(s_freeMoveAnchor);
+    local.position[0] = emitterValid ? emitter.X : body.x;
+    local.position[1] = emitterValid ? emitter.Y : body.y;
+    local.position[2] = emitterValid ? emitter.Z : body.z;
+
+    if (!s_audioListenerAnchorLogged)
+    {
+        s_audioListenerAnchorLogged = true;
+        char ab[320];
+        sprintf_s(ab, sizeof(ab),
+            "[WASDCombat] dc_audio_listener_anchor_on source=%s listener=(%.1f,%.1f,%.1f) camera=(%.1f,%.1f,%.1f) body=(%.1f,%.1f,%.1f)",
+            emitterValid ? "character_audio" : "body_fallback",
+            local.position[0], local.position[1], local.position[2],
+            transform->position[0], transform->position[1], transform->position[2],
+            body.x, body.y, body.z);
+        VerbLog(ab);
+    }
+    return s_audioListenerSubmitOrig(&local, listenerIndex);
+}
+
+// Resolve the listener submit from the current executable's symbol-resolved
+// CameraClass::updateAudio body.  This avoids a naked game RVA: the short call-
+// site signature is byte-checked, and the target prologue is checked before
+// MinHook sees it.  An updated executable safely disables only this feature.
+static intptr_t dcResolveAudioListenerSubmit()
+{
+    unsigned char* updateAudio = (unsigned char*)KenshiLib::GetRealAddress(
+        DcRobResult<DcCameraUpdateAudioTag>::ptr);
+    if (!updateAudio) return 0;
+
+    const unsigned char prefix[] = { 0x33, 0xD2, 0x48, 0x8D, 0x4D, 0x38, 0xE8 };
+    const unsigned char suffix[] = { 0x45, 0x33, 0xC0 };
+    for (size_t i = 0; i + 14 <= 0x180; ++i)
+    {
+        if (memcmp(updateAudio + i, prefix, sizeof(prefix)) != 0
+            || memcmp(updateAudio + i + 11, suffix, sizeof(suffix)) != 0)
+            continue;
+        int relative = 0;
+        memcpy(&relative, updateAudio + i + 7, sizeof(relative));
+        unsigned char* callNext = updateAudio + i + 11;
+        unsigned char* target = callNext + relative;
+        const unsigned char prologue[] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+        if (memcmp(target, prologue, sizeof(prologue)) == 0)
+            return (intptr_t)target;
+    }
+    return 0;
+}
 
 static void (*s_setCombatStateOrig)(CombatClass* cc, swordStateEnum state);
 static void setCombatState_hook(CombatClass* cc, swordStateEnum state)
 {
-    if (state == CHOP_WEAPON && cc && s_manualAttackOn && !s_attackActive && s_mode == MODE_FREE_MOVE
+    swordStateEnum before = cc ? cc->getCombatState() : COMBAT_FINISHED;
+    if (state == CHOP_WEAPON && cc && s_manualAttackOn && !s_attackDirectInitialising && s_mode == MODE_FREE_MOVE
         && !s_dcShutdownInProgress && !s_loadGuardActive && cc->me == s_freeMoveAnchor)
     {
         VerbLog("[WASDCombat] manual_ai_attack_state_denied");
         state = WAIT_MENACINGLY;
     }
     s_setCombatStateOrig(cc, state);
+    if (cc && cc->me == s_freeMoveAnchor && s_mode == MODE_FREE_MOVE)
+    {
+        swordStateEnum after = cc->getCombatState();
+        bool inReaction = after == STUMBLE || after == REACTION_BLOCK;
+        bool wasReaction = before == STUMBLE || before == REACTION_BLOCK;
+        if (inReaction)
+        {
+            s_hitReactionPending = false;
+            InterlockedExchange(&s_hitReactionInputLock, 1);
+        }
+        else if (wasReaction)
+        {
+            s_hitReactionPending = false;
+            InterlockedExchange(&s_hitReactionInputLock, 0);
+            VerbLog("[WASDCombat] hit_native_reaction_state_end");
+        }
+    }
 }
 
 // CharStats::chooseBlock - the AI's defence choice.  In manual-attack mode the
-// controlled character gets NO automatic block or dodge: the chooser returns
-// nothing (exactly what a failed block roll returns) and the hit lands.
+// controlled character gets NO autonomous defence: the chooser returns nothing
+// (exactly what a failed defence roll returns) and the hit lands.
 // Exceptions: a G block the player asked for (accepted press, within its hold
 // or perfect window), and a stagger in progress (the stumble reaction stays
-// vanilla).  Our own Q dodge and G pose never use the chooser.
+// vanilla). Ironwind's manual guard pose does not use this chooser; automatic
+// guard deliberately does, and may therefore receive a native block or dodge.
 static bool focusTargetValid(Character* t);   // fwd decls (lock-on helpers below)
+static bool focusTargetLoaded(Character* t);
+static bool manualVAttackTargetLive(Character* t);
 static bool focusLockLive();
+static CombatTechniqueData* (*s_chooseAttackOrig)(CharStats*, float, float, CombatTechniqueData*, bool);
+static CombatTechniqueData* chooseAttack_hook(CharStats* st, float range, float reach,
+                                               CombatTechniqueData* previous, bool stationary)
+{
+    if (!s_directionalCombat || !s_manualAttackOn || !s_attackDirectInitialising || !st
+        || st->me != s_freeMoveAnchor || s_attackDesiredForSwing == CUT_DEFAULT)
+        return s_chooseAttackOrig(st, range, reach, previous, stationary);
+
+    // Free-control attacks are action-first: the player's direction chooses a
+    // native move even when no target is in reach. The target is only a carrier
+    // that lets AttackState build its normal impact/defence context. Collect the
+    // current weapon's same-direction techniques from the native pool first,
+    // then supplement them by sampling the character's chooser at neutral
+    // reference ranges. Pick randomly; actual contact remains entirely native
+    // at the impact frame.
+    CutDirection wanted = (CutDirection)s_attackDesiredForSwing;
+    const float sampleRange[4] = { 0.0f, 5.0f, 12.0f, 25.0f };
+    CombatTechniqueData* choices[64];
+    int choiceCount = 0;
+    int poolChoiceCount = 0;
+    int wt = (int)st->currentWeaponType;
+    for (int i = 0; i < s_dcAttackCount && choiceCount < 64; ++i)
+    {
+        CombatTechniqueData* candidate = s_dcAttack[i];
+        if (!candidate || !(wt >= 0 && wt < 0x16 && candidate->skillTypes[wt])
+            || candidate->isBlock || candidate->isDodge
+            || candidate->animation.empty() || candidate->numImpactPoints() <= 0
+            || candidate->impactPoint(0)->direction != wanted) continue;
+        bool duplicate = false;
+        for (int j = 0; j < choiceCount; ++j)
+            if (choices[j] == candidate) { duplicate = true; break; }
+        if (!duplicate) choices[choiceCount++] = candidate;
+    }
+    poolChoiceCount = choiceCount;
+    for (int i = 0; i < 32; ++i)
+    {
+        CombatTechniqueData* candidate = s_chooseAttackOrig(
+            st, sampleRange[i / 8], reach, previous, stationary);
+        if (!candidate || candidate->isBlock || candidate->isDodge
+            || candidate->animation.empty() || candidate->numImpactPoints() <= 0
+            || candidate->impactPoint(0)->direction != wanted) continue;
+        bool duplicate = false;
+        for (int j = 0; j < choiceCount; ++j)
+            if (choices[j] == candidate) { duplicate = true; break; }
+        if (!duplicate && choiceCount < 64) choices[choiceCount++] = candidate;
+    }
+    if (choiceCount > 0)
+    {
+        int start = (int)(UtilityT::random() * choiceCount);
+        if (start >= choiceCount) start = choiceCount - 1;
+        CombatTechniqueData* picked = choices[start];
+        if (choiceCount > 1 && picked == previous)
+        {
+            for (int i = 1; i < choiceCount; ++i)
+            {
+                CombatTechniqueData* alternate = choices[(start + i) % choiceCount];
+                if (alternate != previous) { picked = alternate; break; }
+            }
+        }
+        int slot = combatDirectionSlot(wanted);
+        if (slot >= 0) s_dirMoveAvailable[slot] = 1;
+        char b[256];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] attack_direction_native_random dir=%d choices=%d pool=%d sampled=%d actual_range=%.2f reach=%.2f unarmed=%d anim=%s",
+            (int)wanted, choiceCount, poolChoiceCount, choiceCount - poolChoiceCount,
+            range, reach, st->currentWeaponType == SKILL_UNARMED ? 1 : 0,
+            picked->animation.c_str());
+        VerbLog(b);
+        return picked;
+    }
+    int slot = combatDirectionSlot(wanted);
+    if (slot >= 0) s_dirMoveAvailable[slot] = 0;
+    char b[176];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_direction_unavailable dir=%d actual_range=%.2f reach=%.2f unarmed=%d",
+        (int)wanted, range, reach,
+        st->currentWeaponType == SKILL_UNARMED ? 1 : 0);
+    VerbLog(b);
+    // The weapon/skill combination genuinely has no same-direction native move.
+    // Never substitute another direction merely to force an animation.
+    return nullptr;
+}
 static CombatTechniqueData* (*s_chooseBlockOrig)(CharStats* st, CutDirection dir, float opponentAttackSkill,
                                                  CutOrigination from, Character* opponent);
 static ULONGLONG s_manualBlockDeniedLogMs = 0;
@@ -7785,15 +9252,18 @@ static CombatTechniqueData* chooseBlock_hook(CharStats* st, CutDirection dir, fl
                                              CutOrigination from, Character* opponent)
 {
     ULONGLONG nowC = GetTickCount64();
+    bool liveHeldRequest = (s_directionalCombat && s_mouseBlockHeld && s_blockHeld)
+                        || (s_blockHeld && (nowC - s_blockHoldStartMs) <= (ULONGLONG)s_blockHoldMs);
     bool blockWanted = s_blockAcceptedPressMs != 0 && s_blockPressMs == s_blockAcceptedPressMs
                     && s_blockHoldStartMs != 0
-                    && ((s_blockHeld && (nowC - s_blockHoldStartMs) <= (ULONGLONG)s_blockHoldMs)
-                        || (nowC - s_blockHoldStartMs) <= (ULONGLONG)s_perfectWindowMs);
-    // AiBlocksInManual (default ON since build 48): the chooser stays vanilla, so
-    // the AI still blocks/dodges on its own with Z on; the denial below only runs
-    // when the user wants a fully manual defence.  (Log 2026-09-21: 293 denied
+                    && liveHeldRequest;
+    // RMB is the permission boundary in both modes.  Manual mode validates the
+    // player's direction later; automatic mode forwards the original chooser
+    // only while RMB is held, so Kenshi chooses the defence direction without
+    // gaining permission to defend (or take over combat) on its own.
+    // (Log 2026-09-21: 293 denied
     // blocks = 293 aborted block entries - a twitch and a stagger each.)
-    if (s_manualAttackOn && !s_settingAiBlocks && !blockWanted && s_mode == MODE_FREE_MOVE
+    if (s_manualAttackOn && !blockWanted && s_mode == MODE_FREE_MOVE
         && st && st->me && st->me == s_freeMoveAnchor && !s_dcShutdownInProgress && !s_loadGuardActive)
     {
         CombatClass* cc = st->me->getCombatClass();
@@ -7808,7 +9278,18 @@ static CombatTechniqueData* chooseBlock_hook(CharStats* st, CutDirection dir, fl
             return nullptr;
         }
     }
-    return s_chooseBlockOrig(st, dir, opponentAttackSkill, from, opponent);
+    CombatTechniqueData* picked = s_chooseBlockOrig(st, dir, opponentAttackSkill, from, opponent);
+    if (s_manualAttackOn && s_settingAiBlocks && blockWanted
+        && st && st->me && st->me == s_freeMoveAnchor)
+    {
+        char b[256];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] ai_block_choice incoming_dir=%d chosen=%d dodge=%d anim=%s",
+            (int)dir, picked ? 1 : 0, picked && picked->isDodge ? 1 : 0,
+            picked ? picked->animation.c_str() : "none");
+        VerbLog(b);
+    }
+    return picked;
 }
 
 // AIM FOCUS feeds the AI's "who": CombatClassAI::chooseAttackTarget (facing,
@@ -7823,6 +9304,10 @@ static bool focusLockLive()
 static Character* (*s_chooseAttackTargetOrig)(CombatClass* cc);
 static Character* chooseAttackTarget_hook(CombatClass* cc)
 {
+    if (cc && cc->me == s_freeMoveAnchor && s_attackIntentTarget
+        && s_attackIntentPressMs == s_attackAcceptedPressMs
+        && (s_attackActive || manualAttackCommitLive())
+        && focusTargetLoaded(s_attackIntentTarget)) return s_attackIntentTarget;
     if (cc && cc->me == s_freeMoveAnchor && focusLockLive()) return s_lockTarget;
     return s_chooseAttackTargetOrig(cc);
 }
@@ -7832,6 +9317,43 @@ static bool manualAttackCommitLive()
     return s_attackCommitUntilMs != 0 && GetTickCount64() < s_attackCommitUntilMs;
 }
 
+static bool manualAttackStartDirect(CombatClass* cc, Character* foe, ULONGLONG press);
+static void manualFreeActionTick();
+
+// A single release may be buffered while a swing or its configured recovery
+// owns the action layer.  The queue never survives a stagger/load and expires
+// quickly, so old input cannot fire after the player has changed context.
+static void manualAttackQueueTick()
+{
+    ULONGLONG queued = s_attackQueuedAtMs;
+    if (!queued) return;
+    ULONGLONG now = GetTickCount64();
+    if (now - queued > ATTACK_QUEUE_MS)
+    {
+        manualAttackClearQueuedInput(true);
+        VerbLog("[Ironwind] attack_queue_expired");
+        return;
+    }
+    if (s_staggerStartMs != 0 || s_attackActive || s_freeAttackTech
+        || now < s_attackRecoveryUntilMs)
+        return;
+    int direction = s_attackQueuedDirection;
+    Character* queuedTarget = s_attackQueuedTarget;
+    manualAttackClearQueuedInput(false);
+    if (direction == CUT_DEFAULT) return;
+    ULONGLONG syntheticPress = now;
+    if (syntheticPress <= s_attackSeenPressMs) syntheticPress = s_attackSeenPressMs + 1;
+    s_attackDesired = direction;
+    s_attackPressMs = syntheticPress;
+    s_attackIntentTarget = focusTargetLoaded(queuedTarget) && manualVAttackTargetLive(queuedTarget)
+        ? queuedTarget : nullptr;
+    s_attackIntentPressMs = s_attackIntentTarget ? syntheticPress : 0;
+    char b[160]; sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_queue_commit dir=%d age=%llu captured_target=%d",
+        direction, now - queued, s_attackIntentTarget ? 1 : 0);
+    VerbLog(b);
+}
+
 // Main thread, once per frame: a fresh Attack press becomes a commit window.
 static void manualAttackPressTick()
 {
@@ -7839,30 +9361,62 @@ static void manualAttackPressTick()
     if (press == 0 || press == s_attackSeenPressMs) return;
     s_attackSeenPressMs = press;
     ULONGLONG now = GetTickCount64();
+    Character* pressTarget = nullptr;
+    if (s_attackIntentPressMs == press && focusTargetLoaded(s_attackIntentTarget)
+        && manualVAttackTargetLive(s_attackIntentTarget))
+        pressTarget = s_attackIntentTarget;              // queued commit already associated it
+    else if (focusTargetLoaded(s_attackAimCapturedTarget)
+        && manualVAttackTargetLive(s_attackAimCapturedTarget))
+        pressTarget = s_attackAimCapturedTarget;         // live reticle at LMB-down
     const char* why = nullptr;
     if (!s_settingManualBlock || s_mode != MODE_FREE_MOVE || !s_freeMoveAnchor
         || s_dcShutdownInProgress || s_loadGuardActive)          why = "not_dc";
     else if (!s_manualAttackOn)                                   why = "manual_off";  // E is a manual-attack control
+    else if (manualHitReactionLive(s_freeMoveAnchor))             why = "native_reaction";
     else if (s_staggerStartMs != 0)                               why = "staggered";   // dropped, never buffered
-    else if (s_attackActive)                                      why = "in_flight";   // one swing until it finishes
-    else if (now < s_attackRecoveryUntilMs)                       why = "recovery";    // last swing's follow-through
+    else if (s_attackActive || s_freeAttackTech || now < s_attackRecoveryUntilMs)
+    {
+        bool repeat = s_attackAcceptedPressMs != 0 && press >= s_attackAcceptedPressMs
+                   && press - s_attackAcceptedPressMs < (ULONGLONG)s_inputRepeatGuardMs;
+        if (repeat) why = "repeat";
+        else
+        {
+            int direction = s_attackDesired;
+            if (direction == CUT_DEFAULT) direction = s_lastAttackDirection;
+            s_attackQueuedDirection = direction;
+            s_attackQueuedAtMs = press;
+            s_attackQueuedTarget = pressTarget;
+            manualAttackClearCapturedTarget();
+            char b[144]; sprintf_s(b, sizeof(b),
+                "[Ironwind] attack_queued dir=%d captured_target=%d",
+                direction, s_attackQueuedTarget ? 1 : 0);
+            VerbLog(b);
+            return;
+        }
+    }
     else if (s_attackAcceptedPressMs != 0 && press >= s_attackAcceptedPressMs
              && press - s_attackAcceptedPressMs < (ULONGLONG)s_inputRepeatGuardMs) why = "repeat";  // accidental double-tap
-    else if (s_dodgeActiveTech)                                 { why = "dodging_buffered"; s_attackAfterDodgeMs = press; }   // dodge-then-strike
-    else if (!s_freeMoveAnchor->isInCombatMode(true, true)
-             && (s_lastInCombatMs == 0 || now - s_lastInCombatMs > 1500)) why = "no_combat";
+    else if (s_freeAttackTech)                                  why = "free_swing_in_flight";
     if (why)
     {
-        char b[96];
-        sprintf_s(b, sizeof(b), "[WASDCombat] attack_press_ignored reason=%s", why);
+        CombatClass* ccTrace = (s_freeMoveAnchor && !s_loadGuardActive && !s_dcShutdownInProgress)
+                             ? s_freeMoveAnchor->getCombatClass() : nullptr;
+        char b[160];
+        sprintf_s(b, sizeof(b), "[WASDCombat] attack_press_ignored reason=%s manual=%d cc_active=%d mode=%d",
+                  why, s_manualAttackOn ? 1 : 0, ccTrace && ccTrace->combatModeActive ? 1 : 0, (int)s_mode);
         VerbLog(b);
+        manualAttackClearCapturedTarget();
         return;
     }
+    s_attackIntentTarget = pressTarget;
+    s_attackIntentPressMs = pressTarget ? press : 0;
+    manualAttackClearCapturedTarget();
     s_attackCommitUntilMs   = press + (ULONGLONG)s_attackWindowMs;
     s_attackAcceptedPressMs = press;
-    char b[96];
-    sprintf_s(b, sizeof(b), "[WASDCombat] attack_commit window=%.0f moving=%d",
-              s_attackWindowMs, (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0);
+    char b[128];
+    sprintf_s(b, sizeof(b), "[WASDCombat] attack_commit window=%.0f moving=%d captured_target=%d",
+              s_attackWindowMs, (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0,
+              pressTarget ? 1 : 0);
     VerbLog(b);
 }
 
@@ -7880,17 +9434,42 @@ static void manualBlockTick()
     if (!ou || !ou->player || ou->isLoadingFromASaveGame() || s_dcPtrLossActive) return;   // build 74: no anchor deref while ANY load flag is up
     manualAttackTick();
     manualAimTick();
+    manualAttackAimCaptureTick();
     manualStaggerTick();
-    manualDodgePressTick();
+    manualAttackQueueTick();
     manualAttackPressTick();
-    // "Held" = key down OR inside the perfect-block window after a press, so a
-    // tap keeps vanilla's BLOCK order (and its visible +20 melee defence) on for
-    // exactly the timing window - the HUD shows when the window is live.
-    // Key-follow (user 2026-09-18): the BLOCK order (and its "(+20)") is on
-    // exactly while the key is down; the perfect window itself is timed from
-    // the press in the verdict hook and does not need the key held.
-    // Timed block: a fresh press is accepted only off cooldown; the block then
-    // lasts while the key is down AND within BlockHoldMs of that press.
+    // AiBlocksInManual changes only who chooses the defence direction. RMB is
+    // still the player's hold-to-guard request in both modes. A mode transition
+    // retires the old mode's token once so stale manual directions/perfect
+    // windows cannot leak into the automatic chooser; the player then re-presses
+    // RMB under the new mode.
+    static int lastAiBlockMode = -1;
+    int aiBlockMode = s_settingAiBlocks ? 1 : 0;
+    if (aiBlockMode != lastAiBlockMode)
+    {
+        if (lastAiBlockMode != -1)
+        {
+            if (s_blockOrderApplied) manualBlockOrder(false);
+            s_blockHeld = false;
+            s_mouseBlockHeld = false;
+            s_blockGestureSeen = false;
+            s_blockHeldPrev = false;
+            s_blockPressMs = 0;
+            s_blockSeenPressMs = 0;
+            s_blockAcceptedPressMs = 0;
+            s_blockInjectedPressMs = 0;
+            s_blockHoldStartMs = 0;
+            s_blockReleaseMs = 0;
+            s_blockCooldownUntilMs = 0;
+        }
+        lastAiBlockMode = aiBlockMode;
+        VerbLog(aiBlockMode
+            ? "[Ironwind] block_mode mode=automatic_ai"
+            : "[Ironwind] block_mode mode=manual_directional");
+    }
+    // Directional and automatic guards live exactly while RMB is held.  The
+    // old non-directional keyboard fallback alone retains its hold budget and
+    // cooldown so existing INI-based DIY layouts keep their behaviour.
     ULONGLONG nowT = GetTickCount64();
     ULONGLONG pressT = s_blockPressMs;
     if (pressT != 0 && pressT != s_blockSeenPressMs)
@@ -7899,27 +9478,31 @@ static void manualBlockTick()
         // RESUME (input forgiveness): the block is still live (release + press
         // fell inside one frame) or was let go within the repeat guard, and the
         // hold budget is unspent -> the SAME block continues: no cooldown, the
-        // budget and the perfect window still run from the first press, and the
+        // budget still runs from the first press, and the
         // pose is not re-injected.  A fumbled double-tap no longer drops the
         // guard for BlockCooldownMs (the "got hit while I was blocking" case).
         bool budgetLeft = s_blockHoldStartMs != 0 && pressT >= s_blockHoldStartMs
                        && (pressT - s_blockHoldStartMs) < (ULONGLONG)s_blockHoldMs;
-        bool resume = budgetLeft
+        bool resume = !s_directionalCombat && budgetLeft
                    && (s_blockHeldPrev
                        || (s_blockReleaseMs != 0 && pressT >= s_blockReleaseMs
                            && (pressT - s_blockReleaseMs) <= (ULONGLONG)s_inputRepeatGuardMs));
         if (!s_manualAttackOn)
             VerbLog("[WASDCombat] block_press_ignored reason=manual_off");  // G is a manual-combat control (user 2026-09-29)
+        else if (manualHitReactionLive(s_freeMoveAnchor))
+            VerbLog("[WASDCombat] block_press_ignored reason=native_reaction");
         else if (s_staggerStartMs != 0)
             VerbLog("[WASDCombat] block_press_ignored reason=staggered");   // dropped, never buffered
-        else if (nowT < s_perfectRewardUntilMs)
+        else if (s_settingAiBlocks)
         {
-            // Perfect-block reward: a FRESH block (new hold budget + new perfect
-            // window) even inside the resume / cooldown windows.  Spends it.
+            // Automatic guard has no manual direction or cooldown. Its
+            // lifetime is exactly this RMB hold; chooseBlock_hook
+            // delegates each incoming defence choice to Kenshi.
             s_blockAcceptedPressMs = pressT;
-            s_blockHoldStartMs     = pressT;
-            s_perfectRewardUntilMs = 0;
-            VerbLog("[WASDCombat] block_press_reward");
+            s_blockHoldStartMs = pressT;
+            s_blockInjectedPressMs = 0;
+            s_blockCooldownUntilMs = 0;
+            VerbLog("[Ironwind] block_press_accepted mode=automatic_ai");
         }
         else if (resume)
         {
@@ -7937,16 +9520,16 @@ static void manualBlockTick()
         s_blockReleaseMs = 0;
     }
     bool pressLive = s_blockAcceptedPressMs != 0 && s_blockPressMs == s_blockAcceptedPressMs
-                  && s_blockHoldStartMs != 0
-                  && (nowT - s_blockHoldStartMs) <= (ULONGLONG)s_blockHoldMs;
+                   && s_blockHoldStartMs != 0
+                   && ((s_directionalCombat && s_mouseBlockHeld)
+                       || (nowT - s_blockHoldStartMs) <= (ULONGLONG)s_blockHoldMs);
     bool held = s_settingManualBlock && s_manualAttackOn && s_blockHeld && pressLive && s_mode == MODE_FREE_MOVE
              && !s_dcShutdownInProgress && !s_loadGuardActive && s_freeMoveAnchor;
     // Staggered: the BLOCK order is not applied (anti-cheese) - it comes on
     // the moment the stagger ends if the key is still down.
     if (held)
     {
-        CombatClass* ccH = s_freeMoveAnchor->getCombatClass();
-        if (ccH && ccH->combatModeActive && ccH->getCombatState() == STUMBLE) held = false;
+        if (manualHitReactionLive(s_freeMoveAnchor)) held = false;
     }
     // Anchor switched (F) while held: restore the old one, re-apply on the new.
     if (held && s_blockOrderApplied && s_blockOrderChar != s_freeMoveAnchor)
@@ -7957,28 +9540,29 @@ static void manualBlockTick()
     if (held != s_blockHeldPrev)
     {
         s_blockHeldPrev = held;
-        manualBlockOrder(held);
+        if (held) s_holdPosValid = false;  // capture the actual guard-press location
+        // Manual mode exposes its selected direction and the vanilla defensive
+        // order immediately. Automatic mode is permission only: pressing RMB
+        // must not force any idle/standing pose. It remains stationary via the
+        // movement gate, then enters native BLOCK only when a real incoming
+        // swing produces one original chooseBlock result.
+        if (!s_settingAiBlocks)
+            manualBlockOrder(held);
+        else
+        {
+            if (!held && s_blockOrderApplied) manualBlockOrder(false);
+            VerbLog(held ? "[Ironwind] ai_guard_request armed=1 pose=unchanged"
+                         : "[Ironwind] ai_guard_request armed=0 pose=unchanged");
+        }
         if (!held)
         {
-            s_blockCooldownUntilMs = (nowT < s_perfectRewardUntilMs) ? 0     // perfect reward: no cooldown
+            s_blockCooldownUntilMs = (s_settingAiBlocks || s_directionalCombat) ? 0
                                    : nowT + (ULONGLONG)s_blockCooldownMs;   // released or expired
             s_blockReleaseMs       = nowT;                                   // a re-press inside the repeat guard resumes
         }
     }
 }
 
-// --- MANUAL DODGE helpers ------------------------------------------------
-static bool manualDodgeArmed(Character* self)
-{
-    return s_settingManualBlock
-        && !s_dcShutdownInProgress && !s_loadGuardActive
-        && s_mode == MODE_FREE_MOVE
-        && self && self == s_freeMoveAnchor;
-}
-
-// Inject the dodge, once per press, from the combat-AI hook on the first idle
-// combat frame inside the commit window.  Writes exactly what the game's own
-// changeState + initialiseBlock write; blockState does the rest.
 // Pick a mod-owned block copy for the pose.  If the foe is mid-swing, match its
 // current impact direction converted into our frame (what the vanilla chooser
 // matches a block against); otherwise any block.
@@ -8014,9 +9598,25 @@ static bool focusTargetLoaded(Character* t)
     for (auto it = chars.begin(); it != chars.end(); ++it) if (*it == t) return true;
     return false;
 }
+
+// Kenshi reports isUnconcious()==true for more than a true knockout. In
+// particular PS_CRIPPLED (broken-leg crawl) and PS_PLAYING_DEAD characters can
+// still be deliberately attacked by the original combat system. Keep them in
+// target selection, while a real PS_KO or dead character remains ineligible.
+// This chooses only the native AttackState carrier; it never grants contact or
+// damage, which remain owned by Kenshi's attack zone and verdict path.
+static bool manualVAttackTargetLive(Character* t)
+{
+    if (!t || t->isDead()) return false;
+    ProneState prone = t->getProneState();
+    if (prone == PS_KO) return false;
+    if (prone == PS_CRIPPLED || prone == PS_PLAYING_DEAD) return true;
+    return !t->isUnconcious();
+}
+
 static bool focusTargetValid(Character* t)
 {
-    return focusTargetLoaded(t) && s_freeMoveAnchor && !t->isDead() && !t->isUnconcious()
+    return focusTargetLoaded(t) && s_freeMoveAnchor && manualVAttackTargetLive(t)
         && t->isEnemy(s_freeMoveAnchor, true);
 }
 
@@ -8029,6 +9629,8 @@ static bool manualAimYaw(float& yawOut)
     if (s_otsCamActive)      { yawOut = s_otsYaw;  return true; }
     return false;
 }
+static bool focusProject(Ogre::Camera* cam, Ogre::Vector3 gamePos, float pullToCam, int& sx, int& sy);
+static bool focusBonePos(Character* t, const char* bone, float fallbackUp, Ogre::Vector3& out);
 
 // Directional aim: the live hostile nearest to the view ray within reach and
 // inside the aim cone (angle first, distance second).  nullptr = nobody aimed at.
@@ -8051,11 +9653,644 @@ static Character* manualAimPick(Character* me, float range)
         if (d2 < 1e-4f || d2 >= maxR2) continue;
         float d = sqrtf(d2), cosA = (dx * fx + dz * fz) / d;
         if (cosA < cosCone) continue;
-        if (c->isDead() || c->isUnconcious() || c->isDown() || !c->isEnemy(me, true)) continue;   // downed = not attackable
+        if (!manualVAttackTargetLive(c) || !c->isEnemy(me, true)) continue;
         float score = (1.0f - cosA) * 100.0f + d * 0.05f;   // angle first, distance second
         if (score < bestScore) { bestScore = score; best = c; }
     }
     return best;
+}
+
+static bool manualVPlayerTeamMember(Character* target)
+{
+    if (!target) return false;
+    if (target->isPlayerCharacter()) return true;
+    // Recruited mod characters can report false from isPlayerCharacter().
+    // PlayerInterface's roster is the authoritative backstop for squad safety.
+    if (!ou || !ou->player) return false;
+    const lektor<Character*>& pcs = ou->player->playerCharacters;
+    for (auto it = pcs.begin(); it != pcs.end(); ++it)
+        if (*it == target) return true;
+    return false;
+}
+
+static bool manualVTargetAllowed(Character* me, Character* target)
+{
+    // Faction allies outside the player's squad remain deliberate attack
+    // targets when the reticle covers them; only the player's team is safe.
+    return me && target && target != me && !manualVPlayerTeamMember(target);
+}
+
+static bool manualUnarmedCombat(CharStats* stats)
+{
+    return stats && stats->currentWeaponType == SKILL_UNARMED;
+}
+
+// Use the exact world-space reach calculated by Kenshi's combat class.  The raw
+// weapon-data length returned by getCurrentWeaponLength() is not in movement
+// world units (v52 selected no target at ordinary melee spacing), while the
+// longestReachingAttack member is ABI-stale (v51 climbed from 2269 to 4519).
+// The upper bound is only a corruption guard, not a gameplay reach clamp.
+// Kenshi intentionally reports zero here while fighting unarmed: martial-arts
+// techniques carry their own native range data and the original chooser still
+// accepts that zero.  It is therefore a valid chooser argument, not a broken
+// weapon accessor and never a reason to disable the unarmed move set.
+static float manualOriginalMeleeReach(Character* me)
+{
+    CharStats* stats = me ? me->getStats() : nullptr;
+    CombatClass* cc = me ? me->getCombatClass() : nullptr;
+    if (!stats || !cc) return 0.0f;
+    float reach = (cc->*DcRobResult<DcWeaponReachTag>::ptr)();
+    if (reach == 0.0f && manualUnarmedCombat(stats)) return 0.0f;
+    if (!(reach > 0.0f && reach <= 250.0f))
+    {
+        static ULONGLONG lastInvalidLogMs = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastInvalidLogMs >= 1000)
+        {
+            lastInvalidLogMs = now;
+            char b[176]; sprintf_s(b, sizeof(b),
+                "[Ironwind] weapon_reach_invalid combat=%.2f weapon_length=%.2f stale_field=%.2f weapon=%d",
+                reach, stats->getCurrentWeaponLength(), stats->longestReachingAttack,
+                (int)stats->currentWeaponType);
+            VerbLog(b);
+        }
+        return 0.0f;
+    }
+    return reach;
+}
+
+// A positive reach is required for equipped melee weapons.  Empty-hand combat
+// is the one native exception: pass Kenshi's own zero through to chooseAttack
+// so martial-arts skill, injuries, encumbrance and technique requirements stay
+// authoritative instead of inventing a weapon-like range in the plugin.
+static bool manualAttackChooserReach(Character* me, float& reach)
+{
+    CharStats* stats = me ? me->getStats() : nullptr;
+    reach = manualOriginalMeleeReach(me);
+    return reach > 0.0f || manualUnarmedCombat(stats);
+}
+
+// The long-lived aim focus is useful for name/health UI and deliberate RMB
+// locks, but in a crowd it can remain on a centred enemy 30-60 units away
+// while another hostile is directly in front of the blade.  For a fresh LMB
+// only, find the distance-first hostile inside the same view cone.  This is
+// target ownership for native AttackState initialisation, never a contact or
+// damage test; the original attack zone remains authoritative.
+static Character* manualMeleeForwardHostilePick(Character* me, float range,
+                                                 float coneDegrees,
+                                                 float* distanceOut)
+{
+    if (distanceOut) *distanceOut = -1.0f;
+    float yaw;
+    if (!me || !me->movement || !s_gwFrame || range <= 0.0f
+        || !manualAimYaw(yaw)) return nullptr;
+    const Ogre::Vector3 mp = me->movement->pos;
+    const float fx = -sinf(yaw), fz = -cosf(yaw);
+    const float cosCone = cosf(coneDegrees * 0.0174533f);
+    const float maxR2 = range * range;
+    Character* best = nullptr;
+    float bestDistance = -1.0f, bestScore = 1e9f;
+    auto& chars = s_gwFrame->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it)
+    {
+        Character* c = *it;
+        if (!c || c == me || !c->movement || !manualVAttackTargetLive(c)
+            || !c->isEnemy(me, true)) continue;
+        float dx = c->movement->pos.x - mp.x, dz = c->movement->pos.z - mp.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < 1e-4f || d2 >= maxR2) continue;
+        float d = sqrtf(d2);
+        float cosA = (dx * fx + dz * fz) / d;
+        if (cosA < cosCone) continue;
+        // Distance leads, with enough centre bias that two similarly close
+        // enemies still follow the crosshair instead of flickering by range.
+        float score = d + (1.0f - cosA) * range;
+        if (score < bestScore)
+        {
+            bestScore = score;
+            bestDistance = d;
+            best = c;
+        }
+    }
+    if (distanceOut) *distanceOut = bestDistance;
+    return best;
+}
+
+// A no-focus LMB must not decide whether the swing can ever deal damage.  If
+// the directional search found nobody, use the nearest hostile only as the
+// native AttackState's execution carrier.  This helper is deliberately
+// direction-blind: it neither turns the player nor authorises a hit.  Kenshi's
+// original attack zone still decides which bodies the weapon actually reaches,
+// including bodies other than this carrier.
+static Character* manualNearestHostileCarrier(Character* me, float range,
+                                               float* distanceOut)
+{
+    if (distanceOut) *distanceOut = -1.0f;
+    if (!me || !me->movement || !s_gwFrame || range <= 0.0f) return nullptr;
+    const Ogre::Vector3 mp = me->movement->pos;
+    const float maxR2 = range * range;
+    Character* best = nullptr;
+    float best2 = maxR2;
+    auto& chars = s_gwFrame->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it)
+    {
+        Character* c = *it;
+        if (!c || c == me || !c->movement || !manualVAttackTargetLive(c)
+            || !c->isEnemy(me, true)
+            || !manualVTargetAllowed(me, c)) continue;
+        float dx = c->movement->pos.x - mp.x, dz = c->movement->pos.z - mp.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < 1e-4f || d2 >= best2) continue;
+        best2 = d2;
+        best = c;
+    }
+    if (best && distanceOut) *distanceOut = sqrtf(best2);
+    return best;
+}
+
+// Intent is only aim/focus selection: the native combat state machine owns
+// range, attack-zone, contact, blocking and damage for both hostile focused and
+// neutral unprovoked orders.  Selection may use the weapon data length as a
+// broad "who did the player mean" radius; it never grants damage.  V mode never
+// targets the squad.
+static Character* manualAttackIntentPick(Character* me)
+{
+    float yaw;
+    if (!me || !me->movement || !s_gwFrame || !manualAimYaw(yaw)) return nullptr;
+    Character* aimedHostile = (s_lockTarget && focusTargetValid(s_lockTarget))
+        ? s_lockTarget : manualAimPick(me, s_aimRange);
+    const Ogre::Vector3 mp = me->movement->pos;
+    float aimedHostileDistance = aimedHostile && aimedHostile->movement
+        ? mp.distance(aimedHostile->movement->pos) : -1.0f;
+    float forwardHostileDistance = -1.0f;
+    Character* forwardHostile = manualMeleeForwardHostilePick(
+        me, s_aimRange, s_aimConeDeg, &forwardHostileDistance);
+    Character* nativeHostile = aimedHostile;
+    // An RMB click is an explicit lock. Automatic sticky focus is only
+    // replaced when the forward candidate is materially closer, avoiding
+    // target churn between two enemies standing at almost the same range.
+    bool hostileRetargeted = false;
+    if (!s_aimClicked && forwardHostile
+        && (!aimedHostile || aimedHostileDistance < 0.0f
+            || (aimedHostileDistance > forwardHostileDistance + 8.0f
+                && aimedHostileDistance > forwardHostileDistance * 1.35f)))
+    {
+        nativeHostile = forwardHostile;
+        hostileRetargeted = nativeHostile != aimedHostile;
+    }
+    if (hostileRetargeted)
+    {
+        char rb[176]; sprintf_s(rb, sizeof(rb),
+            "[Ironwind] attack_hostile_retarget aimed_dist=%.1f forward_dist=%.1f",
+            aimedHostileDistance, forwardHostileDistance);
+        VerbLog(rb);
+    }
+    const float reach = manualOriginalMeleeReach(me);
+    CharStats* stats = me->getStats();
+    const bool unarmed = manualUnarmedCombat(stats);
+    float intentReach = reach;
+    const float weaponLength = stats ? stats->getCurrentWeaponLength() : 0.0f;
+    if (weaponLength > intentReach && weaponLength <= 250.0f)
+        intentReach = weaponLength;
+    // A broken helper reach disables only the neutral/free path. Hostile target
+    // eligibility remains entirely native and must not depend on this accessor.
+    // Unarmed combat has no weapon reach by design.  It may capture a neutral
+    // only when the reticle actually covers the body, inside the ordinary aim
+    // radius.  That supplies an intent carrier; native AttackState still owns
+    // martial-arts contact range and cannot be extended by this selection.
+    if (intentReach <= 0.0f && !unarmed) return nativeHostile;
+    const float selectionReach = intentReach > 0.0f ? intentReach : s_aimRange;
+    const float maxR2 = selectionReach * selectionReach;
+    const float fx = -sinf(yaw), fz = -cosf(yaw);
+    const float cosNeutralArc = cosf(25.0f * 0.0174533f);
+    Ogre::Camera* cam = ou && ou->player && ou->player->camera
+        ? ou->player->camera->camera : nullptr;
+    MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+    const float aimX = view.width * 0.5f, aimY = view.height * 0.5f;
+    Character* precise = nullptr;
+    Character* neutralArc = nullptr;
+    float preciseScore = 1e9f, neutralArcScore = 1e9f;
+    int preciseCandidates = 0, neutralArcCandidates = 0;
+    int nearbyCharacters = 0;
+    int rawNearby = 0, squadExcluded = 0, factionAlliesNearby = 0;
+    float nearestCharacter = -1.0f;
+    float nearestNonhostileMiss = 1e9f;
+    float nearestNonhostileDx = -1.0f, nearestNonhostileDy = -1.0f;
+    auto& chars = s_gwFrame->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it)
+    {
+        Character* c = *it;
+        if (!c || c == me || !c->movement || !manualVAttackTargetLive(c)) continue;
+        float dx = c->movement->pos.x - mp.x, dz = c->movement->pos.z - mp.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 < 120.0f * 120.0f)
+        {
+            ++rawNearby;
+            if (manualVPlayerTeamMember(c)) ++squadExcluded;
+            else if (c->isAlly(me, true)) ++factionAlliesNearby;
+        }
+        if (!manualVTargetAllowed(me, c)) continue;
+        if (d2 < 120.0f * 120.0f)
+        {
+            ++nearbyCharacters;
+            float distance = sqrtf(d2);
+            if (nearestCharacter < 0.0f || distance < nearestCharacter)
+                nearestCharacter = distance;
+        }
+        if (d2 < 1e-4f || d2 >= maxR2) continue;
+        float d = sqrtf(d2), cosA = (dx * fx + dz * fz) / d;
+        bool enemy = c->isEnemy(me, true);
+        // The neutral helper requires the reticle to overlap the projected body,
+        // not merely lie near its chest. Hostile contact is never decided here.
+        // chest. A height-scaled width also works for large close characters.
+        if (!enemy && cam && view.width > 0 && view.height > 0)
+        {
+            Ogre::Vector3 head, chest, hips;
+            int hx, hy, cx, cy, px, py, feetX, feetY;
+            if (focusBonePos(c, "Bip01 Head", 18.0f, head)
+                && focusBonePos(c, "Bip01 Spine1", 11.0f, chest)
+                && focusBonePos(c, "Bip01 Pelvis", 5.0f, hips)
+                && focusProject(cam, head, 0.0f, hx, hy)
+                && focusProject(cam, chest, 0.0f, cx, cy)
+                && focusProject(cam, hips, 0.0f, px, py)
+                && focusProject(cam, c->movement->pos + Ogre::Vector3(0.0f, 1.0f, 0.0f),
+                                0.0f, feetX, feetY))
+            {
+                // Include the legs and a small screen-space margin.  The
+                // previous head-to-pelvis box missed visibly aimed targets
+                // by only a few pixels horizontally or below the pelvis.
+                int topPx = hy < cy ? hy : cy;
+                if (py < topPx) topPx = py;
+                if (feetY < topPx) topPx = feetY;
+                int bottomPx = hy > cy ? hy : cy;
+                if (py > bottomPx) bottomPx = py;
+                if (feetY > bottomPx) bottomPx = feetY;
+                float top = (float)topPx - 14.0f;
+                float bottom = (float)bottomPx + 18.0f;
+                float bodyHeight = bottom - top;
+                float halfWidth = bodyHeight * 0.16f + 8.0f;
+                if (halfWidth < 24.0f) halfWidth = 24.0f;
+                if (halfWidth > 65.0f) halfWidth = 65.0f;
+                float centerX = (cx + px) * 0.5f;
+                if (aimY > (float)py && feetY != py)
+                {
+                    float t = (aimY - py) / (float)(feetY - py);
+                    if (t < 0.0f) t = 0.0f;
+                    if (t > 1.0f) t = 1.0f;
+                    centerX = px + (feetX - px) * t;
+                }
+                float missX = fabsf(aimX - centerX) - halfWidth;
+                float missY = aimY < top ? top - aimY : (aimY > bottom ? aimY - bottom : 0.0f);
+                if (missX < 0.0f) missX = 0.0f;
+                if (missX + missY < nearestNonhostileMiss)
+                {
+                    nearestNonhostileMiss = missX + missY;
+                    nearestNonhostileDx = missX;
+                    nearestNonhostileDy = missY;
+                }
+                if (fabsf(aimX - centerX) <= halfWidth && aimY >= top && aimY <= bottom)
+                {
+                    ++preciseCandidates;
+                    float screenScore = fabsf(aimX - centerX) / halfWidth + d * 0.02f;
+                    if (screenScore < preciseScore)
+                    { preciseScore = screenScore; precise = c; }
+                }
+            }
+        }
+        // The approximate neutral arc depends on a verified weapon reach.
+        // Empty hands require explicit body coverage to avoid selecting a
+        // bystander at an arbitrary plugin-defined martial-arts distance.
+        if (!enemy && intentReach > 0.0f && cosA >= cosNeutralArc)
+        {
+            ++neutralArcCandidates;
+            // Angle first, then distance. This stays narrow so an off-centre
+            // bystander is not selected when shoulder parallax misses the body.
+            float score = (1.0f - cosA) * 150.0f + d * 0.1f;
+            if (score < neutralArcScore)
+            { neutralArcScore = score; neutralArc = c; }
+        }
+    }
+    // An explicitly covered neutral wins. Otherwise combat focus wins before
+    // the parallax helper, so a nearby bystander cannot steal an enemy swing.
+    Character* best = precise ? precise : (nativeHostile ? nativeHostile : neutralArc);
+    char b[432];
+    sprintf_s(b, sizeof(b), "[Ironwind] attack_pick mode=%s hostile=%d precise=%d candidates=%d/%d/%d dist=%.1f neutral_miss=%.0f/%.0f nearby=%d raw=%d squad=%d allies=%d nearest=%.1f unarmed=%d",
+              precise ? "neutral_reticle" : (nativeHostile ? "native_hostile" : (neutralArc ? "neutral_arc" : "none")),
+              best && best->isEnemy(me, true) ? 1 : 0, precise ? 1 : 0,
+              nativeHostile ? 1 : 0, preciseCandidates, neutralArcCandidates,
+              best && best->movement ? mp.distance(best->movement->pos) : -1.0f,
+              nearestNonhostileDx, nearestNonhostileDy, nearbyCharacters,
+              rawNearby, squadExcluded, factionAlliesNearby, nearestCharacter,
+              unarmed ? 1 : 0);
+    VerbLog(b);
+    return best;
+}
+
+// Capture deliberate intent on the first game-thread frame of LMB-down, before
+// the directional mouse stroke also rotates the OTS/FP view.  v56 field data
+// repeatedly had a neutral 7-8 units away but no release-time candidate after
+// the stroke moved the projected body 70-150 px off the reticle.  The pointer
+// is still revalidated on release and at impact; this changes target ownership,
+// not weapon reach or the final contact test.
+static void manualAttackAimCaptureTick()
+{
+    if (s_attackAimCancelled)
+    {
+        manualAttackClearCapturedTarget();
+        return;
+    }
+    ULONGLONG started = s_attackAimStartedMs;
+    if (!s_attackAimHeld || !started || started == s_attackAimCapturedStartMs) return;
+    s_attackAimCapturedStartMs = started;
+    s_attackAimCapturedTarget = manualAttackIntentPick(s_freeMoveAnchor);
+    Character* target = s_attackAimCapturedTarget;
+    bool neutralOrigin = false;
+    if (!target)
+    {
+        manualAttackClearNeutralIntent();
+    }
+    else if (target == s_attackNeutralIntentTarget)
+    {
+        // initialiseAttack can mutate relations even when it returns false.
+        // Preserve the LMB-down provenance while the player keeps aiming at
+        // the same actor; only a different selection replaces it.
+        neutralOrigin = true;
+    }
+    else
+    {
+        neutralOrigin = !target->isEnemy(s_freeMoveAnchor, true)
+            && !s_freeMoveAnchor->isEnemy(target, true);
+        s_attackNeutralIntentTarget = neutralOrigin ? target : nullptr;
+    }
+    char b[192];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_press_target captured=%d hostile=%d neutral_origin=%d",
+        target ? 1 : 0,
+        target && target->isEnemy(s_freeMoveAnchor, true) ? 1 : 0,
+        neutralOrigin ? 1 : 0);
+    VerbLog(b);
+}
+
+// Nearby interaction target selection. Unlike attack intent this is forgiving:
+// a close character in the central view is selected without pixel-perfect body
+// overlap. Distance dominates the score, then screen offset breaks ties.
+static int s_interactionPickSeen = 0;
+static float s_interactionPickNearestPx = -1.0f;
+static float s_interactionPickNearestDist = -1.0f;
+static float s_interactionPickSelectedDist = -1.0f;
+static Character* manualInteractionPick(Character* me)
+{
+    s_interactionPickSeen = 0;
+    s_interactionPickNearestPx = s_interactionPickNearestDist = -1.0f;
+    s_interactionPickSelectedDist = -1.0f;
+    if (!me || !me->movement || !s_gwFrame || !ou || !ou->player
+        || !ou->player->camera) return nullptr;
+    Ogre::Camera* cam = ou->player->camera->camera;
+    if (!cam) return nullptr;
+    MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+    if (view.width <= 0 || view.height <= 0) return nullptr;
+    const float aimX = view.width * 0.5f, aimY = view.height * 0.5f;
+    const Ogre::Vector3 mp = me->movement->pos;
+    const float maxR2 = 40.0f * 40.0f;
+    Character* best = nullptr;
+    float bestScore = 1e9f;
+    auto& chars = s_gwFrame->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it)
+    {
+        Character* c = *it;
+        if (!c || c == me || !c->movement) continue;
+        if (c->isEnemy(me, true) && !c->isDead() && c->getProneState() != PS_KO)
+            continue; // a live hostile remains a combat target, not an E prompt
+        Ogre::Vector3 delta = c->movement->pos - mp;
+        delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        if (d2 >= maxR2) continue;
+        Ogre::Vector3 head, chest, hips;
+        int hx, hy, cx, cy, px, py, feetX, feetY;
+        if (!focusBonePos(c, "Bip01 Head", 18.0f, head)
+            || !focusBonePos(c, "Bip01 Spine1", 11.0f, chest)
+            || !focusBonePos(c, "Bip01 Pelvis", 5.0f, hips)) continue;
+        bool headOk = focusProject(cam, head, 0.0f, hx, hy);
+        bool chestOk = focusProject(cam, chest, 0.0f, cx, cy);
+        bool hipsOk = focusProject(cam, hips, 0.0f, px, py);
+        bool feetOk = focusProject(cam, c->movement->pos + Ogre::Vector3(0.0f, 1.0f, 0.0f),
+                                   0.0f, feetX, feetY);
+        if (!chestOk && !hipsOk && !headOk) continue;
+        ++s_interactionPickSeen;
+        int top = chestOk ? cy : (hipsOk ? py : hy);
+        int bottom = top;
+        if (headOk && hy < top) top = hy;
+        if (hipsOk && py < top) top = py;
+        if (feetOk && feetY < top) top = feetY;
+        if (headOk && hy > bottom) bottom = hy;
+        if (hipsOk && py > bottom) bottom = py;
+        if (feetOk && feetY > bottom) bottom = feetY;
+        float upper = (float)top - 28.0f;
+        float lower = (float)bottom + 32.0f;
+        float halfWidth = (lower - upper) * 0.16f + 8.0f;
+        if (halfWidth < 40.0f) halfWidth = 40.0f;
+        if (halfWidth > 90.0f) halfWidth = 90.0f;
+        float centerX = chestOk ? (float)cx : (hipsOk ? (float)px : (float)hx);
+        if (chestOk && hipsOk) centerX = (cx + px) * 0.5f;
+        if (hipsOk && feetOk && aimY > py && feetY != py)
+        {
+            float t = (aimY - py) / (float)(feetY - py);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            centerX = px + (feetX - px) * t;
+        }
+        float missX = fabsf(aimX - centerX) - halfWidth;
+        float missY = aimY < upper ? upper - aimY : (aimY > lower ? aimY - lower : 0.0f);
+        if (missX < 0.0f) missX = 0.0f;
+        float miss = missX + missY;
+        if (s_interactionPickNearestPx < 0.0f || miss < s_interactionPickNearestPx)
+        {
+            s_interactionPickNearestPx = miss;
+            s_interactionPickNearestDist = sqrtf(d2);
+        }
+        // Close proximity provides the selection; the broad view gate only
+        // prevents an NPC behind the camera or at the extreme edge stealing E.
+        if (missX > 280.0f || missY > 240.0f)
+            continue;
+        float score = sqrtf(d2) * 0.20f + miss * 0.012f
+                    + fabsf(aimX - centerX) * 0.002f;
+        if (c == s_interactionAutoTarget) score -= 1.25f; // stable until another target is clearly better
+        if (score < bestScore)
+        {
+            bestScore = score;
+            best = c;
+            s_interactionPickSelectedDist = sqrtf(d2);
+        }
+    }
+    return best;
+}
+
+// The native context menu is a hold-RMB UI.  Opening it directly without a
+// matching held input lets PlayerInterface close it on the following update.
+
+// Vanilla player talk: the NPC owns the dialogue package and receives
+// EV_PLAYER_TALK_TO_ME with the player as the other party.  Squad members
+// keep the full order menu so medic, inventory and follow stay one click away.
+static bool manualHasPlayerTalk(Character* me, Character* target)
+{
+    if (!me || !target || target->isDead()) return false;
+    if (target->isEnemy(me, true)) return false;
+    if (!target->hasDialogue() || !target->dialogue) return false;
+    return target->dialogue->hasDialogueEvent(EV_PLAYER_TALK_TO_ME);
+}
+
+static void manualInteractionTargetTick()
+{
+    bool allow = false;
+    int tint = 0;
+    Character* selected = nullptr;
+    if (s_mode == MODE_FREE_MOVE && s_directionalCombat
+        && (s_firstPersonActive || s_otsCamActive) && s_freeMoveAnchor
+        && !s_dcShutdownInProgress && !s_loadGuardActive
+        && !s_cameraUiOpen && !dcUiWantsCursor() && ou && ou->player)
+    {
+        Character* t = manualInteractionPick(s_freeMoveAnchor);
+        if (t && focusTargetLoaded(t))
+        {
+            selected = t;
+            allow = manualHasPlayerTalk(s_freeMoveAnchor, t);
+            tint = (t->isAlly(s_freeMoveAnchor, true)
+                    || manualVPlayerTeamMember(t)) ? 2 : 1;
+        }
+    }
+    if (selected != s_interactionAutoTarget)
+    {
+        s_interactionAutoTarget = selected;
+        char b[192];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] interact_target selected=%d distance=%.1f seen=%d miss_px=%.1f",
+            selected ? 1 : 0, selected ? s_interactionPickSelectedDist : -1.0f,
+            s_interactionPickSeen, s_interactionPickNearestPx);
+        VerbLog(b);
+    }
+    s_allowTalkCursor = allow;
+    s_xhairTint = tint;
+}
+
+// One-shot E interaction. Target selection stays automatic and combat remains
+// active; only the native menu temporarily receives the pointer. We never call
+// ContextMenuGUI::optionSelected ourselves: its own widgets execute the order.
+static void manualInteractionActionTick()
+{
+    bool valid = s_mode == MODE_FREE_MOVE && s_directionalCombat
+        && s_manualAttackOn && s_freeMoveAnchor
+        && !s_dcShutdownInProgress && !s_loadGuardActive
+        && !s_dcPtrLossActive;
+    if (s_interactionMenuByE)
+    {
+        bool visible = valid && ou && ou->player
+            && ou->player->contextMenu.isVisible();
+        if (!visible)
+        {
+            s_interactionMenuByE = false;
+            VerbLog("[Ironwind] interact_menu_closed");
+        }
+    }
+    if (!s_interactionRequested) return;
+    s_interactionRequested = false;
+
+    if (s_interactionMenuByE && ou && ou->player)
+    {
+        if (s_gwFrame) s_gwFrame->hideContextMenu();
+        s_interactionMenuByE = false;
+        VerbLog("[Ironwind] interact_menu_closed reason=e_toggle");
+        return;
+    }
+    if (!valid)
+    {
+        VerbLog("[Ironwind] interact_mode_denied reason=context");
+        return;
+    }
+    if (s_cameraUiOpen || dcUiWantsCursor())
+    {
+        VerbLog("[Ironwind] interact_mode_denied reason=ui");
+        return;
+    }
+    bool busy = s_attackAimHeld || s_attackActive || manualAttackCommitLive()
+        || s_freeAttackTech
+        || s_mouseBlockHeld || s_blockHeld
+        || manualHitReactionLive(s_freeMoveAnchor);
+    if (busy)
+    {
+        VerbLog("[Ironwind] interact_mode_denied reason=committed_action");
+        return;
+    }
+    Character* target = manualInteractionPick(s_freeMoveAnchor);
+    if (!target || !focusTargetLoaded(target))
+    {
+        VerbLog("[Ironwind] interact_no_target");
+        return;
+    }
+    s_interactionAutoTarget = target;
+    // Never carry a combat edge into the native menu.
+    s_rmbCombatEdgeSeenMs = s_rmbCombatEdgeMs;
+    s_rmbCombatEdgeMs = 0;
+    s_attackAimHeld = false;
+    s_attackAimCancelled = false;
+    s_attackHeld = false;
+    s_mouseBlockHeld = false;
+    s_blockHeld = false;
+    s_blockGestureSeen = false;
+    ou->player->contextMenu.showContextMenu(true, target);
+    s_interactionMenuByE = ou->player->contextMenu.isVisible();
+    char b[224];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] interact_menu_open visible=%d distance=%.1f target_dead=%d target_ko=%d",
+        s_interactionMenuByE ? 1 : 0, s_interactionPickSelectedDist,
+        target->isDead() ? 1 : 0, target->getProneState() == PS_KO ? 1 : 0);
+    VerbLog(b);
+}
+
+// Runs at the top of the game-thread frame, before the block press is consumed.
+// Outside the explicit interaction layer RMB is unconditionally guard: hold
+// duration can never reinterpret the press as a menu or dialogue request.
+static void manualConsumeCombatRmb()
+{
+    ULONGLONG edge = s_rmbCombatEdgeMs;
+    if (edge && edge != s_rmbCombatEdgeSeenMs)
+    {
+        s_rmbCombatEdgeSeenMs = edge;
+        if (!ou || !ou->player || ou->isLoadingFromASaveGame() || s_dcPtrLossActive
+            || s_dcShutdownInProgress || s_loadGuardActive
+            || !mouseCombatContext() || !s_freeMoveAnchor || dcUiWantsCursor())
+            return;
+        if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) == 0) return;
+        CutDirection recent = combatRecentDirection();
+        CutDirection guard = recent;
+        CutDirection gesture = CUT_DEFAULT;
+        if (!s_settingAiBlocks)
+        {
+            s_blockGestureSeen = recent != CUT_DEFAULT;
+            if (guard == CUT_DEFAULT) guard = (CutDirection)s_lastAttackDirection;
+            if (guard == CUT_DEFAULT) guard = CUT_DOWNWARD;
+            gesture = guard;
+            guard = combatGuardDirectionFromGesture(gesture);
+            s_blockDesired = guard;
+            s_mouseBlockHeld = true;
+            s_blockHeld = true;
+            s_blockPressMs = edge;
+        }
+        else
+        {
+            // The player still owns the WHEN: holding RMB requests defence.
+            // Direction stays unset so the original chooser owns the HOW.
+            s_mouseBlockHeld = true;
+            s_blockHeld = true;
+            s_blockPressMs = edge;
+            s_blockGestureSeen = false;
+        }
+
+        char b[192];
+        sprintf_s(b, sizeof(b), "[Ironwind] interact_rmb_block mode=%s gesture_dir=%d guard_dir=%d gesture=%d social_armed=0",
+                  s_settingAiBlocks ? "automatic_ai" : "manual_directional",
+                  (int)gesture, (int)guard, s_blockGestureSeen ? 1 : 0);
+        VerbLog(b);
+    }
 }
 
 // The foe every manual action uses: the LOCKED target, else whoever the view is
@@ -8084,7 +10319,7 @@ static Character* manualAimHoverPick(Character* me, Ogre::Camera* cam, float rad
         if (!c || c == me || !c->movement) continue;
         float dx = c->movement->pos.x - me3.x, dz = c->movement->pos.z - me3.z;
         if (dx * dx + dz * dz >= maxR2) continue;
-        if (c->isDead() || c->isUnconcious() || c->isDown() || !c->isEnemy(me, true)) continue;
+        if (!manualVAttackTargetLive(c) || !c->isEnemy(me, true)) continue;
         Ogre::Vector3 chest; int sx, sy;
         if (!focusBonePos(c, "Bip01 Spine1", 11.0f, chest) || !focusProject(cam, chest, 0.0f, sx, sy)) continue;
         float px = (float)(sx - mp.left), py = (float)(sy - mp.top);
@@ -8161,14 +10396,20 @@ static void manualAimTick()
         s_aimLogged = s_lockTarget;
         DebugLog(s_lockTarget ? "[WASDCombat] aim_focus set" : "[WASDCombat] aim_focus none");
     }
-    if (!s_lockTarget) return;
     CombatClass* cc = s_freeMoveAnchor->getCombatClass();
-    if (cc && cc->currentTarget != s_lockTarget) cc->currentTarget = s_lockTarget;   // AI target = the aim focus
+    if (cc && s_attackIntentTarget && s_attackIntentPressMs == s_attackAcceptedPressMs
+        && (s_attackActive || manualAttackCommitLive())
+        && focusTargetLoaded(s_attackIntentTarget))
+    {
+        if (cc->currentTarget != s_attackIntentTarget) cc->currentTarget = s_attackIntentTarget;
+    }
+    else if (cc && s_lockTarget && cc->currentTarget != s_lockTarget)
+        cc->currentTarget = s_lockTarget;   // AI target = the aim focus
 }
 
 // Block POSE on a G press (user 2026-09-18: a press during the enemy's swing
-// blocked without the pose, or the AI's own block came too late).  Same shape
-// as the dodge inject: the game's chooser picks the block technique (the
+// blocked without the pose, or the AI's own block came too late). The manual
+// block pool supplies a block technique (the
 // DEFENSIVE order and the perfect window keep the chooser open for us), then
 // the changeState(BLOCK) writes; blockState starts a block technique's clip
 // itself (it only pre-checks progress for dodges).  The perfect-block verdict
@@ -8177,162 +10418,216 @@ static void manualAimTick()
 static Character* manualAttackFindFoe(CombatClass* cc, Character* me);   // fwd decl
 static void manualBlockInject(CombatClass* cc)
 {
+    if (s_settingAiBlocks) return;
     ULONGLONG press = s_blockPressMs;
     if (press == 0 || press == s_blockInjectedPressMs || press != s_blockAcceptedPressMs) return;
     ULONGLONG now = GetTickCount64();
-    if (now - press > 300) { s_blockInjectedPressMs = press; return; }   // stale press
-    if (!cc->combatModeActive) return;                                    // wait for combat (short)
+    if (now - press > 300 && !s_blockHeld) { s_blockInjectedPressMs = press; return; }
+    if (!cc->combatModeActive)
+    {
+        static ULONGLONG s_loggedBlockWaitPress = 0;
+        if (s_loggedBlockWaitPress != press)
+        {
+            s_loggedBlockWaitPress = press;
+            VerbLog("[IronwindTrace] block_inject_wait cc_active=0");
+        }
+        return;
+    }                                    // wait for combat (short)
     s_blockInjectedPressMs = press;
     swordStateEnum st = cc->getCombatState();
-    if (st == STUMBLE || s_dodgeActiveTech || s_attackActive) return;
+    if (st == STUMBLE || s_attackActive) return;
     if (st == BLOCK && cc->currentTechnique) return;                      // already blocking
     Character* me = cc->me;
     CharStats* stats = me ? me->getStats() : nullptr;
     if (!stats) return;
-    // Build 62: the technique copies were only built on the first Q press of a
-    // session (log 2026-09-30: a session with no dodge = every G press
-    // "block_inject_no_technique", no pose at all).  Build them here too.
-    manualDodgeBuildCopies();
-    Character* foe = glintIncomingAttacker();          // build 61: whoever is swinging at us (any direction)
+    manualBlockBuildCopies();
+    Character* foe = incomingAttackAttacker();         // build 61: whoever is swinging at us (any direction)
     bool fromSwing = foe != nullptr;
     if (!foe) foe = manualAttackFindFoe(cc, me);       // else the aimed / current / biggest-threat enemy
     if (!foe || !foe->getStats()) { VerbLog("[WASDCombat] block_inject_no_target"); return; }
-    // Exactly like the dodge: OUR copies, never the chooser (the chooser needs
-    // the exact incoming cut and returned nothing 54 times in the field).
+    // Use block-only copies, never a dodge record. The chooser needs the exact
+    // incoming cut and returned nothing 54 times in the field.
     int want = -1;
     CombatTechniqueData* t = nullptr;
-    if (stats->currentWeaponType == SKILL_UNARMED) t = manualDodgePick(false);   // unarmed: no block techniques exist
-    else                                            t = manualBlockPick(me, foe, &want);
+    t = manualBlockPick(me, foe, &want);
     if (!t) { VerbLog("[WASDCombat] block_inject_no_technique"); return; }
     cc->currentTechnique = t;
     cc->blockingTarget   = foe;
-    bool played = false;
-    if (t->isDodge && s_dodgePlayFn && cc->animation)        // (unarmed: a dodge technique needs the clip started)
-    {
-        std::string suffix;
-        s_dodgePlayFn((void*)cc->animation, t, stats->blockSpeed * t->animSpeedMultiplier, &suffix);
-        played = true;
-    }
     cc->techniqueIntegrityCheckTimer = stats->calculateTechniqueInegrityCheckTimer();
     cc->stateTimer   = 0.2f;
     cc->nextMove     = BLOCK;
     cc->combatState  = BLOCK;
     char b[160];
-    sprintf_s(b, sizeof(b), "[WASDCombat] block_inject anim=%s want=%d dodge=%d played=%d state_was=%d press_age=%llu from_swing=%d",
-              t->animation.c_str(), want, t->isDodge ? 1 : 0, played ? 1 : 0, (int)st, now - press, fromSwing ? 1 : 0);
+    sprintf_s(b, sizeof(b), "[WASDCombat] block_inject anim=%s want=%d state_was=%d press_age=%llu from_swing=%d",
+              t->animation.c_str(), want, (int)st, now - press, fromSwing ? 1 : 0);
     VerbLog(b);
 }
 
-static void manualDodgeInject(CombatClass* cc)
+// Automatic guard is still player-authorised: RMB must be held and the native
+// attackingYou notification must identify a currently live enemy swing.  The
+// original CharStats::chooseBlock performs the skill/weapon/direction choice;
+// we only deliver its one result to the native BLOCK state.  v86 merely let the
+// AI decision frame run while the player was otherwise pinned in WAIT, which
+// often never reached chooseBlock before impact and produced no guard at all.
+static void manualAutoBlockInject(CombatClass* cc)
 {
-    ULONGLONG press = s_dodgePressMs;
-    if (press == 0 || press == s_dodgeInjectedPressMs || !manualDodgeCommitLive()) return;
-    if (!cc->combatModeActive) return;                 // the AI re-engages combat first (1-2 frames)
-    swordStateEnum st = cc->getCombatState();
-    // HIGH PRIORITY (user 2026-09-18): the dodge overrides whatever the AI is
-    // doing - its swing, its block, its waiting.  While STAGGERED (STUMBLE) the
-    // normal dodges are off and only the game's stumble dodges are available
-    // (the ones the AI itself plays out of a stagger) - anti-cheese.
-    bool stumbling = (st == STUMBLE);
-    if (s_staggerStartMs != 0 || stumbling) return;    // never out of a stagger (a confirmed one drops the press; a blip clears in a frame)
-    Character* me = cc->me;
-    CharStats* stats = me ? me->getStats() : nullptr;
-    if (!stats) return;
-    s_dodgeInjectedPressMs = press;                    // one dodge per press
+    if (!s_settingAiBlocks || !s_blockHeldPrev || !cc || !cc->me
+        || cc->me != s_freeMoveAnchor || !s_chooseBlockOrig) return;
+    if (s_attackActive || manualHitReactionLive(cc->me)) return;
+    swordStateEnum state = cc->getCombatState();
+    if (state == STUMBLE || state == REACTION_BLOCK) return;
+    if (state == BLOCK && cc->currentTechnique) return;
 
-    // Who are we dodging?  CRASH LESSON (dump 2026-09-18 12:37, AV at
-    // chooseBlock+0x5E = `mov rdx,[opponent]`): the chooser dereferences its
-    // opponent unconditionally - vanilla only ever calls it with a real
-    // attacker.  So: the AI's biggest threat, else its current/attack target,
-    // else the nearest live hostile in range; with NO foe there is no dodge.
-    Character* foe = manualFoeResolve(cc, me);       // lock, else the enemy you are looking at
-    if (!foe) foe = cc->getBiggestThreat(cc->threats, 0.0f);
-    if (!foe) foe = cc->currentTarget;
-    if (!foe) foe = cc->_getAttackTarget().getCharacter();
-    if (!foe && s_gwFrame && me->movement)
+    ULONGLONG now = GetTickCount64();
+    Character* foe = nullptr;
+    ULONGLONG swingStart = 0;
+    for (int i = 0; i < INCOMING_ATTACK_MAX; ++i)
     {
-        const Ogre::Vector3 mp = me->movement->pos;
-        const float maxR2 = 40.0f * 40.0f;
-        float best2 = -1.0f;
-        auto& chars = s_gwFrame->getCharacterUpdateList();
-        for (auto it = chars.begin(); it != chars.end(); ++it)
+        const IncomingAttackSlot& g = s_incomingAttack[i];
+        if (!g.who || g.impactMs != 0 || now - g.startMs >= 4000
+            || !focusTargetLoaded(g.who) || g.who->isDead() || g.who->isUnconcious()) continue;
+        CombatClass* attackerCombat = g.who->getCombatClass();
+        swordStateEnum attackerState = attackerCombat
+            ? attackerCombat->getCombatState() : COMBAT_FINISHED;
+        if (!attackerCombat || !attackerCombat->combatModeActive
+            || (attackerState != STARTUP_STATE && attackerState != CHOP_WEAPON)) continue;
+        if (!foe || g.startMs < swingStart)
         {
-            Character* c = *it;
-            if (!c || c == me || !c->movement) continue;
-            float dx = c->movement->pos.x - mp.x, dz = c->movement->pos.z - mp.z;
-            float d2 = dx * dx + dz * dz;
-            if (d2 >= maxR2 || (best2 >= 0.0f && d2 >= best2)) continue;
-            if (c->isDead() || c->isUnconcious() || c->isDown()) continue;   // downed = not attackable
-            if (!c->isEnemy(me, true)) continue;
-            best2 = d2; foe = c;
+            foe = g.who;
+            swingStart = g.startMs;
         }
     }
-    if (!foe || !foe->getStats())
+    if (!foe || swingStart == 0) return;
+    if (foe == s_autoBlockAttemptWho && swingStart == s_autoBlockAttemptStartMs) return;
+
+    CombatClass* attackerCombat = foe->getCombatClass();
+    CombatTechniqueData* attack = attackerCombat ? attackerCombat->currentTechnique : nullptr;
+    if (!attack || attack->isBlock || attack->numImpactPoints() <= 0) return;
+    int section = attackerCombat->currentComboSection;
+    if (section < 0) section = 0;
+    if (section >= attack->numImpactPoints()) section = attack->numImpactPoints() - 1;
+    CombatTechniqueData::ImpactPoint* impact = attack->impactPoint(section);
+    CharStats* defenderStats = cc->me->getStats();
+    CharStats* attackerStats = foe->getStats();
+    if (!impact || !defenderStats || !attackerStats) return;
+
+    // Spend the swing before calling game code. A null choice is a legitimate
+    // native failed defence and must not be rerolled on the following frame.
+    s_autoBlockAttemptWho = foe;
+    s_autoBlockAttemptStartMs = swingStart;
+    float versus = attackerStats->getMeleeAttack();
+    if (versus < 0.0f) versus = 0.0f;
+    CutOrigination from = cc->me->getAttackOriginationDirection(foe);
+    CutDirection incoming = cc->me->convertCutDirection(impact->direction, from);
+    CombatTechniqueData* picked = s_chooseBlockOrig(
+        defenderStats, impact->direction, versus, from, foe);
+
+    if (!picked)
     {
-        VerbLog("[WASDCombat] dodge_no_target (no hostile to dodge - press ignored)");
-        s_dodgeCommitUntilMs = 0;                      // movement is yours again
+        char miss[176];
+        sprintf_s(miss, sizeof(miss),
+            "[Ironwind] ai_block_attempt chosen=0 incoming_dir=%d from=%d versus=%.1f",
+            (int)incoming, (int)from, versus);
+        VerbLog(miss);
         return;
     }
-    float versus = foe->getStats()->getMeleeAttack();
-    if (versus < 0.0f) versus = 0.0f;                  // animals / no melee stat read as -1
 
-    // PICK one of OUR copies - never the chooser (its null-opponent crash, its
-    // unarmed-only dodge roll and its AI weighting are all out of the loop).
-    CombatTechniqueData* t = manualDodgePick(stumbling);
-    if (!t)
-    {
-        DebugLog(stumbling ? "[WASDCombat] dodge_no_technique (no stumble dodge copies)"
-                           : "[WASDCombat] dodge_no_technique (no dodge copies built)");
-        s_dodgeCommitUntilMs = 0;
-        return;
-    }
-
-    // ROLL honestly: vanilla dodge chance (Dodge +bonus via getDodge) vs the foe.
-    float chance = stats->calculateDodgeChance(versus, false);   // reads getDodge(true) -> +bonus
-    float roll   = UtilityT::random() * 100.0f;
-    s_dodgeRollOk = roll <= chance;
-
-    // INJECT, in initialiseBlock's order: technique + target, START THE CLIP,
-    // timers, then the changeState(BLOCK, 0.2) writes.  The clip start is the
-    // step blockState cannot do for us: it reads the technique's progress first
-    // and an un-started clip reads 1.01 (> 0.98 = finished), which ended every
-    // injected dodge on its first frame in builds 11-14.
-    cc->currentTechnique = t;
-    cc->blockingTarget   = foe;
+    cc->currentTechnique = picked;
+    cc->blockingTarget = foe;
     bool played = false;
-    if (s_dodgePlayFn && cc->animation)
+    if (picked->isDodge && cc->animation)
     {
-        std::string suffix;                            // dodges take no " override" suffix
-        float speed = stats->blockSpeed * t->animSpeedMultiplier;
-        s_dodgePlayFn((void*)cc->animation, t, speed, &suffix);
-        played = true;
+        nativeDefenceResolvePlayFn();
+        if (s_defencePlayFn)
+        {
+            std::string suffix;
+            float speed = defenderStats->blockSpeed * picked->animSpeedMultiplier;
+            s_defencePlayFn((void*)cc->animation, picked, speed, &suffix);
+            played = true;
+        }
     }
-    cc->techniqueIntegrityCheckTimer = stats->calculateTechniqueInegrityCheckTimer();
-    cc->stateTimer                   = 0.2f;
-    cc->nextMove                     = BLOCK;
-    cc->combatState                  = BLOCK;
-    s_dodgeActiveTech    = t;
-    s_dodgeCommitUntilMs = GetTickCount64() + 1200;    // keep WASD buffered for the clip (bounded)
+    cc->techniqueIntegrityCheckTimer = defenderStats->calculateTechniqueInegrityCheckTimer();
+    // Automatic RMB is pose-neutral until this real incoming swing. Re-enter
+    // the combat animation layer only now, immediately before native BLOCK.
+    // This replaces the old press-time combat idle / defensive standing order.
+    if (cc->animation) cc->animation->setCombatMode(true);
+    cc->combatModeActive = true;
+    cc->stateTimer = 0.2f;
+    cc->nextMove = BLOCK;
+    cc->combatState = BLOCK;
+    s_autoBlockActiveTech = picked;
 
-    char b[192];
-    sprintf_s(b, sizeof(b), "[WASDCombat] dodge_inject anim=%s stumbling=%d played=%d foe=%d vsSkill=%.0f chance=%.0f roll=%.0f ok=%d state_was=%d press_age=%llu",
-              t->animation.c_str(), stumbling ? 1 : 0, played ? 1 : 0, foe ? 1 : 0, versus, chance, roll, s_dodgeRollOk ? 1 : 0,
-              (int)st, GetTickCount64() - press);
-    VerbLog(b);
+    char ok[288];
+    sprintf_s(ok, sizeof(ok),
+        "[Ironwind] ai_block_attempt chosen=1 incoming_dir=%d from=%d versus=%.1f dodge=%d explicit_play=%d anim=%s",
+        (int)incoming, (int)from, versus, picked->isDodge ? 1 : 0,
+        played ? 1 : 0, picked->animation.c_str());
+    VerbLog(ok);
 }
 
-// Resolve a foe for the attack (same order as the dodge; the chooser is never
-// involved here, but startupState needs a current target or it ends combat).
+// Resolve a foe for the attack; startupState needs a current target or it ends combat.
 static Character* manualAttackFindFoe(CombatClass* cc, Character* me)
 {
+    if (manualAttackCommitLive() && s_attackAcceptedPressMs)
+    {
+        if (s_attackIntentPressMs != s_attackAcceptedPressMs)
+        {
+            s_attackIntentPressMs = s_attackAcceptedPressMs;
+            s_attackIntentTarget = manualAttackIntentPick(me);
+            if (s_attackIntentTarget)
+                VerbLog(s_attackIntentTarget->isEnemy(me, true)
+                    ? "[Ironwind] attack_aim_target hostile=1"
+                    : "[Ironwind] attack_aim_target hostile=0");
+        }
+        if (focusTargetLoaded(s_attackIntentTarget) && manualVAttackTargetLive(s_attackIntentTarget)
+            && (s_mode != MODE_FREE_MOVE || manualVTargetAllowed(me, s_attackIntentTarget)))
+            return s_attackIntentTarget;
+        // Free-control swings are not target-gated. If the reticle did not
+        // capture anyone, a hostile in the broad forward hemisphere may carry
+        // the native AttackState so its real attack zone can decide incidental
+        // contact. This never selects neutrals or squad members and never grants
+        // damage by itself; empty space still falls through to a visual air swing.
+        float carrierDistance = -1.0f;
+        Character* carrier = manualMeleeForwardHostilePick(
+            me, s_aimRange, 80.0f, &carrierDistance);
+        if (carrier && manualVTargetAllowed(me, carrier))
+        {
+            char cb[128];
+            sprintf_s(cb, sizeof(cb),
+                "[Ironwind] attack_incidental_carrier dist=%.1f", carrierDistance);
+            VerbLog(cb);
+            return carrier;
+        }
+        // The old forward-only carrier made target acquisition at the release
+        // frame a permanent damage gate: five v79 swings became visual-only
+        // even though the reticle acquired an enemy while the blade was moving.
+        // A nearby hostile now keeps the original AttackState alive; the real
+        // attack zone, block/dodge verdict and victim _getHit remain untouched.
+        // The v79 visual-only samples had their nearest hostile at 44-50 while
+        // the reticle AimRange is 40.  Use the same broad 2x range already used
+        // by display/threat fallbacks.  This still cannot extend weapon reach:
+        // it only supplies AttackState's required owner and its native zone may
+        // (and usually will) report zero contacts at that distance.
+        carrier = manualNearestHostileCarrier(me, s_aimRange * 2.0f, &carrierDistance);
+        if (carrier)
+        {
+            char cb[144];
+            sprintf_s(cb, sizeof(cb),
+                "[Ironwind] attack_incidental_carrier_anywhere dist=%.1f", carrierDistance);
+            VerbLog(cb);
+            return carrier;
+        }
+        return nullptr;
+    }
     Character* foe = manualFoeResolve(cc, me);       // lock, else the enemy you are looking at
-    if (!foe) foe = cc->currentTarget;                 // the AI's own target (getNearestEnemyInAttackZone is protected)
-    if (!foe) foe = cc->getBiggestThreat(cc->threats, 0.0f);
-    if (!foe) foe = cc->_getAttackTarget().getCharacter();
+    if (!foe && focusTargetValid(cc->currentTarget)) foe = cc->currentTarget;
+    if (!foe) { Character* t = cc->getBiggestThreat(cc->threats, 0.0f); if (focusTargetValid(t)) foe = t; }
+    if (!foe) { Character* t = cc->_getAttackTarget().getCharacter(); if (focusTargetValid(t)) foe = t; }
     if (!foe && s_gwFrame && me->movement)
     {
         const Ogre::Vector3 mp = me->movement->pos;
-        const float maxR2 = 40.0f * 40.0f;
+        const float reach = manualOriginalMeleeReach(me);
+        const float maxR2 = reach * reach;
         float best2 = -1.0f;
         auto& chars = s_gwFrame->getCharacterUpdateList();
         for (auto it = chars.begin(); it != chars.end(); ++it)
@@ -8342,7 +10637,7 @@ static Character* manualAttackFindFoe(CombatClass* cc, Character* me)
             float dx = c->movement->pos.x - mp.x, dz = c->movement->pos.z - mp.z;
             float d2 = dx * dx + dz * dz;
             if (d2 >= maxR2 || (best2 >= 0.0f && d2 >= best2)) continue;
-            if (c->isDead() || c->isUnconcious() || c->isDown()) continue;   // downed = not attackable
+            if (!manualVAttackTargetLive(c)) continue;
             if (!c->isEnemy(me, true)) continue;
             best2 = d2; foe = c;
         }
@@ -8350,177 +10645,1084 @@ static Character* manualAttackFindFoe(CombatClass* cc, Character* me)
     return foe;
 }
 
-// Inject the swing, once per press, from the combat-AI hook: the AI's own
-// STARTUP -> CHOP_WEAPON entry (checkForNeedBlock's shape with nextMove =
-// CHOP_WEAPON); vanilla picks the technique, plays it, and lands it.
-static void manualAttackInject(CombatClass* cc)
+// The free-action animation is ours, but the active technique is also part of
+// Kenshi's native attacker state.  Defenders inspect it after attackingYou()
+// to choose and time their ordinary block.  Clear only the pointer we own.
+static void manualFreeAttackClearTechnique(CombatClass* cc)
 {
-    ULONGLONG press = s_attackPressMs;
-    if (press == 0 || press == s_attackInjectedPressMs || press != s_attackAcceptedPressMs
-        || !manualAttackCommitLive()) return;
-    if (!cc->combatModeActive) return;                 // the AI re-engages combat first (1-2 frames)
-    swordStateEnum st = cc->getCombatState();
-    if (st == STUMBLE) return;                         // no swing out of a stagger (anti-cheese)
-    if (s_dodgeActiveTech) return;                     // let the dodge finish
-    Character* me = cc->me;
-    if (!me) return;
-    s_attackInjectedPressMs = press;                   // one swing per press
-    Character* foe = manualAttackFindFoe(cc, me);
-    if (!foe)
+    if (cc && s_freeAttackTech && cc->currentTechnique == s_freeAttackTech)
     {
-        VerbLog("[WASDCombat] attack_no_target (no hostile in range - press ignored)");
-        s_attackCommitUntilMs = 0;
+        cc->currentTechnique = nullptr;
+        cc->currentTechniqueHasFinished = false;
+    }
+    s_freeAttackTech = nullptr;
+}
+
+// V controls can animate before Kenshi has entered its target-driven combat
+// state.  These no-target clips are visual actions only: native combat still
+// decides all hits, defence and XP when a hostile is present.
+static void manualEnsureWeaponReady(Character* me, CharStats* stats)
+{
+    if (!me || !stats) return;
+    CharacterHuman* human = me->isHuman();
+    if (!human || human->weaponInHands) return;
+    Inventory* inv = me->getInventory();
+    if (!inv || !inv->hasWeaponEquipped())
+    {
+        if (!s_weaponMissingLogged)
+        {
+            s_weaponMissingLogged = true;
+            VerbLog(manualUnarmedCombat(stats)
+                ? "[Ironwind] weapon_ready unarmed"
+                : "[Ironwind] weapon_ready no_equipped_weapon");
+        }
         return;
     }
-    if (cc->currentTarget != foe) cc->currentTarget = foe;   // startupState re-asserts it via setAttackTarget
-    cc->stateTimer   = 0.0f;
-    cc->nextMove     = CHOP_WEAPON;
-    cc->combatState  = STARTUP_STATE;
-    s_attackActive        = true;
-    s_attackSawChop       = false;
-    s_attackActiveSinceMs = GetTickCount64();
-    s_attackCommitUntilMs = s_attackActiveSinceMs + 1500;   // keep WASD buffered through the swing (bounded)
-    char b[160];
-    float distF = (me->movement && foe->movement) ? me->movement->pos.distance(foe->movement->pos) : -1.0f;
-    sprintf_s(b, sizeof(b), "[WASDCombat] attack_inject state_was=%d press_age=%llu moving=%d dist=%.0f locked=%d",
-              (int)st, s_attackActiveSinceMs - press, (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0,
-              distF, (foe == s_lockTarget) ? 1 : 0);   // locked= aim focus hit
+    s_weaponMissingLogged = false;
+    Weapon* weapon = me->getThePreferredWeapon();
+    if (!weapon) weapon = inv->getPrimaryWeapon();
+    if (!weapon) weapon = inv->getSecondaryWeapon();
+    if (!weapon) return;
+    std::string sectionName;
+    lektor<InventorySection*>& sections = inv->getAllSections();
+    for (unsigned int i = 0; i < sections.size(); ++i)
+        if (sections[i] && sections[i]->hasItem(weapon)) { sectionName = sections[i]->name; break; }
+    s_weaponDrawInProgress = true;
+    bool drawn = me->drawWeapon(weapon, sectionName);
+    s_weaponDrawInProgress = false;
+    char b[192]; sprintf_s(b, sizeof(b),
+        "[Ironwind] weapon_draw attempted=1 ok=%d section=%d hand_after=%d unarmed_after=%d type=%d current=%d",
+        drawn ? 1 : 0, sectionName.empty() ? 0 : 1,
+        human->weaponInHands ? 1 : 0, stats->isUnarmed() ? 1 : 0,
+        (int)weapon->getCategory(), (int)stats->currentWeaponType);
     VerbLog(b);
 }
 
-// The swing is over once the machine has left STARTUP/CHOP_WEAPON (or never
-// got there within a bounded time - e.g. the target walked out of reach).
+static void (*s_sheatheWeaponOrig)(CharacterHuman* me);
+static void sheatheWeapon_hook(CharacterHuman* me)
+{
+    if (me && me == s_freeMoveAnchor && s_mode == MODE_FREE_MOVE && s_manualAttackOn
+        && !s_loadGuardActive && !s_dcShutdownInProgress && !s_weaponDrawInProgress)
+    {
+        Inventory* inv = me->getInventory();
+        if (me->weaponInHands && inv && inv->hasWeaponEquipped()
+            && !me->isUnconcious() && !me->isDown() && !me->isRagdoll()
+            && !s_lootUiSuspendActive)
+        {
+            static ULONGLONG lastLogMs = 0;
+            ULONGLONG now = GetTickCount64();
+            if (now - lastLogMs > 1000)
+            {
+                lastLogMs = now;
+                VerbLog("[Ironwind] human_auto_sheathe_suppressed weapon_in_hands=1");
+            }
+            return;
+        }
+    }
+    s_sheatheWeaponOrig(me);
+}
+
+// Free actions do not enter CombatClass's STARTUP/BLOCK state machine.  Read
+// the SingleAnimation that Kenshi is actually advancing; completion or
+// removal of that clip ends the action.  The watchdog only releases a clip
+// that never appeared or has frozen, and is not the intended action duration.
+static bool manualFreeClipFinished(AnimationClass* animation, CombatTechniqueData* technique,
+                                   bool& seen, float& previousProgress, ULONGLONG startMs, float speed,
+                                   ULONGLONG* lastAdvanceMs = nullptr)
+{
+    if (!technique) return false;
+    AnimationClassBase::SingleAnimation* playing = manualPlayingTechnique(animation, technique);
+    if (playing)
+    {
+        ULONGLONG now = GetTickCount64();
+        float length = 0.0f;
+        float progress = manualClipTimeline(playing, &length);
+        if (progress >= 0.0f)
+        {
+            // The old instance of the same move can remain at frame 1.0.
+            if (progress < 0.25f && !playing->mainState->hasEnded()) seen = true;
+            if (seen)
+            {
+                float actualSpeed = speed > 0.1f ? speed : 1.0f;
+                ULONGLONG earliestEnd = (ULONGLONG)(length * 1000.0f / actualSpeed);
+                bool ended = playing->mainState->hasEnded() || progress >= 1.0f
+                          || playing->currentFrameTime01 >= 0.98f
+                          || (previousProgress > 0.45f && previousProgress - progress > 0.35f);
+                if (progress > previousProgress + 0.001f)
+                {
+                    previousProgress = progress;
+                    if (lastAdvanceMs) *lastAdvanceMs = now;
+                }
+                // This is a freeze guard, not an action timer: a slow clip is
+                // valid as long as its real Ogre timeline keeps advancing.
+                if (lastAdvanceMs && *lastAdvanceMs && progress > 0.05f && progress < 0.98f
+                    && playing->weight > 0.10f && !playing->mainState->hasEnded()
+                    && now - *lastAdvanceMs > 1500)
+                {
+                    char b[144]; sprintf_s(b, sizeof(b),
+                        "[Ironwind] free_animation_watchdog stalled progress=%.2f ms=%llu",
+                        progress, now - *lastAdvanceMs);
+                    VerbLog(b);
+                    return true;
+                }
+                if (ended && now - startMs >= earliestEnd) return true;
+            }
+        }
+    }
+    else if (seen && previousProgress > 0.45f) return true;
+    // A clip which never acquired an Ogre timeline has not actually started.
+    // Release that failed action promptly; live clips retain the long guard.
+    ULONGLONG watchdog = previousProgress < 0.0f ? 3000 : 15000;
+    if (startMs && GetTickCount64() - startMs > watchdog)
+    {
+        VerbLog("[Ironwind] free_animation_watchdog no_complete_clip");
+        return true;
+    }
+    return false;
+}
+
+// v38: recompute the per-direction attack availability for the current
+// anchor + weapon. Mirrors the free-attack commit eligibility exactly (pool
+// scan first, chooser sampling as the fallback for directions the pool
+// missed), so the HUD can distinguish directions a release can actually use.
+// Game thread only; self-gated to ~600 ms and to anchor/weapon changes.
+// Unknown (-1) is rendered white like an unavailable direction, and real
+// commits overwrite the cache with ground truth.
+static void manualRefreshDirMoveAvailability()
+{
+    if (!s_freeMoveAnchor || s_dcShutdownInProgress || s_loadGuardActive) return;
+    if (!s_manualAttackOn || !s_directionalCombat) return;
+    Character* me = s_freeMoveAnchor;
+    CharStats* stats = me->getStats();
+    if (!stats) return;
+    CharacterHuman* human = me->isHuman();
+    int wt = (int)stats->currentWeaponType;
+    int hands = human && human->weaponInHands ? 1 : 0;
+    ULONGLONG now = GetTickCount64();
+    if (me == s_dirMoveAnchor && wt == s_dirMoveWeaponType && hands == s_dirMoveHands
+        && now - s_dirMoveCheckedMs < 600)
+        return;
+    // v39: no pool requirement. The RVA-based pool may be empty, so chooser
+    // sampling remains the fallback for capability display. Direction colour
+    // describes the weapon/skill move set, never target distance.
+    s_dirMoveAnchor = me;
+    s_dirMoveWeaponType = wt;
+    s_dirMoveHands = hands;
+    s_dirMoveCheckedMs = now;
+    bool poolHit[4] = { false, false, false, false };
+    for (int i = 0; i < s_dcAttackCount; ++i)
+    {
+        CombatTechniqueData* t = s_dcAttack[i];
+        if (!(wt >= 0 && wt < 0x16 && t->skillTypes[wt])) continue;
+        if (t->isBlock || t->isDodge || t->animation.empty()) continue;
+        if (t->numImpactPoints() > 0)
+        {
+            int slot = combatDirectionSlot((CutDirection)(int)t->impactPoint(0)->direction);
+            if (slot >= 0) poolHit[slot] = true;
+        }
+    }
+    bool chooseHit[4] = { false, false, false, false };
+    if (s_chooseAttackOrig)
+    {
+        float reach = 0.0f;
+        if (manualAttackChooserReach(me, reach))
+        {
+            const float sampleRange[4] = { 0.0f, 5.0f, 12.0f, 25.0f };
+            for (int i = 0; i < 32; ++i)
+            {
+                CombatTechniqueData* t = s_chooseAttackOrig(stats, sampleRange[i / 8], reach,
+                                                              nullptr, false);
+                if (!t || t->isBlock || t->isDodge || t->animation.empty()) continue;
+                if (t->numImpactPoints() > 0)
+                {
+                    int slot = combatDirectionSlot((CutDirection)(int)t->impactPoint(0)->direction);
+                    if (slot >= 0) chooseHit[slot] = true;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < 4; ++i)
+        s_dirMoveAvailable[i] = (poolHit[i] || chooseHit[i]) ? 1 : 0;
+    // Log only when the picture changes (or once every 5 s while it holds) -
+    // the 600 ms refresh itself spammed ~1.7 lines/s in the field (v40 log).
+    static int s_lastLoggedKey = -1;
+    static ULONGLONG s_lastLoggedMs = 0;
+    int key = (poolHit[0] ? 1 : 0) | (poolHit[1] ? 2 : 0) | (poolHit[2] ? 4 : 0)
+            | (poolHit[3] ? 8 : 0) | (chooseHit[0] ? 16 : 0) | (chooseHit[1] ? 32 : 0)
+            | (chooseHit[2] ? 64 : 0) | (chooseHit[3] ? 128 : 0)
+            | (wt << 8) | (hands << 16)
+            | (manualUnarmedCombat(stats) ? (1 << 17) : 0);
+    if (key != s_lastLoggedKey || now - s_lastLoggedMs >= 5000)
+    {
+        s_lastLoggedKey = key;
+        s_lastLoggedMs = now;
+        char b[176]; sprintf_s(b, sizeof(b),
+            "[Ironwind] dir_move_avail pool=%d%d%d%d choose=%d%d%d%d weapon=%d hands=%d unarmed=%d",
+            poolHit[0] ? 1 : 0, poolHit[1] ? 1 : 0, poolHit[2] ? 1 : 0, poolHit[3] ? 1 : 0,
+            chooseHit[0] ? 1 : 0, chooseHit[1] ? 1 : 0, chooseHit[2] ? 1 : 0, chooseHit[3] ? 1 : 0,
+            wt, hands, manualUnarmedCombat(stats) ? 1 : 0);
+        VerbLog(b);
+    }
+}
+
+static void manualFreeActionTick()
+{
+    manualRefreshDirMoveAvailability();
+    if (!s_freeMoveAnchor || s_dcShutdownInProgress || s_loadGuardActive) return;
+    CombatClass* cc = s_freeMoveAnchor->getCombatClass();
+    if (!cc || !cc->animation) return;
+    Character* me = cc->me;
+    CharStats* stats = me ? me->getStats() : nullptr;
+    if (!stats) return;
+    ULONGLONG now = GetTickCount64();
+    // v42: do not replay a free swing/guard over the native hit-reaction entry
+    // after the original loop has just processed the impact.  The verdict hook
+    // drops our action bookkeeping; the native reaction now exclusively owns
+    // the combat animation layer until its state and short entry window end.
+    if (manualHitReactionLive(me)) return;
+    bool pendingAttack = s_attackPressMs && s_attackPressMs == s_attackAcceptedPressMs
+                      && s_attackPressMs != s_attackInjectedPressMs && manualAttackCommitLive();
+    bool pendingBlock = !s_settingAiBlocks
+                     && s_blockPressMs && s_blockPressMs == s_blockAcceptedPressMs
+                     && s_blockPressMs != s_freeBlockPressMs && s_blockHeld;
+    if (s_freeGuardUpperIdle && (s_settingAiBlocks || !s_blockHeld || !s_manualAttackOn
+        || s_mode != MODE_FREE_MOVE))
+    {
+        cc->animation->setCombatModeUpperIdle(false);
+        if (s_freeGuardCombatOwned && cc->getCombatState() != STUMBLE
+            && cc->getCombatState() != REACTION_BLOCK)
+            cc->combatModeActive = false;
+        s_freeGuardCombatOwned = false;
+        s_freeGuardUpperIdle = false;
+        s_freeBlockTech = nullptr;
+        VerbLog("[Ironwind] free_block_release");
+    }
+    if (s_freeAttackTech && !s_freeAttackImpactPassed
+        && s_freeAttackPressMs == s_attackAcceptedPressMs)
+    {
+        AnimationClassBase::SingleAnimation* clip = manualPlayingTechnique(cc->animation, s_freeAttackTech);
+        float clipLength = 0.0f;
+        float progress = manualClipTimeline(clip, &clipLength);
+        CombatTechniqueData::ImpactPoint* impact = s_freeAttackTech->numImpactPoints() > 0
+            ? s_freeAttackTech->impactPoint(0) : nullptr;
+        float impactAt = impact ? impact->impactAnimationFrame : 0.50f;
+        if (impactAt < 0.15f || impactAt > 0.95f) impactAt = 0.50f;
+        float speed = s_freeAttackSpeed > 0.1f ? s_freeAttackSpeed : 1.0f;
+        ULONGLONG earliestImpact = (ULONGLONG)(clipLength * impactAt * 600.0f / speed);
+        if (s_freeAttackSeenAnim && progress >= impactAt && clipLength > 0.0f
+            && now - s_freeAttackStartMs >= earliestImpact)
+        {
+            s_freeAttackImpactPassed = true;
+            VerbLog("[Ironwind] free_attack_impact_passed damage=0");
+        }
+    }
+    // RMB may replace the recovery of a free swing once its impact frame has
+    // passed.  Never cancel startup or the damaging part of the arc: doing so
+    // would yield an instant, visually fake hit (or lose the hit entirely).
+    if (!s_settingAiBlocks && s_freeAttackTech && s_freeAttackImpactPassed && s_blockHeld
+        && s_blockPressMs == s_blockAcceptedPressMs
+        && s_blockPressMs >= s_freeAttackStartMs
+        && s_blockPressMs != s_freeBlockPressMs)
+    {
+        AnimationClassBase::SingleAnimation* clip =
+            manualPlayingTechnique(cc->animation, s_freeAttackTech);
+        float clipLength = 0.0f;
+        float progress = manualClipTimeline(clip, &clipLength);
+        char b[160];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] attack_guard_cancel elapsed=%llu progress=%.2f weight=%.2f",
+            now - s_freeAttackStartMs, progress, clip ? clip->weight : -1.0f);
+        VerbLog(b);
+        cc->animation->endCombatAnimation();
+        manualFreeAttackClearTechnique(cc);
+        s_freeAttackLastAdvanceMs = 0;
+        s_attackCommitUntilMs = 0;
+        s_attackRecoveryUntilMs = 0;
+    }
+    if (manualFreeClipFinished(cc->animation, s_freeAttackTech, s_freeAttackSeenAnim,
+                               s_freeAttackLastProgress, s_freeAttackStartMs, s_freeAttackSpeed,
+                               &s_freeAttackLastAdvanceMs))
+    {
+        char b[112]; sprintf_s(b, sizeof(b), "[Ironwind] free_attack_done elapsed=%llu",
+                               now - s_freeAttackStartMs);
+        VerbLog(b);
+        manualFreeAttackClearTechnique(cc);
+        s_freeAttackLastAdvanceMs = 0;
+        s_attackRecoveryUntilMs = now + (ULONGLONG)s_attackRecoveryMs;
+    }
+    bool freeAttackLive = s_freeAttackTech != nullptr;
+    bool freeBlockLive = s_freeGuardUpperIdle && s_freeBlockTech;
+    if (freeAttackLive || freeBlockLive)
+    {
+        cc->animation->setCombatMode(true);
+        s_freeAnimCombatMode = true;
+        if (freeAttackLive)
+        {
+            cc->animation->runCombatAnimation(s_freeAttackTech, s_freeAttackSpeed, std::string());
+            if (s_verboseLog)
+            {
+                static ULONGLONG lastAttackClipTraceMs = 0;
+                if (now - lastAttackClipTraceMs >= 500)
+                {
+                    lastAttackClipTraceMs = now;
+                    AnimationClassBase::SingleAnimation* clip =
+                        manualPlayingTechnique(cc->animation, s_freeAttackTech);
+                    float length = 0.0f;
+                    float progress = manualClipTimeline(clip, &length);
+                    char b[200];
+                    sprintf_s(b, sizeof(b),
+                        "[Ironwind] free_attack_clip progress=%.2f weight=%.2f combat=%d moving=%d override=%d",
+                        progress, clip ? clip->weight : -1.0f,
+                        cc->combatModeActive ? 1 : 0,
+                        (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0,
+                        me->movement && me->movement->animationOverride ? 1 : 0);
+                    VerbLog(b);
+                }
+            }
+        }
+        else if (cc->getCombatState() != STUMBLE
+              && cc->getCombatState() != REACTION_BLOCK)
+        {
+            // Block techniques have zero animation weight when CombatClass's
+            // combat flag is down (confirmed in the v22 free_block_clip log).
+            // WASD clears that flag during movement, so restore it for the
+            // manual guard after movement has been integrated this frame.
+            if (!cc->combatModeActive)
+            {
+                cc->combatModeActive = true;
+                s_freeGuardCombatOwned = true;
+            }
+            cc->animation->runCombatAnimation(s_freeBlockTech, s_freeBlockSpeed, std::string());
+            if (s_verboseLog)
+            {
+                static ULONGLONG lastGuardTraceMs = 0;
+                if (now - lastGuardTraceMs >= 500)
+                {
+                    lastGuardTraceMs = now;
+                    AnimationClassBase::SingleAnimation* clip =
+                        manualPlayingTechnique(cc->animation, s_freeBlockTech);
+                    float length = 0.0f;
+                    float progress = manualClipTimeline(clip, &length);
+                    char b[192]; sprintf_s(b, sizeof(b),
+                        "[Ironwind] free_block_clip anim=%s found=%d progress=%.2f weight=%.2f combat=%d",
+                        s_freeBlockTech->animation.c_str(), clip ? 1 : 0, progress,
+                        clip ? clip->weight : -1.0f, cc->combatModeActive ? 1 : 0);
+                    VerbLog(b);
+                }
+            }
+        }
+    }
+    else if (s_freeAnimCombatMode)
+    {
+        swordStateEnum state = cc->getCombatState();
+        // The moving-swing path deliberately keeps combatModeActive true so
+        // the swing remains visible over WASD.  That flag used to make this
+        // cleanup skip endCombatAnimation(), leaving a stale combat layer for
+        // the next movement input.  Finish our clip regardless of the flag,
+        // but wait for a real stagger/parry reaction to finish first.
+        if (!manualHitReactionLive(me)
+            && (!cc->combatModeActive || (state != STUMBLE && state != REACTION_BLOCK)))
+        {
+            bool combatWasActive = cc->combatModeActive;
+            cc->animation->endCombatAnimation();
+            cc->animation->setCombatMode(s_manualAttackOn && s_mode == MODE_FREE_MOVE);
+            char b[128]; sprintf_s(b, sizeof(b),
+                "[Ironwind] free_action_anim_cleared combat_was=%d state=%d",
+                combatWasActive ? 1 : 0, (int)state);
+            VerbLog(b);
+            s_freeAnimCombatMode = false;
+            manualFreeAttackClearTechnique(cc);
+        }
+    }
+    if (!s_manualAttackOn || s_mode != MODE_FREE_MOVE) return;
+    if (!pendingAttack && !pendingBlock) return;
+    manualBlockBuildCopies();
+    manualAttackLoadPool();
+    Character* foe = manualAttackFindFoe(cc, me);
+    ULONGLONG ap = s_attackPressMs;
+    if (ap && ap == s_attackAcceptedPressMs && ap != s_attackInjectedPressMs
+        && manualAttackCommitLive() && !s_attackActive && !s_freeAttackTech)
+    {
+        // Draw once for this accepted attack, never on an idle timer or while a
+        // swing is playing. The old 750-ms loop restarted clips.
+        if (s_weaponDrawAttemptMs != ap)
+        {
+            s_weaponDrawAttemptMs = ap;
+            manualEnsureWeaponReady(me, stats);
+        }
+        bool useFreeSwing = foe == nullptr;
+        if (foe && s_attackEngagePressMs != ap)
+        {
+            s_attackEngagePressMs = ap;
+            // Start the exact native AttackState synchronously from this input.
+            // No focused task is created: the AI never owns approach, timing,
+            // facing, retries, or a follow-up.  A rejected native initializer
+            // falls back to the existing visual-only air swing below.
+            useFreeSwing = !manualAttackStartDirect(cc, foe, ap);
+        }
+        if (useFreeSwing)
+        {
+            CharacterHuman* human = me->isHuman();
+            Inventory* inv = me->getInventory();
+            if (human && inv && inv->hasWeaponEquipped() && !human->weaponInHands)
+            {
+                static ULONGLONG loggedWaitPress = 0;
+                if (loggedWaitPress != ap)
+                {
+                    loggedWaitPress = ap;
+                    VerbLog("[Ironwind] free_attack_wait_for_weapon_in_hand");
+                }
+                if (now - ap < 1500)
+                    s_attackCommitUntilMs = now + 100;
+                else
+                {
+                    s_attackInjectedPressMs = ap;
+                    s_attackCommitUntilMs = 0;
+                    VerbLog("[Ironwind] free_attack_cancelled_weapon_not_drawn");
+                }
+                return;
+            }
+            CombatTechniqueData* pick = nullptr;
+            int wt = (int)stats->currentWeaponType;
+            int wanted = (int)s_attackDesired;
+            CombatTechniqueData* poolDirectional[64];
+            int poolDirectionalCount = 0;
+            for (int i = 0; i < s_dcAttackCount && poolDirectionalCount < 64; ++i)
+            {
+                CombatTechniqueData* t = s_dcAttack[i];
+                bool skill = wt >= 0 && wt < 0x16 && t->skillTypes[wt];
+                bool dir = t->numImpactPoints() > 0 && (int)t->impactPoint(0)->direction == wanted;
+                if (skill && dir && !t->isBlock && !t->isDodge && !t->animation.empty())
+                    poolDirectional[poolDirectionalCount++] = t;
+            }
+            if (poolDirectionalCount)
+            {
+                int start = (int)(UtilityT::random() * poolDirectionalCount);
+                if (start >= poolDirectionalCount) start = poolDirectionalCount - 1;
+                for (int i = 0; i < poolDirectionalCount; ++i)
+                {
+                    CombatTechniqueData* t = poolDirectional[(start + i) % poolDirectionalCount];
+                    if (t != s_lastFreeAttackTech || i == poolDirectionalCount - 1)
+                    { pick = t; break; }
+                }
+            }
+            // The global pool used above contains defence techniques on this
+            // build.  Ask the game's weapon-aware chooser for an attack when
+            // the pool has no swing, trying several rolls for the aimed cut.
+            if (!pick && s_chooseAttackOrig)
+            {
+                float reach = 0.0f;
+                bool chooserEligible = manualAttackChooserReach(me, reach);
+                const float sampleRange[4] = { 0.0f, 5.0f, 12.0f, 25.0f };
+                CombatTechniqueData* choices[32];
+                int choiceCount = 0;
+                for (int i = 0; chooserEligible && i < 32; ++i)
+                {
+                    CombatTechniqueData* t = s_chooseAttackOrig(stats, sampleRange[i / 8], reach,
+                                                                  nullptr, false);
+                    if (!t || t->isBlock || t->isDodge || t->animation.empty()) continue;
+                    bool duplicate = false;
+                    for (int j = 0; j < choiceCount; ++j)
+                        if (choices[j] == t) { duplicate = true; break; }
+                    if (!duplicate) choices[choiceCount++] = t;
+                }
+                // Retain Kenshi's weapon/skill eligibility, but rotate among
+                // the distinct moves it actually offered for this character.
+                CombatTechniqueData* directional[32]; int directionalCount = 0;
+                for (int i = 0; i < choiceCount; ++i)
+                    if (choices[i]->numImpactPoints() > 0
+                        && (int)choices[i]->impactPoint(0)->direction == wanted)
+                        directional[directionalCount++] = choices[i];
+                CombatTechniqueData** candidates = directional;
+                int candidateCount = directionalCount;
+                if (candidateCount)
+                {
+                    int start = (int)(UtilityT::random() * candidateCount);
+                    if (start >= candidateCount) start = candidateCount - 1;
+                    for (int i = 0; i < candidateCount; ++i)
+                    {
+                        CombatTechniqueData* t = candidates[(start + i) % candidateCount];
+                        if (t != s_lastFreeAttackTech || i == candidateCount - 1) { pick = t; break; }
+                    }
+                }
+                char b[144]; sprintf_s(b, sizeof(b),
+                    "[Ironwind] attack_eligible unique=%d directional=%d weapon=%d unarmed=%d",
+                    choiceCount, directionalCount, wt,
+                    manualUnarmedCombat(stats) ? 1 : 0);
+                VerbLog(b);
+            }
+            s_attackInjectedPressMs = ap;
+            s_attackCommitUntilMs = 0;
+            if (pick)
+            {
+                s_lastFreeAttackTech = pick;
+                s_attackDesiredForSwing = wanted;
+                {   // v38 ground truth: this direction just proved playable
+                    int slot = combatDirectionSlot((CutDirection)wanted);
+                    if (slot >= 0) s_dirMoveAvailable[slot] = 1;
+                }
+                std::string suffix;
+                float speed = stats->attackSpeed * pick->animSpeedMultiplier;
+                if (speed < 0.1f) speed = 0.1f;
+                cc->animation->endCombatAnimation();
+                cc->animation->setCombatMode(true);
+                s_freeAnimCombatMode = true;
+                cc->animation->startCombatAnimation(pick, speed, std::string());
+                s_freeAttackTech = pick;
+                cc->currentTechnique = pick;
+                cc->currentTechniqueHasFinished = false;
+                if (me->movement) cc->attackStartPos = me->movement->pos;
+                cc->calculatedTargetsInAttackZoneThisFrame = false;
+                s_freeAttackPressMs = ap;
+                s_freeAttackImpactPassed = false;
+                s_freeAttackSpeed = speed;
+                s_freeAttackStartMs = now;
+                AnimationClassBase::SingleAnimation* started = manualPlayingTechnique(cc->animation, pick);
+                float clipLength = 0.0f;
+                float clipProgress = manualClipTimeline(started, &clipLength);
+                s_freeAttackSeenAnim = started && started->currentFrameTime01 >= 0.0f
+                    && started->currentFrameTime01 < 0.25f;
+                s_freeAttackLastProgress = -1.0f;
+                s_freeAttackLastAdvanceMs = now;
+                // A free swing now means empty space only.  Its impact point is
+                // retained solely so RMB cannot cancel before the visual blade
+                // has crossed the damaging phase; it never applies damage.
+                AnimationData* ad = cc->animation->getAnimationData(pick->animation);
+                char b[384]; sprintf_s(b, sizeof(b), "[Ironwind] free_attack_start anim=%s dir=%d weapon=%d hand=%d reach=%.2f weapon_length=%.2f speed=%.2f timeline=%.2f/%.2f frame01=%.2f found=%d combat=%d action=%d",
+                                       pick->animation.c_str(), wanted, wt, human && human->weaponInHands ? 1 : 0,
+                                       manualOriginalMeleeReach(me), stats->getCurrentWeaponLength(), speed,
+                                       clipProgress, clipLength,
+                                       started ? started->currentFrameTime01 : -1.0f, ad ? 1 : 0,
+                                       ad ? (int)ad->isCombatMode.key : -1, ad && ad->isAction ? 1 : 0);
+                VerbLog(b);
+            }
+            else
+            {
+                // No technique for this direction: record it so v48 keeps
+                // the arrow white, but do NOT lock the HUD or the input:
+                // the next stroke can retarget instantly (user 2026-10-20).
+                int slot = combatDirectionSlot((CutDirection)wanted);
+                if (slot >= 0) s_dirMoveAvailable[slot] = 0;
+                char b[144]; sprintf_s(b, sizeof(b), "[Ironwind] free_attack_no_technique pool=%d reach=%.1f weapon=%d unarmed=%d",
+                                       s_dcAttackCount, manualOriginalMeleeReach(me), wt,
+                                       manualUnarmedCombat(stats) ? 1 : 0);
+                VerbLog(b);
+            }
+        }
+    }
+
+    ULONGLONG bp = s_blockPressMs;
+    // A native swing and a free guard must never own the combat animation layer
+    // at the same time. v82 kept CHOP alive for the visual recovery, but this
+    // path could start `blk right` over that live attack. Releasing RMB then
+    // crashed vanilla AnimationClass::endCombatAnimation at exe+0x5B357A.
+    // Before impact, retain the block press without cancelling damage. After
+    // impact, leave CHOP first and return; the next main-loop frame confirms
+    // attack ownership is gone before the existing guard path may play.
+    if (!s_settingAiBlocks && bp && bp == s_blockAcceptedPressMs && bp != s_freeBlockPressMs
+        && s_blockHeld && s_attackActive)
+    {
+        if (!s_attackNativeImpactFinished)
+        {
+            static ULONGLONG lastImpactWaitPress = 0;
+            if (lastImpactWaitPress != bp)
+            {
+                lastImpactWaitPress = bp;
+                VerbLog("[Ironwind] attack_guard_wait_for_impact");
+            }
+            return;
+        }
+
+        swordStateEnum beforeGuardHandoff = cc->getCombatState();
+        if (beforeGuardHandoff == CHOP_WEAPON && s_setCombatStateOrig)
+        {
+            s_attackGuardHandoffPending = true;
+            s_setCombatStateOrig(cc, DECISION);
+            swordStateEnum afterGuardHandoff = cc->getCombatState();
+            if (afterGuardHandoff == STARTUP_STATE || afterGuardHandoff == CHOP_WEAPON)
+                s_attackGuardHandoffPending = false;
+            char gb[176];
+            sprintf_s(gb, sizeof(gb),
+                "[Ironwind] attack_guard_handoff before=%d after=%d accepted=%d",
+                (int)beforeGuardHandoff, (int)afterGuardHandoff,
+                s_attackGuardHandoffPending ? 1 : 0);
+            VerbLog(gb);
+        }
+        else if (beforeGuardHandoff != STARTUP_STATE
+              && beforeGuardHandoff != CHOP_WEAPON)
+        {
+            s_attackGuardHandoffPending = true;
+            VerbLog("[Ironwind] attack_guard_handoff state_already_exited");
+        }
+        return;
+    }
+    if (!s_settingAiBlocks && bp && bp == s_blockAcceptedPressMs && bp != s_freeBlockPressMs
+        && s_blockHeld
+        && !s_attackActive && !s_freeAttackTech)
+    {
+        s_freeBlockPressMs = bp;
+        CombatTechniqueData* pick = nullptr;
+        for (int i = 0; i < s_dcBlockCount; ++i)
+        {
+            CombatTechniqueData* t = s_dcBlock[i];
+            if (t->numImpactPoints() > 0 && (int)t->impactPoint(0)->direction == (int)s_blockDesired)
+            { pick = t; break; }
+        }
+        if (!pick && s_dcBlockCount) pick = s_dcBlock[0];
+        if (pick)
+        {
+            std::string suffix;
+            float speed = stats->blockSpeed * pick->animSpeedMultiplier;
+            if (speed < 0.1f) speed = 0.1f;
+            cc->animation->setCombatModeUpperIdle(true);
+            s_freeGuardUpperIdle = true;
+            if (!cc->combatModeActive)
+            {
+                cc->combatModeActive = true;
+                s_freeGuardCombatOwned = true;
+            }
+            cc->animation->setCombatMode(true);
+            s_freeAnimCombatMode = true;
+            cc->animation->startCombatAnimation(pick, speed, std::string());
+            s_freeBlockTech = pick;
+            s_freeBlockSpeed = speed;
+            char b[160]; sprintf_s(b, sizeof(b), "[Ironwind] free_block_play anim=%s dir=%d", pick->animation.c_str(), (int)s_blockDesired);
+            VerbLog(b);
+        }
+        else VerbLog("[Ironwind] free_block_no_technique");
+    }
+}
+
+static bool manualAttackMarkWorldNotified(Character* victim);
+
+static bool manualAttackQueueVictimResponse(Character* victim, Character* attacker,
+                                            const char* source)
+{
+    if (!victim || !attacker) return false;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (s_victimResponseVictim[i] == victim)
+        {
+            s_victimResponseAttacker[i] = attacker;
+            s_victimResponseSource[i] = source;
+            return true;
+        }
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        if (!s_victimResponseVictim[i])
+        {
+            s_victimResponseVictim[i] = victim;
+            s_victimResponseAttacker[i] = attacker;
+            s_victimResponseSource[i] = source;
+            return true;
+        }
+    }
+    VerbLog("[Ironwind] attack_victim_response_queue_full");
+    return false;
+}
+
+// Restore the victim-side half of vanilla's focused/unprovoked task layer only
+// after the victim's authoritative _getHit callback. Direct AttackState must
+// never give the controlled player an AI combat task, but a neutral character
+// actually hit by the player still needs the native awareness, campaign and
+// retaliation entry points. The retaliation order is queued until the current
+// original game loop returns so the first victim does not observe the old
+// neutral relation. The task remains entirely on the VICTIM, so it cannot
+// time, move or chain the player's swing. A click, attack start, miss or block
+// never calls this helper.
+static void manualAttackProvokeVictim(Character* victim, Character* attacker,
+                                      bool wasNeutral, const char* source)
+{
+    if (!victim || !attacker || victim == attacker
+        || manualVPlayerTeamMember(victim)
+        || !manualAttackMarkWorldNotified(victim)) return;
+
+    bool deferred = false;
+    if (wasNeutral)
+    {
+        victim->notifyTheCampaignOfAnAttack(attacker);
+        deferred = manualAttackQueueVictimResponse(victim, attacker, source);
+    }
+    victim->attackingYou(attacker, true, true);
+    if (!deferred) victim->attackTarget(attacker);
+
+    CombatClass* victimCombat = victim->getCombatClass();
+    char b[256];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_victim_provoked source=%s was_neutral=%d deferred=%d victim_enemy=%d attacker_enemy=%d target_set=%d",
+        source ? source : "unknown", wasNeutral ? 1 : 0,
+        deferred ? 1 : 0,
+        victim->isEnemy(attacker, true) ? 1 : 0,
+        attacker->isEnemy(victim, true) ? 1 : 0,
+        victimCombat && victimCombat->currentTarget == attacker ? 1 : 0);
+    VerbLog(b);
+}
+
+// Start exactly one engine-owned AttackState from the accepted player input.
+// This bypasses CombatClassAI's focused-order decision layer but retains the
+// native technique chooser, attack-zone construction, hostile-victim
+// notification, animation, block/dodge verdict, damage, armour and XP paths.
+// A neutral-origin victim's notification is committed only by _getHit.
+static bool manualAttackStartDirect(CombatClass* cc, Character* foe, ULONGLONG press)
+{
+    if (!cc || !cc->animation || !s_setCombatStateOrig || !foe || !cc->me
+        || press == 0 || press != s_attackAcceptedPressMs
+        || press == s_attackInjectedPressMs || !manualAttackCommitLive()) return false;
+    Character* me = cc->me;
+    if (s_mode != MODE_FREE_MOVE || me != s_freeMoveAnchor
+        || !manualVTargetAllowed(me, foe) || manualHitReactionLive(me)
+        || s_attackActive) return false;
+
+    swordStateEnum before = cc->getCombatState();
+    if (before == STUMBLE || before == REACTION_BLOCK) return false;
+
+    // Consume the press before entering game code so a re-entrant update cannot
+    // initialise it twice.  The direct-initialising flag is the only permission
+    // granted to the attack-direction chooser and the two anti-AI choke points.
+    s_attackInjectedPressMs = press;
+    s_attackCommitUntilMs = 0;
+    s_attackDesiredForSwing = s_attackDesired;
+    s_attackActive = true;
+    s_attackSawChop = false;
+    s_attackObservedUnfinished = false;
+    s_attackStateRecovered = false;
+    s_attackNativeImpactFinished = false;
+    s_attackGuardHandoffPending = false;
+    s_attackActiveSinceMs = GetTickCount64();
+    s_attackAdvancedFrameSerial = 0;
+    s_attackAdvanceLogMs = 0;
+    s_attackNativeContacts = 0;
+    s_attackNativeHits = 0;
+    s_attackNativeBlocks = 0;
+    s_attackNativeDodges = 0;
+    for (int wi = 0; wi < 8; ++wi)
+    {
+        s_attackWorldNotified[wi] = nullptr;
+        s_attackNeutralContact[wi] = nullptr;
+    }
+    s_attackDirectInitialising = true;
+
+    Character* previousTarget = cc->currentTarget;
+    bool previousCombatMode = cc->combatModeActive;
+    bool previousTechniqueFinished = cc->currentTechniqueHasFinished;
+    cc->currentTarget = foe;
+    cc->combatModeActive = true;
+    cc->animation->setCombatMode(true);
+
+    // Direct control deliberately skips the AI DECISION/WAIT frames which, in
+    // vanilla, consume the previous technique's completion flag. Leaving that
+    // stale true caused every attack after the first to enter CHOP and be
+    // mistaken for complete on its first (15-32 ms) update. A fresh native
+    // initialisation must begin unfinished just as the ordinary AI path does.
+    cc->currentTechniqueHasFinished = false;
+
+    CombatState* nativeState = (cc->*DcRobResult<DcGetStateClassTag>::ptr)(CHOP_WEAPON);
+    AttackState* attackState = nativeState ? static_cast<AttackState*>(nativeState) : nullptr;
+    bool started = attackState && attackState->initialiseAttack(foe);
+    if (started)
+    {
+        // initialiseAttack has already selected and started the native technique.
+        // Enter only its CHOP state; no AI DECISION/WAIT/approach frame exists.
+        cc->nextMove = CHOP_WEAPON;
+        s_setCombatStateOrig(cc, CHOP_WEAPON);
+        s_attackSawChop = cc->getCombatState() == CHOP_WEAPON;
+        s_attackObservedUnfinished = !cc->currentTechniqueHasFinished;
+    }
+    s_attackDirectInitialising = false;
+
+    float dist = (me->movement && foe->movement)
+        ? me->movement->pos.distance(foe->movement->pos) : -1.0f;
+    char b[320];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_direct_native started=%d state_before=%d state_after=%d dir=%d dist=%.1f enemy=%d target_slave=%d prone=%d down=%d unconscious=%d press_age=%llu",
+        started ? 1 : 0, (int)before, (int)cc->getCombatState(), s_attackDesiredForSwing,
+        dist, me->isEnemy(foe, true) ? 1 : 0, (int)foe->isSlave(),
+        (int)foe->getProneState(), foe->isDown() ? 1 : 0, foe->isUnconcious() ? 1 : 0,
+        GetTickCount64() - press);
+    VerbLog(b);
+
+    if (!started)
+    {
+        cc->currentTarget = previousTarget;
+        cc->combatModeActive = previousCombatMode;
+        cc->currentTechniqueHasFinished = previousTechniqueFinished;
+        manualAttackClearActiveRuntime();
+        return false;
+    }
+    return true;
+}
+
+static void manualAttackFinish(CombatClass* cc, bool playerMoving, const char* reason)
+{
+    ULONGLONG now = GetTickCount64();
+    swordStateEnum st = cc ? cc->getCombatState() : COMBAT_FINISHED;
+    char b[320];
+    sprintf_s(b, sizeof(b),
+        "[WASDCombat] attack_done state=%d ms=%llu swung=%d cm=%d tgt=%d moving=%d contacts=%d hits=%d blocks=%d dodges=%d reason=%s",
+        (int)st, now - s_attackActiveSinceMs, s_attackSawChop ? 1 : 0,
+        cc && cc->combatModeActive ? 1 : 0, cc && cc->currentTarget ? 1 : 0,
+        playerMoving ? 1 : 0, s_attackNativeContacts, s_attackNativeHits,
+        s_attackNativeBlocks, s_attackNativeDodges,
+        reason ? reason : "state_exit");
+    VerbLog(b);
+    bool completedChop = s_attackSawChop;
+    manualAttackClearActiveRuntime();
+    s_attackCommitUntilMs = 0;      // movement is yours the frame the native attempt ends
+    if (completedChop)
+        s_attackRecoveryUntilMs = now + (ULONGLONG)s_attackRecoveryMs;
+    // No focused order exists in the direct path.  The next input is eligible
+    // immediately after the native state exits (subject to configured recovery).
+    VerbLog("[Ironwind] attack_direct_control_restored");
+}
+
+// Every observer of a state exit must pass through the same recovery gate.
+// v80 put this check only in the post-main-loop lifecycle pass, but field logs
+// showed manualAttackTrack inside CombatClass::go could finish the attack first
+// (0/234/329 ms), so the later gate never saw it.  State alone is insufficient:
+// recover once only when the exact native technique still owns a live,
+// unfinished Ogre clip.  No elapsed-time estimate participates.
+static bool manualAttackStillSwingingOrRecover(CombatClass* cc,
+                                               const char* source)
+{
+    if (!cc) return false;
+    swordStateEnum st = cc->getCombatState();
+    // STARTUP is shared by two unrelated native transitions: our attack entry
+    // and a victim's STARTUP -> STUMBLE hand-off.  Once _getHit has claimed the
+    // character, the reaction must win before STARTUP is classified as part of
+    // the outgoing swing.  v89 did this check below the STARTUP/CHOP test, so a
+    // hit received during CHOP could leave both ownership latches alive: the
+    // attack waited for STARTUP to finish while the queued STUMBLE waited for
+    // the attack owner to yield.
+    if (manualHitReactionLive(cc->me)) return false;
+    if (s_attackGuardHandoffPending
+        && st != STARTUP_STATE && st != CHOP_WEAPON)
+        return false;
+    if (st == STARTUP_STATE || st == CHOP_WEAPON) return true;
+
+    AnimationClassBase::SingleAnimation* clip = nullptr;
+    float clipLength = 0.0f, progress = -1.0f;
+    if (cc->animation && cc->currentTechnique)
+    {
+        clip = manualPlayingTechnique(cc->animation, cc->currentTechnique);
+        progress = manualClipTimeline(clip, &clipLength);
+    }
+    bool unfinished = cc->currentTechnique && !cc->currentTechniqueHasFinished;
+    bool visualRecovery = s_attackNativeImpactFinished && clip
+        && progress >= 0.0f && progress < 0.98f;
+    if (!s_attackStateRecovered && (unfinished || visualRecovery) && s_setCombatStateOrig
+        && progress >= 0.0f && progress < 0.98f)
+    {
+        s_attackStateRecovered = true;
+        cc->combatModeActive = true;
+        cc->nextMove = CHOP_WEAPON;
+        s_setCombatStateOrig(cc, CHOP_WEAPON);
+        swordStateEnum restored = cc->getCombatState();
+        char rb[240];
+        sprintf_s(rb, sizeof(rb),
+            "[Ironwind] attack_native_state_recovered source=%s state_was=%d state_now=%d progress=%.3f length=%.3f",
+            source ? source : "unknown", (int)st, (int)restored,
+            progress, clipLength);
+        VerbLog(rb);
+        return restored == STARTUP_STATE || restored == CHOP_WEAPON;
+    }
+
+    if (unfinished || visualRecovery)
+    {
+        char eb[240];
+        sprintf_s(eb, sizeof(eb),
+            "[Ironwind] attack_native_early_exit source=%s state=%d technique_finished=%d impact_finished=%d recovered=%d clip=%d progress=%.3f",
+            source ? source : "unknown", (int)st,
+            cc->currentTechniqueHasFinished ? 1 : 0,
+            s_attackNativeImpactFinished ? 1 : 0,
+            s_attackStateRecovered ? 1 : 0, clip ? 1 : 0, progress);
+        VerbLog(eb);
+    }
+    return false;
+}
+
+// The direct initializer enters CHOP synchronously.  The swing is over when the
+// native machine leaves STARTUP/CHOP_WEAPON. There is deliberately no Ironwind
+// duration timer: weapon and skill animation speed remain authoritative.
 static void manualAttackTrack(CombatClass* cc, bool playerMoving)
 {
     if (!s_attackActive) return;
     swordStateEnum st = cc->getCombatState();
     if (st == CHOP_WEAPON) s_attackSawChop = true;
-    bool swinging = (st == STARTUP_STATE || st == CHOP_WEAPON);
-    ULONGLONG now = GetTickCount64();
-    // OUT OF REACH: the game's initialiser failed for range (it stepped toward the
-    // target and the state fell back).  Vanilla would re-decide and keep closing
-    // in; with the AI's own swings refused, we re-arm the same STARTUP+CHOP pair
-    // each time it falls back, for up to AttackApproachMs, so the character walks
-    // in and swings when in range - unless the player is driving with WASD (then
-    // closing the distance is theirs and the press is spent).
-    // The failed initialiser CLEARS currentTarget (log 2026-09-21: every retry
-    // fizzled with tgt=0 and the approach never ran) - re-resolve the foe here
-    // (downed ones are excluded now) so the character actually walks in.
-    Character* approachTgt = cc->currentTarget;
-    if (!approachTgt && !swinging && !s_attackSawChop && cc->combatModeActive && cc->me)
-        approachTgt = manualAttackFindFoe(cc, cc->me);
-    if (!swinging && !s_attackSawChop && !playerMoving && cc->combatModeActive && approachTgt
-        && st != STUMBLE && !s_dodgeActiveTech
-        && (now - s_attackActiveSinceMs) <= (ULONGLONG)s_attackApproachMs)
+    if (!manualAttackStillSwingingOrRecover(cc, "combat_track"))
     {
-        // Build 48: the walk-in is the AI's own.  Re-arming STARTUP every frame
-        // restarted the startup animation 60x a second while closing in (log:
-        // a tenth of all swings ran past 1.6 s, the worst 8.7 s).  While our
-        // swing is live (s_attackActive) the initialiser accepts the AI's own
-        // attempts and the idle pin stands aside, so vanilla's decision loop
-        // approaches, steps in and swings exactly as it does unmanaged; the
-        // track below ends the press after that one swing.
-        if (cc->currentTarget != approachTgt) cc->currentTarget = approachTgt;
-        s_attackCommitUntilMs = now + 250;          // keep the commit alive frame to frame
-        if (now - s_attackReapproachLogMs >= 1000)
+        st = cc->getCombatState();
+        const char* reason = manualHitReactionLive(cc->me) ? "hit_reaction"
+                           : (st == TARGET_PATHFINDING || st == TARGET_PATHFINDING_STARTUP)
+                           ? "unexpected_pathfinding" : "state_exit";
+        manualAttackFinish(cc, playerMoving, reason);
+    }
+}
+
+// Execute one frame of the native combat base state without executing
+// CombatClassAI::update/decisionState. initialiseAttack() has already chosen the
+// vanilla technique, built its target context and started its animation.
+// CombatClass::update dispatches CHOP directly to CombatClass::attackState,
+// which owns animation sections, attack-zone checks, block/dodge verdicts,
+// damage and XP.  CombatClassAI::update normally performs the separate
+// CHOP -> DECISION hand-off after the technique reports completion.  We cannot
+// run that whole AI update (it also owns targeting, approach and follow-up
+// attacks), so the direct path reproduces only that native completion hand-off
+// below. AttackState::update is only the AI-side target/movement helper; v68
+// called it directly and left the real attack executor untouched.
+//
+// combatGo_hook is the preferred call site. The main-loop lifecycle pass calls
+// the same helper as a fallback because a direct attack has no AI task and the
+// engine can therefore stop scheduling CombatClass::go. The frame serial makes
+// those two paths mutually exclusive, so native timers and hit checks cannot be
+// advanced twice in one frame.
+static bool manualAttackAdvanceNativeState(CombatClass* cc, float frameTime,
+                                           const char* source)
+{
+    if (!s_attackActive || !cc || !s_combatBaseUpdateNative
+        || cc->me != s_freeMoveAnchor
+        || manualHitReactionLive(cc->me)
+        || cc->getCombatState() != CHOP_WEAPON) return false;
+    if (s_attackAdvancedFrameSerial == s_manualMainFrameSerial) return true;
+
+    // `currentTechniqueHasFinished` marks the end of Kenshi's damaging attack
+    // phase, not the end of the visible clip.  v81 transitioned to DECISION at
+    // this edge, truncating Great sword low slash around 812 ms while the same
+    // clip's real timeline lasts about 1562 ms.  Once all native impact work is
+    // finished, stop calling attackState (no duplicate contacts) and let the
+    // existing Ogre clip advance naturally to its own end.
+    if (s_attackNativeImpactFinished)
+    {
+        s_attackAdvancedFrameSerial = s_manualMainFrameSerial;
+        AnimationClassBase::SingleAnimation* clip =
+            manualPlayingTechnique(cc->animation, cc->currentTechnique);
+        float clipLength = 0.0f;
+        float progress = manualClipTimeline(clip, &clipLength);
+        if (clip && progress >= 0.0f && progress < 0.98f)
         {
-            s_attackReapproachLogMs = now;
-            VerbLog("[WASDCombat] attack_approach (out of reach - AI closes in for this swing)");
+            ULONGLONG nowRecovery = GetTickCount64();
+            if (nowRecovery - s_attackAdvanceLogMs >= 500)
+            {
+                s_attackAdvanceLogMs = nowRecovery;
+                char rb[224];
+                sprintf_s(rb, sizeof(rb),
+                    "[Ironwind] attack_native_recovery_clip source=%s progress=%.3f length=%.3f state=%d",
+                    source ? source : "unknown", progress, clipLength,
+                    (int)cc->getCombatState());
+                VerbLog(rb);
+            }
+            return true;
         }
+        if (s_setCombatStateOrig)
+        {
+            s_setCombatStateOrig(cc, DECISION);
+            char fb[192];
+            sprintf_s(fb, sizeof(fb),
+                "[Ironwind] attack_native_finish_transition source=clip_finished progress=%.3f clip=%d",
+                progress, clip ? 1 : 0);
+            VerbLog(fb);
+        }
+        return true;
+    }
+
+    CombatState* nativeState = (cc->*DcRobResult<DcGetStateClassTag>::ptr)(CHOP_WEAPON);
+    if (!nativeState || nativeState->combat != cc)
+    {
+        ULONGLONG nowBad = GetTickCount64();
+        if (nowBad - s_attackAdvanceLogMs >= 500)
+        {
+            s_attackAdvanceLogMs = nowBad;
+            VerbLog("[Ironwind] attack_native_advance_invalid");
+        }
+        return false;
+    }
+
+    s_attackAdvancedFrameSerial = s_manualMainFrameSerial;
+    swordStateEnum before = cc->getCombatState();
+    float combatTimerBefore = cc->stateTimer;
+    float attackTimerBefore = nativeState->stateTimer;
+    int comboBefore = cc->currentComboSection;
+    bool finishedBefore = cc->currentTechniqueHasFinished;
+    if (!finishedBefore) s_attackObservedUnfinished = true;
+    cc->frameTIME = frameTime;
+    s_combatBaseUpdateNative(cc, frameTime);
+    swordStateEnum after = cc->getCombatState();
+
+    // The flag ends native impact evaluation, but the visible recovery frames
+    // may still be playing.  Latch that phase and stop advancing attackState;
+    // transition only after the exact clip reaches its real end.  If no live
+    // clip can be observed, retain the old immediate native cleanup as a safe
+    // fallback rather than inventing a duration.
+    if (after == CHOP_WEAPON && s_attackObservedUnfinished
+        && cc->currentTechniqueHasFinished
+        && s_setCombatStateOrig)
+    {
+        AnimationClassBase::SingleAnimation* clip =
+            manualPlayingTechnique(cc->animation, cc->currentTechnique);
+        float clipLength = 0.0f;
+        float progress = manualClipTimeline(clip, &clipLength);
+        if (clip && progress >= 0.0f && progress < 0.98f)
+        {
+            s_attackNativeImpactFinished = true;
+            char ib[208];
+            sprintf_s(ib, sizeof(ib),
+                "[Ironwind] attack_native_impact_finished progress=%.3f length=%.3f",
+                progress, clipLength);
+            VerbLog(ib);
+        }
+        else
+        {
+            s_setCombatStateOrig(cc, DECISION);
+            after = cc->getCombatState();
+            char fb[192];
+            const char* finishSource = !clip ? "technique_finished_no_clip"
+                : progress >= 0.98f ? "technique_finished_clip_complete"
+                : "technique_finished_clip_invalid";
+            sprintf_s(fb, sizeof(fb),
+                "[Ironwind] attack_native_finish_transition source=%s progress=%.3f clip=%d",
+                finishSource, progress, clip ? 1 : 0);
+            VerbLog(fb);
+        }
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (after != before || now - s_attackAdvanceLogMs >= 500)
+    {
+        s_attackAdvanceLogMs = now;
+        char b[320];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] attack_native_advance source=%s before=%d after=%d dt=%.4f combat_timer=%.3f->%.3f attack_timer=%.3f->%.3f combo=%d->%d tech=%d target=%d finished=%d->%d",
+            source ? source : "unknown", (int)before, (int)after, frameTime,
+            combatTimerBefore, cc->stateTimer, attackTimerBefore,
+            nativeState->stateTimer, comboBefore, cc->currentComboSection,
+            cc->currentTechnique ? 1 : 0, cc->currentTarget ? 1 : 0,
+            finishedBefore ? 1 : 0,
+            cc->currentTechniqueHasFinished ? 1 : 0);
+        VerbLog(b);
+    }
+    return true;
+}
+
+// CombatClassAI::update is the outer owner of the controlled character's
+// combat state. v78 intercepted go(), but field logs still showed ten direct
+// CHOPs being replaced by DECISION before go() was reached (0-328 ms, no
+// incoming hit). While one player-authorised CHOP is live, run only the native
+// CombatClass base state and skip this AI decision layer altogether. Hit
+// reactions remain outside this branch and therefore stay fully vanilla.
+static void (*s_combatAiUpdateOrig)(CombatClassAI*, float);
+static void combatAiUpdate_hook(CombatClassAI* thisptr, float frameTime)
+{
+    if (!s_dcShutdownInProgress && !s_loadGuardActive
+        && s_mode == MODE_FREE_MOVE && s_manualAttackOn
+        && thisptr && thisptr->me == s_freeMoveAnchor
+        && s_attackActive && !manualHitReactionLive(thisptr->me)
+        && thisptr->getCombatState() == CHOP_WEAPON)
+    {
+        s_retreatLockGoSuppressed = true;
+        manualAttackAdvanceNativeState(thisptr, frameTime, "combat_update");
         return;
     }
-    if (!swinging || now - s_attackActiveSinceMs > 2500 + (ULONGLONG)s_attackApproachMs)
-    {
-        // FIZZLE RETRY (log 2026-09-21: an inject on the last frame of a stagger
-        // recovery fell back in 15 ms with no swing and the press was spent - the
-        // player had to press again).  A start that never reached CHOP_WEAPON
-        // re-arms the SAME press for the next idle frame, bounded: at most 3
-        // retries and never later than AttackWindowMs + 600 ms after the press.
-        ULONGLONG press = s_attackAcceptedPressMs;
-        if (!s_attackSawChop && press != 0 && now >= press
-            && (now - press) <= (ULONGLONG)s_attackWindowMs + 600
-            && !(s_attackRetryPressMs == press && s_attackRetries >= 3))
-        {
-            if (s_attackRetryPressMs != press) { s_attackRetryPressMs = press; s_attackRetries = 0; }
-            ++s_attackRetries;
-            s_attackActive          = false;
-            s_attackInjectedPressMs = 0;                                   // the inject may fire again for this press
-            s_attackCommitUntilMs   = press + (ULONGLONG)s_attackWindowMs + 600;
-            char b[160];
-            sprintf_s(b, sizeof(b), "[WASDCombat] attack_retry n=%d state=%d ms=%llu cm=%d tgt=%d moving=%d",
-                      s_attackRetries, (int)st, now - s_attackActiveSinceMs,
-                      cc->combatModeActive ? 1 : 0, cc->currentTarget ? 1 : 0, playerMoving ? 1 : 0);
-            VerbLog(b);
-            return;
-        }
-        char b[160];
-        sprintf_s(b, sizeof(b), "[WASDCombat] attack_done state=%d ms=%llu swung=%d cm=%d tgt=%d moving=%d",
-                  (int)st, now - s_attackActiveSinceMs, s_attackSawChop ? 1 : 0,
-                  cc->combatModeActive ? 1 : 0, cc->currentTarget ? 1 : 0, playerMoving ? 1 : 0);
-        VerbLog(b);
-        s_attackActive        = false;
-        s_attackCommitUntilMs = 0;      // sharp: movement is yours the frame the swing ends
-        if (s_attackSawChop) s_attackRecoveryUntilMs = now + (ULONGLONG)s_attackRecoveryMs;   // follow-through: presses ignored
-    }
-}
-
-// Once the machine has left BLOCK (or our technique is gone), the dodge is over.
-static void manualDodgeTrack(CombatClass* cc)
-{
-    if (!s_dodgeActiveTech) return;
-    if (cc->getCombatState() != BLOCK || cc->currentTechnique != s_dodgeActiveTech)
-    {
-        s_dodgeActiveTech    = nullptr;
-        s_dodgeRollOk        = false;
-        s_dodgeCommitUntilMs = 0;      // sharp: movement is yours the frame the dodge ends
-        s_dodgeRecoveryUntilMs = GetTickCount64() + (ULONGLONG)s_dodgeRecoveryMs;   // presses ignored while the follow-through plays
-        // Dodge-then-strike: an E pressed during the dodge (within the last 600 ms)
-        // becomes the swing now, as if pressed the frame the dodge ended.
-        if (s_attackAfterDodgeMs != 0)
-        {
-            ULONGLONG nowE = GetTickCount64();
-            if (nowE - s_attackAfterDodgeMs <= 600 && s_manualAttackOn && !s_attackActive)
-            {
-                s_attackAcceptedPressMs = s_attackAfterDodgeMs;
-                s_attackInjectedPressMs = 0;
-                s_attackCommitUntilMs   = nowE + (ULONGLONG)s_attackWindowMs;
-                VerbLog("[WASDCombat] attack_commit after_dodge");
-            }
-            s_attackAfterDodgeMs = 0;
-        }
-    }
-}
-
-static bool manualDodgeChar(CharStats* st)
-{
-    return st && st->me && st->me == s_freeMoveAnchor && s_mode == MODE_FREE_MOVE
-        && s_settingManualBlock && !s_dcShutdownInProgress && !s_loadGuardActive;
-}
-// Bonus visible/active while the key is held, inside the timing window after a
-// press, or while our roll is pending (block mode's +20 is likewise "while on").
-// The +DodgeSkillBonus is on for the DODGE WINDOW after a press (and while the
-// injected dodge is in flight) - a visible "(+20)" that marks the timing window,
-// not a hold buff.
-static bool manualDodgeBonusActive(CharStats* st)
-{
-    if (!manualDodgeChar(st) || !s_manualAttackOn) return false;   // the (+20) is a manual-combat effect
-    ULONGLONG now = GetTickCount64();
-    // Key DOWN and inside the window: releases the moment the key comes up.
-    return s_dodgeHeld && s_dodgePressMs > 0 && (now - s_dodgePressMs) <= (ULONGLONG)s_dodgeWindowMs;
-}
-// CharStats::getDodge - the Dodge skill the roll (and the stats HUD) reads.
-static float (*s_getDodgeOrig)(CharStats* st, bool bonuses);
-static float getDodge_hook(CharStats* st, bool bonuses)
-{
-    float v = s_getDodgeOrig(st, bonuses);
-    // The stats panel prints "{getDodge(true)} (+{getDodge(true)-getDodge(false)})",
-    // so the bonus goes on the with-bonuses read only - it then shows as "(+20)"
-    // in the modifier text, exactly like block mode's melee-defence bonus.
-    if (bonuses && manualDodgeBonusActive(st))
-    {
-        v += s_dodgeSkillBonus;
-    }
-    return v;
+    s_combatAiUpdateOrig(thisptr, frameTime);
 }
 
 // CombatClass::_iHitYouAreYouHit - the block VERDICT Character::hitByMeleeAttack
@@ -8532,10 +11734,257 @@ static float getDodge_hook(CharStats* st, bool bonuses)
 // including the HELD skill block, which vanilla resolves from the block
 // technique currently playing - forwards untouched.
 static HitMaterialType (*s_iHitOrig)(CombatClass* cc, CutDirection dir, Damages& damage, Character* who);
+static HitMaterialType iHitYouAreYouHit_inner(CombatClass* cc, CutDirection dir, Damages& damage, Character* who);   // v40 fwd (wrapper below)
 static HitMaterialType iHitYouAreYouHit_hook(CombatClass* cc, CutDirection dir, Damages& damage, Character* who)
 {
+    Character* preVictim = cc ? cc->me : nullptr;
+    bool neutralAtIntent = preVictim && preVictim == s_attackNeutralIntentTarget;
+    bool neutralNow = preVictim && who && who == s_freeMoveAnchor
+        && !preVictim->isEnemy(s_freeMoveAnchor, true)
+        && !s_freeMoveAnchor->isEnemy(preVictim, true);
+    bool outgoingNeutralContact = preVictim && who && who == s_freeMoveAnchor
+        && s_attackActive && !manualVPlayerTeamMember(preVictim)
+        && (neutralNow || neutralAtIntent);
+    if (outgoingNeutralContact)
+    {
+        for (int ni = 0; ni < 8; ++ni)
+        {
+            if (s_attackNeutralContact[ni] == preVictim) break;
+            if (!s_attackNeutralContact[ni])
+            {
+                s_attackNeutralContact[ni] = preVictim;
+                break;
+            }
+        }
+    }
+    HitMaterialType result = iHitYouAreYouHit_inner(cc, dir, damage, who);
     Character* self = cc ? cc->me : nullptr;
-    if (self && self == s_freeMoveAnchor) glintImpact(who);   // weapon glint: flash out at the hit (blocked or not)
+    bool victimCombatRestored = false;
+    if (outgoingNeutralContact && result != HIT_SWORD && result != HIT_MISSED
+        && cc && !cc->combatModeActive)
+    {
+        // A neutral victim reached the original HIT_FLESH verdict, but without
+        // the vanilla unprovoked/focused order their CombatClass can still be
+        // inactive. Character::hitByMeleeAttack then abandons the path before
+        // _getHit, producing contact with no damage or retaliation. Activate
+        // only the victim's native combat layer here; the caller still owns
+        // damage, armour, _getHit and the confirmed-hit aggression rule.
+        cc->combatModeActive = true;
+        victimCombatRestored = true;
+        VerbLog("[Ironwind] outgoing_hit_victim_combat_restored");
+    }
+    // All targeted swings use the native state machine. This is a contact
+    // verdict, not yet proof that Character::_getHit actually ran: v79 recorded
+    // one HIT_FLESH candidate that never entered the victim path. Count contact,
+    // block and dodge here; confirmed hits and the red marker are owned by the
+    // later getHit_hook.
+    if (who && who == s_freeMoveAnchor && s_attackActive)
+    {
+        ++s_attackNativeContacts;
+        const char* outcome = "hit";
+        if (result == HIT_SWORD)
+        {
+            ++s_attackNativeBlocks;
+            outcome = "blocked";
+        }
+        else if (result == HIT_MISSED)
+        {
+            ++s_attackNativeDodges;
+            outcome = "dodged";
+        }
+        else
+        {
+            outcome = "hit_candidate";
+        }
+        float victimDistance = self && self->movement && who->movement
+            ? self->movement->pos.distance(who->movement->pos) : -1.0f;
+        char vb[240];
+        CombatClass* attackerCombat = who->getCombatClass();
+        sprintf_s(vb, sizeof(vb),
+            "[Ironwind] attack_native_verdict outcome=%s result=%d intended=%d dist=%.1f neutral_origin=%d victim_combat=%d restored=%d",
+            outcome, (int)result,
+            attackerCombat && self == attackerCombat->currentTarget ? 1 : 0,
+            victimDistance, outgoingNeutralContact ? 1 : 0,
+            cc && cc->combatModeActive ? 1 : 0, victimCombatRestored ? 1 : 0);
+        VerbLog(vb);
+    }
+    // A confirmed hit on the controlled character (not blocked, not dodged)
+    // immediately cancels Ironwind-owned actions.  Reaction duration is NOT
+    // decided here: the subsequent native _getHit(..., stumble) call is the
+    // authority in v44.
+    if (self && self == s_freeMoveAnchor && result != HIT_SWORD && result != HIT_MISSED)
+    {
+        // The verdict hook runs before Character::hitByMeleeAttack calls the
+        // victim's _getHit(..., stumble). End only Ironwind's current free
+        // action here, then let vanilla install its own flinch/stumble layer.
+        // v42 cleared bookkeeping immediately but left the visible swing pose
+        // alive until the 750 ms window expired (field: 744/761 ms late).
+        bool freeActionInterrupted = s_freeAnimCombatMode
+            && (s_freeAttackTech || s_freeBlockTech);
+        if (freeActionInterrupted && cc->animation)
+        {
+            cc->animation->setCombatModeUpperIdle(false);
+            cc->animation->endCombatAnimation();
+            s_freeAnimCombatMode = false;
+            if (self->movement) self->movement->animationOverride = false;
+            VerbLog("[Ironwind] hit_free_action_interrupted before_vanilla_reaction");
+        }
+        // V-mode idle/free actions can deliberately leave CombatClass inactive.
+        // Character::hitByMeleeAttack checks that flag before calling _getHit;
+        // restoring it here (after the native hit verdict, before that caller
+        // continues) keeps an in-flight free swing from swallowing the native
+        // flinch/stumble path. This is state restoration, not a timed lock:
+        // getHit_hook still follows vanilla's own `stumble` decision.
+        if (!cc->combatModeActive)
+        {
+            cc->combatModeActive = true;
+            VerbLog("[WASDCombat] hit_reaction_combat_restored");
+        }
+        ++s_hitReactionSerial;
+        bool yielded = s_freeAttackTech || s_freeBlockTech
+                    || s_attackQueuedAtMs != 0 || s_attackAimHeld;
+        if (cc->animation && s_freeGuardUpperIdle)
+            cc->animation->setCombatModeUpperIdle(false);
+        manualFreeAttackClearTechnique(cc);
+        s_freeAttackStartMs = 0;
+        s_freeAttackSeenAnim = false;
+        s_freeAttackLastProgress = -1.0f;
+        s_freeAttackLastAdvanceMs = 0;
+        s_freeBlockTech = nullptr;
+        s_freeGuardUpperIdle = false;
+        s_freeGuardCombatOwned = false;
+        s_freeAttackImpactPassed = false;
+        s_attackCommitUntilMs = 0;
+        manualAttackClearQueuedInput(true);
+        s_attackSeenPressMs = s_attackPressMs;
+        if (s_interactionMenuByE)
+        {
+            if (s_gwFrame) s_gwFrame->hideContextMenu();
+            manualInteractionClearRuntime(false);
+            VerbLog("[Ironwind] interact_menu_closed reason=hit");
+        }
+        s_rmbCombatEdgeSeenMs = s_rmbCombatEdgeMs;
+        s_rmbCombatEdgeMs = 0;
+        manualAttackClearAimInput(true, true);
+        char rb[192];
+        sprintf_s(rb, sizeof(rb),
+            "[WASDCombat] hit_confirmed_pre_gethit serial=%u state=%d combat=%d wasd=%d yielded=%d",
+            s_hitReactionSerial, (int)cc->getCombatState(), cc->combatModeActive ? 1 : 0,
+            (s_wHeld || s_aHeld || s_sHeld || s_dHeld) ? 1 : 0, yielded ? 1 : 0);
+        VerbLog(rb);
+    }
+    return result;
+}
+
+// CombatClass::_getHit is the original game's authoritative reaction choice.
+// The `stumble` argument has already been calculated by Character's native
+// damage path.  A true value is allowed one native go() transition and then
+// STUMBLE/REACTION_BLOCK own movement for exactly as long as vanilla keeps the
+// state.  A false value receives no artificial Ironwind lock.
+static void (*s_getHitOrig)(CombatClass* cc, CutDirection dir,
+                            const Damages& damage, RootObject* who, bool stumble);
+static bool manualAttackMarkWorldNotified(Character* victim)
+{
+    if (!victim) return false;
+    for (int i = 0; i < 8; ++i)
+        if (s_attackWorldNotified[i] == victim) return false;
+    for (int i = 0; i < 8; ++i)
+        if (!s_attackWorldNotified[i])
+        {
+            s_attackWorldNotified[i] = victim;
+            return true;
+        }
+    // An attack zone hitting more than eight distinct neutral characters is
+    // exceptional. World notification is safer than silently suppressing the
+    // ninth victim; duplicate callbacks remain bounded by the native impacts.
+    return true;
+}
+static bool manualAttackWasNeutralAtContact(Character* victim)
+{
+    if (!victim) return false;
+    for (int i = 0; i < 8; ++i)
+        if (s_attackNeutralContact[i] == victim) return true;
+    return false;
+}
+static void getHit_hook(CombatClass* cc, CutDirection dir,
+                        const Damages& damage, RootObject* who, bool stumble)
+{
+    bool outgoingPlayerHit = cc && cc->me && cc->me != s_freeMoveAnchor
+        && who && who == s_freeMoveAnchor && s_attackActive;
+    bool outgoingNeutralHit = outgoingPlayerHit && !manualVPlayerTeamMember(cc->me)
+        && manualAttackWasNeutralAtContact(cc->me);
+    bool controlled = cc && cc->me && cc->me == s_freeMoveAnchor
+        && s_mode == MODE_FREE_MOVE && s_manualAttackOn
+        && !s_dcShutdownInProgress && !s_loadGuardActive;
+    int beforeState = cc ? (int)cc->getCombatState() : -1;
+    int beforeNext = cc ? (int)cc->nextMove : -1;
+    if (controlled && stumble)
+    {
+        s_hitReactionPending = true;
+        InterlockedExchange(&s_hitReactionInputLock, 1);
+        // V movement normally clears this flag.  Restore it only because the
+        // native hit explicitly requested a stumble, not for a timed window.
+        cc->combatModeActive = true;
+    }
+
+    // The user requires confirmed-hit aggression: targeting, LMB release,
+    // AttackState start, a miss and a native block must not provoke a neutral.
+    // Neutrality was captured immediately before the native contact verdict;
+    // this authoritative _getHit callback proves that the damage path accepted
+    // the hit. Deliberate and incidental victims therefore share one rule.
+    if (outgoingNeutralHit)
+    {
+        manualAttackProvokeVictim(cc->me, s_freeMoveAnchor, true, "confirmed_gethit");
+        if (cc->me == s_attackNeutralIntentTarget)
+            manualAttackClearNeutralIntent();
+    }
+
+    s_getHitOrig(cc, dir, damage, who, stumble);
+
+    // The verdict hook runs before Character::hitByMeleeAttack continues into
+    // the victim's native hit path. Only this callback proves that the hit was
+    // accepted. Drive the counter and red X here so a verdict candidate that is
+    // abandoned later cannot produce false feedback. Damage, armour, body-part
+    // selection and reaction remain entirely native.
+    if (outgoingPlayerHit)
+    {
+        ++s_attackNativeHits;
+        s_hitMarkerUntilMs = GetTickCount64() + HIT_MARKER_VISIBLE_MS;
+        VerbLog("[Ironwind] hit_marker_trigger source=native_gethit");
+        float victimDistance = cc->me->movement && s_freeMoveAnchor->movement
+            ? cc->me->movement->pos.distance(s_freeMoveAnchor->movement->pos) : -1.0f;
+        char ob[224];
+        sprintf_s(ob, sizeof(ob),
+            "[Ironwind] attack_native_gethit victim_dist=%.1f damage=%.2f cut=%.2f blunt=%.2f pierce=%.2f stumble=%d state=%d/%d",
+            victimDistance, damage.total(), damage.cut, damage.blunt, damage.pierce,
+            stumble ? 1 : 0, (int)cc->getCombatState(), (int)cc->nextMove);
+        VerbLog(ob);
+    }
+
+    if (controlled && cc)
+    {
+        swordStateEnum afterState = cc->getCombatState();
+        bool inNativeState = afterState == STUMBLE || afterState == REACTION_BLOCK;
+        bool queuedNativeState = cc->nextMove == STUMBLE || cc->nextMove == REACTION_BLOCK;
+        if (inNativeState) s_hitReactionPending = false;
+        else s_hitReactionPending = stumble; // one real go() opportunity; no clock
+        bool live = inNativeState || s_hitReactionPending;
+        InterlockedExchange(&s_hitReactionInputLock, live ? 1 : 0);
+
+        char rb[256];
+        sprintf_s(rb, sizeof(rb),
+            "[WASDCombat] hit_native_reaction serial=%u stumble=%d before=%d/%d after=%d/%d queued=%d combat=%d lock=%d",
+            s_hitReactionSerial, stumble ? 1 : 0, beforeState, beforeNext,
+            (int)afterState, (int)cc->nextMove, queuedNativeState ? 1 : 0,
+            cc->combatModeActive ? 1 : 0, live ? 1 : 0);
+        VerbLog(rb);
+    }
+}
+
+static HitMaterialType iHitYouAreYouHit_inner(CombatClass* cc, CutDirection dir, Damages& damage, Character* who)
+{
+    Character* self = cc ? cc->me : nullptr;
+    if (self && self == s_freeMoveAnchor) incomingAttackImpact(who); // close native incoming event; glint may flash out
     // DIAG (build 56): every hit on the controlled character, with the attacker's
     // technique - to find the two-strike moves and tune the block windows.
     if (self && self == s_freeMoveAnchor)
@@ -8552,30 +12001,22 @@ static HitMaterialType iHitYouAreYouHit_hook(CombatClass* cc, CutDirection dir, 
         VerbLog(hb);
         s_lastHitMs = nowD; s_lastHitWho = who;
     }
-    // MANUAL DODGE, failed roll: the animation plays but does not protect -
-    // hide the technique from the verdict for this hit so vanilla resolves it
-    // as a plain hit.  A successful roll is protected only by the technique's
-    // own animation window (vanilla), never by us.
-    if (self && self == s_freeMoveAnchor && s_dodgeActiveTech && !s_dodgeRollOk
-        && cc->currentTechnique == s_dodgeActiveTech)
+    // A mouse guard without a selected or matching direction cannot use a
+    // native block technique to parry this impact. Keep dodge outcomes intact.
+    if (self && self == s_freeMoveAnchor && s_directionalCombat && s_mouseBlockHeld
+        && manualBlockArmed(self) && (!cc->currentTechnique || !cc->currentTechnique->isDodge)
+        && !combatDirectionMatches((CutDirection)s_blockDesired, dir))
     {
         CombatTechniqueData* keep = cc->currentTechnique;
         cc->currentTechnique = nullptr;
         HitMaterialType r = s_iHitOrig(cc, dir, damage, who);
         cc->currentTechnique = keep;
-        char b[96];
-        sprintf_s(b, sizeof(b), "[WASDCombat] dodge_failed_hit dir=%d result=%d", (int)dir, (int)r);
-        VerbLog(b);
-        return r;
+        return r == HIT_SWORD ? HIT_FLESH : r;
     }
     if (manualBlockArmed(self))
     {
         ULONGLONG now   = GetTickCount64();
-        ULONGLONG press = s_blockPressMs;
-        ULONGLONG origin = s_blockHoldStartMs;                 // first press of this block (a resume keeps it)
-        bool inWindow = s_manualAttackOn && press > 0 && press == s_blockAcceptedPressMs && origin != 0
-                     && (now - origin) <= (ULONGLONG)s_perfectWindowMs;
-        bool cooling  = now < s_perfectCooldownUntilMs;
+        ULONGLONG origin = s_blockHoldStartMs;
         bool rear = (dir == CUT_REAR_DOWNWARD || dir == CUT_REAR_LEFT || dir == CUT_REAR_RIGHT);
         bool front = !rear;
         if (front && who && who->movement && self->movement)
@@ -8586,36 +12027,25 @@ static HitMaterialType iHitYouAreYouHit_hook(CombatClass* cc, CutDirection dir, 
                 front = f.normalisedCopy().dotProduct(to.normalisedCopy()) > 0.34f;   // ~140 deg arc
         }
         bool swinging  = cc->combatModeActive && cc->getCombatState() == CHOP_WEAPON;
-        bool staggered = cc->combatModeActive && cc->getCombatState() == STUMBLE;   // no block out of a stagger
-        // Build 56 (user 2026-09-29: "the follow-up hit always connects"): the
-        // cooldown starts at the FIRST perfect hit, and this check refused every
-        // later hit as "cooling" - so the second strike of a two-hit technique
-        // always fell through to vanilla.  A press that already earned its perfect
-        // keeps covering hits for the rest of its window.
-        bool sameWindow = (s_perfectUsedPressMs == origin);
-        // Build 57: a follow-up strike is covered for PERFECT_FOLLOWUP_MS after the
-        // first perfect hit even if the press window has just run out (a late
-        // press that parries the first strike at ~900 ms would otherwise leave the
-        // second strike, 360 ms later, to the skill roll).
-        bool followUp = sameWindow && s_perfectLastHitMs != 0 && (now - s_perfectLastHitMs) <= PERFECT_FOLLOWUP_MS;
-        if ((inWindow || followUp) && (sameWindow || !cooling) && front && !swinging && !staggered)
+        bool reacting = manualHitReactionLive(self);
+        bool directionalReady = s_directionalCombat && s_mouseBlockHeld;
+        bool keyboardReady = !s_directionalCombat
+                          && s_freeGuardUpperIdle && s_freeBlockTech
+                          && (now - origin) <= (ULONGLONG)s_blockHoldMs;
+        // Vanilla can resolve a block while its visible pose is still entering.
+        // Match that semantic: an accepted held directional request is ready
+        // immediately; the pose is feedback, not a second hidden timing gate.
+        if ((directionalReady || keyboardReady) && !s_freeAttackTech
+            && front && !swinging && !reacting
+            && (!s_directionalCombat
+                || combatDirectionMatches((CutDirection)s_blockDesired, dir)))
         {
-            // One press = one perfect window; the window covers a combo's follow-up
-            // hits, and the cooldown starts from the FIRST perfect hit.
-            if (s_perfectUsedPressMs != origin)
-                s_perfectUsedPressMs     = origin;   // (was never stored: every combo hit restarted the cooldown)
-            // REWARD (user 2026-10-08) instead of the old PerfectBlockCooldownMs
-            // lockout: no cooldown at all, and the next press is accepted fresh
-            // (see manualBlockTick) - chaining perfects is the skill being paid.
-            s_perfectCooldownUntilMs = 0;
-            s_blockCooldownUntilMs   = 0;
-            s_perfectRewardUntilMs   = now + (ULONGLONG)s_perfectRewardMs;
-            s_perfectLastHitMs = now;
-            char b[128];
-            sprintf_s(b, sizeof(b), "[WASDCombat] perfect_block dir=%d press_age=%llu followup=%d",
-                      (int)dir, now - origin, sameWindow ? 1 : 0);
+            char b[96];
+            sprintf_s(b, sizeof(b), "[Ironwind] directional_guard_block dir=%d press_age=%llu pose=%d",
+                      (int)dir, now - origin,
+                      (s_freeGuardUpperIdle && s_freeBlockTech) ? 1 : 0);
             VerbLog(b);
-            return HIT_SWORD;   // caller runs the native block branch: pose, parry sound, spark, XP
+            return HIT_SWORD;   // native caller still owns sound, spark and XP
         }
     }
     HitMaterialType rv = s_iHitOrig(cc, dir, damage, who);
@@ -8650,25 +12080,140 @@ static HitMaterialType iHitYouAreYouHit_hook(CombatClass* cc, CutDirection dir, 
 // crash was setCurrentAction, NOT go).
 // -----------------------------------------------------------------------
 static void (*s_combatGoOrig)(CombatClass* thisptr, float frameTime);
+static void manualHitReactionReconcileAfterGo(CombatClass* cc,
+    unsigned int reactionSerial, int stateBefore, const char* source)
+{
+    if (!cc || cc->me != s_freeMoveAnchor) return;
+
+    if (s_hitReactionPending)
+    {
+        swordStateEnum afterState = cc->getCombatState();
+        bool inNativeState = afterState == STUMBLE || afterState == REACTION_BLOCK;
+        bool queuedNativeState = cc->nextMove == STUMBLE
+                              || cc->nextMove == REACTION_BLOCK;
+        if (inNativeState)
+        {
+            s_hitReactionPending = false;
+            InterlockedExchange(&s_hitReactionInputLock, 1);
+        }
+        else if (!queuedNativeState)
+        {
+            // _getHit requested stumble, but vanilla consumed its transition
+            // without entering a reaction. Follow that native result rather
+            // than inventing a duration or forcing a state.
+            s_hitReactionPending = false;
+            InterlockedExchange(&s_hitReactionInputLock, 0);
+            char nb[160];
+            sprintf_s(nb, sizeof(nb),
+                "[WASDCombat] hit_native_reaction_not_entered serial=%u source=%s",
+                reactionSerial, source ? source : "unknown");
+            VerbLog(nb);
+        }
+    }
+
+    if (reactionSerial)
+    {
+        static unsigned int lastSerial = 0;
+        static int lastAfter = -1;
+        int after = (int)cc->getCombatState();
+        if (reactionSerial != lastSerial || after != lastAfter)
+        {
+            lastSerial = reactionSerial;
+            lastAfter = after;
+            char rb[208];
+            sprintf_s(rb, sizeof(rb),
+                "[WASDCombat] hit_reaction_go serial=%u before=%d after=%d combat=%d source=%s",
+                reactionSerial, stateBefore, after,
+                cc->combatModeActive ? 1 : 0, source ? source : "unknown");
+            VerbLog(rb);
+        }
+    }
+}
+
 static void combatGo_hook(CombatClass* thisptr, float frameTime)
 {
+    unsigned int reactionTraceSerial = 0;
+    int reactionStateBefore = -1;
     if (!s_dcShutdownInProgress && !s_loadGuardActive
         && s_mode == MODE_FREE_MOVE && thisptr && thisptr->me
         && thisptr->me == s_freeMoveAnchor)
     {
+        // In V mode free actions own air swings and guard; a target press starts
+        // one native AttackState directly. Keep the decision layer from
+        // reacquiring movement or starting an unrequested follow-up. A genuine
+        // hit reaction still needs go(); an active native swing advances its
+        // AttackState below without entering CombatClassAI::update.
+        bool reactionLive = manualHitReactionLive(thisptr->me);
+        if (reactionLive)
+        {
+            reactionTraceSerial = s_hitReactionSerial;
+            reactionStateBefore = (int)thisptr->getCombatState();
+            if (s_hitReactionPending)
+                s_hitReactionAdvancedFrameSerial = s_manualMainFrameSerial;
+        }
+        // Automatic defence needs the original AI decision frame only when the
+        // player is holding an accepted RMB request AND a live attack is
+        // incoming. Outside that intersection V mode still owns locomotion and
+        // suppresses autonomous defence, attacks and follow-ups.
+        bool aiDefenceRequested = s_settingAiBlocks && s_blockHeldPrev && incomingAttackLive();
+        bool guardDecisionRequested = (!s_settingAiBlocks && s_blockHeld)
+                                   || aiDefenceRequested;
+        if (s_manualAttackOn)
+        {
+            swordStateEnum state = thisptr->getCombatState();
+            // Do not mistake the native victim entry STARTUP -> STUMBLE for an
+            // AI attack startup. v44 overwrote nextMove=STUMBLE with WAIT here,
+            // so the reaction animation could play while the combat state and
+            // input lock returned to DECISION on the same frame.
+            if (!reactionLive && !s_attackActive && !manualAttackCommitLive()
+                && (state == STARTUP_STATE || state == CHOP_WEAPON
+                || state == TARGET_PATHFINDING_STARTUP || state == TARGET_PATHFINDING))
+            {
+                thisptr->nextMove = WAIT_MENACINGLY;
+                thisptr->combatState = WAIT_MENACINGLY;
+            }
+            if (state != STUMBLE && state != REACTION_BLOCK && !reactionLive
+                && !manualAttackCommitLive() && !s_attackActive
+                && !guardDecisionRequested
+                && !manualAutoGuardBlockLive(thisptr->me))
+            {
+                s_retreatLockGoSuppressed = true;
+                static ULONGLONG lastManualGoLog = 0;
+                ULONGLONG nowManualGo = GetTickCount64();
+                if (nowManualGo - lastManualGoLog >= 1000)
+                {
+                    lastManualGoLog = nowManualGo;
+                    VerbLog("[Ironwind] manual_combat_ai_suppressed");
+                }
+                return;
+            }
+        }
+        // A direct CHOP owns only the original attack execution state. Calling
+        // the full go() here would also run AI decision/movement and can hand the
+        // next strike back to the AI. Advance the native state once and return.
+        // mainLoop's fallback covers frames where the engine does not call go().
+        if (!reactionLive && s_attackActive
+            && thisptr->getCombatState() == CHOP_WEAPON)
+        {
+            s_retreatLockGoSuppressed = true;
+            manualAttackAdvanceNativeState(thisptr, frameTime, "combat_go");
+            if (!(s_wHeld || s_aHeld || s_sHeld || s_dHeld)
+                && thisptr->me->movement)
+                thisptr->me->movement->halt();
+            return;
+        }
         bool wasdHeld     = s_wHeld || s_aHeld || s_sHeld || s_dHeld;
         bool movementOwns = wasdHeld
             || (s_wasdLastHeldMs > 0
                 && (GetTickCount64() - s_wasdLastHeldMs) < COMBAT_WASD_BRIDGE_MS);
         // (Manual block: the pose is vanilla's own - the DEFENSIVE_COMBAT standing
         //  order is applied while the key is held; nothing to request here.)
-        // Manual dodge: raise the native block intent for a fresh press while the
-        // AI is about to run this frame (not while WASD owns the character).
         if (s_settingManualBlock)
         {
             // MANUAL ATTACK mode: a swing intent the AI raised on its own is turned
             // into the armed ready stance before the startup state initialises it.
-            // Our E sets the same STARTUP+CHOP pair with s_attackActive.
+            // A player-authorised direct attack is already in CHOP and does not
+            // require the AI's STARTUP decision.
             if (s_manualAttackOn && !s_attackActive && thisptr->combatModeActive
                 && thisptr->getCombatState() == STARTUP_STATE && thisptr->nextMove == CHOP_WEAPON)
             {
@@ -8684,13 +12229,14 @@ static void combatGo_hook(CombatClass* thisptr, float frameTime)
             // armed ready hold with a short dwell, so the AI never decides at all
             // while nothing of ours is pending.  Untouched: a block on the way
             // (nextMove BLOCK / wantsToBlock), an incoming swing (the AI's own
-            // block logic must run - the glint tracker knows), our swing / dodge
-            // (pending or in flight), a stagger.
-            if (s_manualAttackOn && thisptr->combatModeActive && !s_attackActive && !s_dodgeActiveTech
-                && !manualAttackCommitLive() && !manualDodgeCommitLive()
+            // block logic must run - the incoming tracker knows), our swing
+            // (pending or in flight), or a stagger.
+            if (s_manualAttackOn && thisptr->combatModeActive && !s_attackActive
+                && !manualAttackCommitLive()
+                && !reactionLive
                 && thisptr->getCombatState() == DECISION
                 && thisptr->nextMove != BLOCK && !thisptr->wantsToBlock
-                && !(s_settingAiBlocks && glintIncoming()))   // build 49: WaitingStateAI hands back to DECISION every
+                && !aiDefenceRequested)                       // build 49: WaitingStateAI hands back to DECISION every
                                                                 // frame an attack slot is free, and enemy swings are
                                                                 // "incoming" most of a melee - with AI blocks OFF the
                                                                 // exemption only let the refused-startup twitch back in
@@ -8707,15 +12253,27 @@ static void combatGo_hook(CombatClass* thisptr, float frameTime)
             }
             if (focusLockLive() && thisptr->currentTarget != s_lockTarget)
                 thisptr->currentTarget = s_lockTarget;          // the AI thinks about the lock only
-            manualDodgeTrack(thisptr);
-            manualAttackTrack(thisptr, movementOwns);
-            s_anchorPrevState = (int)thisptr->getCombatState();   // DIAG for manual_ai_attack_denied
-            if (!movementOwns)
-                manualBlockInject(thisptr);
-            if (!movementOwns || manualDodgeCommitLive())
-                manualDodgeInject(thisptr);
-            if (!movementOwns || manualAttackCommitLive())
-                manualAttackInject(thisptr);
+            // The native hit reaction has exclusive action ownership.  Input
+            // resumes on the exact native state exit.
+            if (!reactionLive)
+            {
+                manualAttackTrack(thisptr, movementOwns);
+                s_anchorPrevState = (int)thisptr->getCombatState();   // DIAG for manual_ai_attack_denied
+                if (aiDefenceRequested)
+                    manualAutoBlockInject(thisptr);
+                else if (!movementOwns)
+                    manualBlockInject(thisptr);
+            }
+        }
+        // With V enabled, neutral idle belongs to the player.  Do not let an
+        // old attack order resume pathfinding after the requested swing ends.
+        if (s_manualAttackOn && !s_attackActive && !manualAttackCommitLive()
+            && !guardDecisionRequested
+            && !reactionLive
+            && !isCommittedCombatClip(thisptr->me))
+        {
+            s_retreatLockGoSuppressed = true;
+            return;
         }
         // Let go() RUN while a committed combat clip is mid-play (swing / stagger /
         // parry) so it FINISHES and the state advances (the charMovUpdate buffer holds
@@ -8723,7 +12281,9 @@ static void combatGo_hook(CombatClass* thisptr, float frameTime)
         // chains and movement takes over.  Suppressing only OUTSIDE the clip also means
         // we never freeze the state machine mid-clip (the buffer would otherwise stick
         // forever — e.g. a stagger that never advances).
-        if (movementOwns && !isCommittedCombatClip(thisptr->me))
+        if (movementOwns && !reactionLive && !s_attackActive && !manualAttackCommitLive()
+            && !aiDefenceRequested
+            && !isCommittedCombatClip(thisptr->me))
         {
             s_retreatLockGoSuppressed = true;   // WASD owns locomotion; AI stands down
             return;                             // skip the combat decision entirely
@@ -8731,6 +12291,18 @@ static void combatGo_hook(CombatClass* thisptr, float frameTime)
     }
     s_retreatLockGoSuppressed = false;
     s_combatGoOrig(thisptr, frameTime);
+    // BLOCK often returns to DECISION in the same call that starts its visual
+    // technique. Reconcile against the real clip after original go(); the
+    // helper restores guard-ready only when that clip has actually ended.
+    if (thisptr && thisptr->me == s_freeMoveAnchor && s_autoBlockActiveTech)
+        (void)manualAutoGuardBlockLive(thisptr->me);
+    manualHitReactionReconcileAfterGo(thisptr, reactionTraceSerial,
+        reactionStateBefore, "engine");
+    if (thisptr && thisptr->me == s_freeMoveAnchor && s_mode == MODE_FREE_MOVE
+        && s_manualAttackOn && s_attackActive
+        && !(s_wHeld || s_aHeld || s_sHeld || s_dHeld)
+        && thisptr->me->movement)
+        thisptr->me->movement->halt();  // no AI walk-in during a player swing
 }
 
 // -----------------------------------------------------------------------
@@ -8740,7 +12312,7 @@ static void combatGo_hook(CombatClass* thisptr, float frameTime)
 //   1.  Safety gate (load-guard)
 //   2.  Selection tracking
 //   3.  V-Mode transition
-//   4.  HUD + X speed key
+//   4.  HUD + vanilla movement-speed synchronisation
 //   5.  Pre-AI WASD
 //   6.  s_mainLoopOrig (AI + CharMovement::update + CombatClass::go)
 //   7.  Post-AI combat job suppression
@@ -8760,9 +12332,147 @@ static bool dcInUpdateList(GameWorld* gw, Character* c)
     return false;
 }
 
+static void manualVictimResponseClearSlot(int i)
+{
+    s_victimResponseVictim[i] = nullptr;
+    s_victimResponseAttacker[i] = nullptr;
+    s_victimResponseSource[i] = nullptr;
+}
+
+// Complete a neutral victim's retaliation only after the original main loop
+// has returned from the AttackState/impact stack that raised the aggression.
+// This is event/order sequencing, not an artificial combat delay. Cached
+// Character identities are always checked against the live update list before
+// dereference; refusal by the victim's original rules is logged and respected.
+static void manualVictimResponseTick(GameWorld* gw)
+{
+    if (!gw || s_dcShutdownInProgress || s_loadGuardActive) return;
+    for (int i = 0; i < 8; ++i)
+    {
+        Character* victim = s_victimResponseVictim[i];
+        Character* attacker = s_victimResponseAttacker[i];
+        const char* source = s_victimResponseSource[i];
+        if (!victim) continue;
+        if (!attacker || victim == attacker
+            || !dcInUpdateList(gw, victim) || !dcInUpdateList(gw, attacker))
+        {
+            VerbLog("[Ironwind] attack_victim_response_dropped reason=not_live");
+            manualVictimResponseClearSlot(i);
+            continue;
+        }
+        if (manualVPlayerTeamMember(victim) || victim->isDead()
+            || victim->getProneState() == PS_KO || attacker->isDead())
+        {
+            VerbLog("[Ironwind] attack_victim_response_dropped reason=invalid_actor");
+            manualVictimResponseClearSlot(i);
+            continue;
+        }
+
+        // Repeat awareness after the world/campaign update, then issue exactly
+        // one victim-side combat task. Do not force temporary-enemy memory:
+        // slaves, guards and other special identities retain vanilla refusal.
+        victim->attackingYou(attacker, true, true);
+        victim->attackTarget(attacker);
+        CombatClass* victimCombat = victim->getCombatClass();
+        char b[256];
+        sprintf_s(b, sizeof(b),
+            "[Ironwind] attack_victim_response source=%s victim_enemy=%d attacker_enemy=%d target_set=%d",
+            source ? source : "unknown",
+            victim->isEnemy(attacker, true) ? 1 : 0,
+            attacker->isEnemy(victim, true) ? 1 : 0,
+            victimCombat && victimCombat->currentTarget == attacker ? 1 : 0);
+        VerbLog(b);
+        manualVictimResponseClearSlot(i);
+    }
+}
+
+// Reconcile the direct native state once per main-thread frame as well as from
+// combatGo_hook.  This catches a state exit even when the engine stops calling
+// CombatClass::go; the real native state remains the sole duration authority.
+static void manualAttackLifecycleTick(GameWorld* gw, float frameTime)
+{
+    if (!s_attackActive || !gw || !s_freeMoveAnchor
+        || !dcInUpdateList(gw, s_freeMoveAnchor)) return;
+    CombatClass* cc = s_freeMoveAnchor->getCombatClass();
+    if (!cc) return;
+    manualAttackAdvanceNativeState(cc, frameTime, "main_fallback");
+    swordStateEnum st = cc->getCombatState();
+    if (st == CHOP_WEAPON) s_attackSawChop = true;
+    bool playerMoving = s_wHeld || s_aHeld || s_sHeld || s_dHeld;
+    if (!manualAttackStillSwingingOrRecover(cc, "main_lifecycle"))
+    {
+        st = cc->getCombatState();
+        manualAttackFinish(cc, playerMoving,
+            manualHitReactionLive(cc->me) ? "hit_reaction_main"
+            : (st == TARGET_PATHFINDING || st == TARGET_PATHFINDING_STARTUP)
+                ? "unexpected_pathfinding_main" : "state_exit_main");
+    }
+}
+
+// Compatibility fallback for combat controllers that queue a native victim
+// reaction but do not schedule the controlled character's go() afterwards.
+// This is deliberately narrower than attack advancement: it runs only for the
+// exact native victim transition STARTUP -> STUMBLE/REACTION_BLOCK, at most
+// once per world frame, and calls the original go implementation. Native
+// state and animation exit remain the sole duration authority.
+static void manualHitReactionLifecycleTick(GameWorld* gw, float frameTime)
+{
+    if (!s_hitReactionPending || !s_combatGoOrig || !gw
+        || s_dcShutdownInProgress || s_loadGuardActive
+        || s_mode != MODE_FREE_MOVE || !s_manualAttackOn
+        || !s_freeMoveAnchor || !dcInUpdateList(gw, s_freeMoveAnchor)
+        || s_hitReactionAdvancedFrameSerial == s_manualMainFrameSerial)
+        return;
+
+    CombatClass* cc = s_freeMoveAnchor->getCombatClass();
+    if (!cc) return;
+
+    swordStateEnum state = cc->getCombatState();
+    if (state == STUMBLE || state == REACTION_BLOCK)
+    {
+        s_hitReactionPending = false;
+        InterlockedExchange(&s_hitReactionInputLock, 1);
+        return;
+    }
+
+    bool queuedNativeState = cc->nextMove == STUMBLE
+                          || cc->nextMove == REACTION_BLOCK;
+    if (!queuedNativeState)
+    {
+        s_hitReactionPending = false;
+        InterlockedExchange(&s_hitReactionInputLock, 0);
+        char nb[160];
+        sprintf_s(nb, sizeof(nb),
+            "[WASDCombat] hit_native_reaction_not_entered serial=%u source=main_reconcile",
+            s_hitReactionSerial);
+        VerbLog(nb);
+        return;
+    }
+
+    // _getHit's verified entry shape. Do not run an AI decision from any other
+    // state merely because an unrelated mod left a reaction enum in nextMove.
+    if (state != STARTUP_STATE) return;
+
+    unsigned int reactionSerial = s_hitReactionSerial;
+    int stateBefore = (int)state;
+    s_hitReactionAdvancedFrameSerial = s_manualMainFrameSerial;
+    cc->combatModeActive = true;
+    s_combatGoOrig(cc, frameTime);
+
+    char fb[208];
+    sprintf_s(fb, sizeof(fb),
+        "[WASDCombat] hit_reaction_fallback_advance serial=%u before=%d after=%d next=%d",
+        reactionSerial, stateBefore, (int)cc->getCombatState(), (int)cc->nextMove);
+    VerbLog(fb);
+    manualHitReactionReconcileAfterGo(cc, reactionSerial, stateBefore,
+        "main_fallback");
+}
+
 static void mainLoop_hook(GameWorld* thisptr, float time)
 {
-    s_gwFrame = thisptr;  // manual combat: world for the dodge foe scan (fresh every frame)
+    ++s_manualMainFrameSerial;
+    if (s_manualMainFrameSerial == 0) ++s_manualMainFrameSerial;
+    s_gwFrame = thisptr;  // manual combat: current world for validated target scans
     // Build 74 (quickload froze 2026-10-01, 6501 per-frame AVs): the SaveManager
     // signal is set when a load is REQUESTED and consumed before the loading
     // flag goes up, so reading it only while the flag is up (build 67) never saw
@@ -8798,7 +12508,10 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             }
         }
     }
-    manualBlockTick();    // manual combat: hold/release edges + dodge press processing (self-gated, cheap)
+    manualInteractionTargetTick(); // nearby visible character -> E prompt
+    manualInteractionActionTick(); // E opens only that target's native menu
+    manualConsumeCombatRmb();       // RMB is always guard outside a visible menu
+    manualBlockTick();    // manual combat: block hold/release edges (self-gated, cheap)
     // Hard-shutdown: all DC hook logic suppressed while true.
     // The six-condition stabilization countdown runs inside this block so it
     // advances even while the shutdown flag is held.
@@ -8936,14 +12649,10 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                     s_dcPtrLossActive = false;
                     s_loadGuardActive = true;
                     clearAllState();
-                    s_vHud.label = nullptr;
-                    s_vHud.shown = false;
-                    s_hudReady   = false;
                     DebugLog("[WASDCombat] dc_loadgame_old_state_cleared");
                     DebugLog("[WASDCombat] load_guard_enabled");
                     DebugLog("[WASDCombat] dc_loadgame_shutdown_complete");
                 }
-                hudUpdate();
                 return;
             }
 
@@ -8980,7 +12689,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                     s_anchorMovement    = nullptr;
                     s_selectedCharacter = nullptr;
                     s_selectedMovement  = nullptr;
-                    hudUpdate();
                     if (ou->player) s_mainLoopOrig(thisptr, time);
                     return;
                 }
@@ -9033,7 +12741,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                             DebugLog(dlbuf);
                         }
                     }
-                    hudUpdate();
                     if (ou->player) s_mainLoopOrig(thisptr, time);
                     return;
                 }
@@ -9065,13 +12772,9 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                     s_savedCamFollowOffY           = 0.0f;
                     s_loadGuardActive = true;
                     clearAllState();
-                    s_vHud.label = nullptr;
-                    s_vHud.shown = false;
-                    s_hudReady   = false;
                     DebugLog("[WASDCombat] dc_loadgame_old_state_cleared");
                     DebugLog("[WASDCombat] load_guard_enabled");
                 }
-                hudUpdate();
                 if (ou && ou->player) s_mainLoopOrig(thisptr, time);
                 return;
             }
@@ -9096,7 +12799,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                               (void*)chR, nowDf - s_dcPtrLossStartedAt);
                     DebugLog(db);
                 }
-                hudUpdate();
                 s_mainLoopOrig(thisptr, time);
                 return;
             }
@@ -9180,10 +12882,9 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             // The DETACHED third-person camera too (2026-09-06 rebuild has its
             // own flag; user 2026-09-14: new game started in OTS showed no
             // characters in creation and a stuck crosshair until DC was
-            // toggled).  Re-attach while the camera is valid, drop the CTRL
-            // toggle so nothing re-enters, and release the crosshair/pointer.
+            // toggled). Re-attach while the camera is valid and release the
+            // crosshair/pointer.
             if (s_otsCamActive) exitOtsCam(true);
-            s_camRotateToggle = false;
             dcUpdateCrosshair(false);
             s_fpSuspendedForInv = false;
             s_otsInvFaceActive = false;
@@ -9224,7 +12925,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             s_aHeld               = false;
             s_sHeld               = false;
             s_dHeld               = false;
-            s_xPressed            = false;
             s_wasdWasActive       = false;
             s_wasdMovementApplied = false;
             s_prevWasdDir         = Ogre::Vector3::ZERO;
@@ -9355,6 +13055,16 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             if (!s_invMoveThroughActive)
             {
                 s_invMoveThroughActive = true;
+                if (s_manualAttackOn)
+                {
+                    s_wasdHoldActive = true;
+                    s_playerPointClickActive = false;
+                    s_holdPosValid = false;
+                    char b[128]; sprintf_s(b, sizeof(b),
+                        "[Ironwind] inventory_control_retained zoom=%.2f",
+                        s_otsZoomCur);
+                    VerbLog(b);
+                }
                 DebugLog("[WASDCombat] inv_move_through_begin");
             }
             s_lootUiWasPrevOpen = true;   // track open so the close edge is clean
@@ -9402,6 +13112,13 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             s_lootUiWasPrevOpen       = false;
             s_lootUiSuspendActive     = false;
             s_lootSuspendStartTick    = 0;
+            if (s_manualAttackOn)
+            {
+                char b[128]; sprintf_s(b, sizeof(b),
+                    "[Ironwind] inventory_control_restored zoom=%.2f",
+                    s_otsZoomCur);
+                VerbLog(b);
+            }
             DebugLog("[WASDCombat] inv_move_through_end");
         }
         else if (anyInvOpen && !s_lootUiWasPrevOpen)
@@ -9495,7 +13212,7 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
         registerNativeCommands(key);
 
     // Movement flags come from the poll thread (always — see the native
-    // keybind block comment).  Only the toggle/speed persistence watchdog
+    // keybind block comment).  Only the toggle persistence watchdog
     // runs here: it saves rebinds even if the options menu never calls
     // saveOptions, and logs whether rebinds actually reach Command::bound.
     if (s_nativeCommandsRegistered)
@@ -9554,7 +13271,20 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             s_playerPointClickActive = false;
             s_holdPosValid           = false;
             s_idleHoldEngaged        = false;
-            s_camRotateToggle        = false;   // start DC with rotate-toggle off
+            s_manualAttackOn         = s_settingManualBlock && (s_freeMoveAnchor != nullptr);
+            s_recentMouseLastMs      = 0;
+            if (s_manualAttackOn && s_freeMoveAnchor)
+            {
+                manualEnsureWeaponReady(s_freeMoveAnchor, s_freeMoveAnchor->getStats());
+                CombatClass* readyCombat = s_freeMoveAnchor->getCombatClass();
+                if (readyCombat && readyCombat->animation)
+                    readyCombat->animation->setCombatMode(true);
+                CharacterHuman* readyHuman = s_freeMoveAnchor->isHuman();
+                char readyLog[96]; sprintf_s(readyLog, sizeof(readyLog),
+                    "[Ironwind] v_combat_stance_prearmed hand=%d",
+                    readyHuman && readyHuman->weaponInHands ? 1 : 0);
+                VerbLog(readyLog);
+            }
 
             if (s_freeMoveAnchor && ou->player->camera)
             {
@@ -9565,21 +13295,40 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                 s_savedCamFollowOffY = ou->player->camera->objectCurrentlyFollowingOffset.y;
                 DebugLog("[WASDCombat] camera_lock_enabled_dc");
             }
-            ou->showPlayerAMessage("Direct Control Enabled", false);
+            ou->showPlayerAMessage(dcZh("Direct Control Enabled"), false);
         }
         else if (!curInVM && prevInVM && !s_lootUiSuspendActive)
         {
+            // V owns only Ironwind's bookkeeping, never the native reaction or
+            // animation duration.  Relinquish an in-flight direct attack before
+            // dropping the anchor so a hit/menu/KO boundary cannot carry the
+            // stale attack latch into the next V session.  The CombatClass state
+            // itself is intentionally untouched and continues under vanilla.
+            if (s_attackActive)
+            {
+                CombatClass* leavingCombat = s_freeMoveAnchor
+                    ? s_freeMoveAnchor->getCombatClass() : nullptr;
+                manualAttackFinish(leavingCombat, false, "v_mode_exit");
+                VerbLog("[Ironwind] attack_v_boundary_released");
+            }
+            s_attackCommitUntilMs = 0;
+            manualAttackClearQueuedInput(true);
+            manualAttackClearAimInput(false, true);
+            s_autoBlockAttemptWho = nullptr;
+            s_autoBlockAttemptStartMs = 0;
+
             // DC turned off — drop the OTS camera first (re-attach to the rig
             // while the anchor is still valid), then restore vanilla camera.
             if (s_fpActive) exitOTS(true);
             if (s_firstPersonActive) exitFirstPerson(true);
+            s_wheelFirstPersonActive = false;
+            s_otsResumeZoomPending = false;
             // The DETACHED third-person camera too (2026-09-06 rebuild has its
             // own flag; user 2026-09-14: new game started in OTS showed no
             // characters in creation and a stuck crosshair until DC was
-            // toggled).  Re-attach while the camera is valid, drop the CTRL
-            // toggle so nothing re-enters, and release the crosshair/pointer.
+            // toggled). Re-attach while the camera is valid and release the
+            // crosshair/pointer.
             if (s_otsCamActive) exitOtsCam(true);
-            s_camRotateToggle = false;
             dcUpdateCrosshair(false);
             s_fpSuspendedForInv = false;
             ou->player->stopTrackCharacter();
@@ -9592,9 +13341,8 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             s_savedCamFollowOffY      = 0.0f;
             s_cameraLockInvSuspend    = false;
             s_cameraLockTurretSuspend = false;
-            // Restore vanilla hold-to-rotate: drop the toggle and clear the forced
-            // rotate flag so the camera doesn't stay rotating in vanilla mode.
-            s_camRotateToggle         = false;
+            // Restore vanilla hold-to-rotate state so the camera cannot remain
+            // rotating in vanilla mode.
             if (key) key->rotate      = false;
             DebugLog("[WASDCombat] camera_lock_disabled_restore_freecam");
             s_freeMoveAnchor        = nullptr;
@@ -9610,7 +13358,7 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             s_playerPointClickActive = false;
             s_holdPosValid           = false;
             s_idleHoldEngaged        = false;
-            ou->showPlayerAMessage("Direct Control Disabled", false);
+            ou->showPlayerAMessage(dcZh("Direct Control Disabled"), false);
         }
         else if (curInVM && s_freeMoveAnchor && !s_lootUiSuspendActive)
         {
@@ -9701,6 +13449,8 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     if (s_fpToggleRequested)
     {
         s_fpToggleRequested = false;
+            s_wheelFirstPersonActive = false; // F remains an explicit independent toggle
+        s_otsResumeZoomPending = false;
         if (s_firstPersonActive)
         {
             s_userWantsFP = false;         // user turned FP off — clear the persistent intent
@@ -9740,7 +13490,7 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     // on the SNEAK button takes), so the UI checkbox, the standing order, and
     // the character's stealth state all stay in sync (user 2026-08-01: direct
     // setStealthMode toggled sneak but left the SNEAK button visually off).
-    // Same precedent as the X speed key driving OrdersPanel::speedNext.  Falls
+    // Use the same OrdersPanel path as the vanilla sneak control. Falls
     // back to the raw state switch if the panel isn't showing the anchor (no UI
     // to sync in that case).  Stealth skill, detection, and XP all run vanilla
     // (Rule 1: DC invokes the system, it does not reimplement it); WASD speed
@@ -9990,24 +13740,18 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     }
     s_prof_cameraLock += qpcNow() - _clStart; }   // end camera-lock timer
 
-    // 4. HUD + X speed key.
-    hudUpdate();
-
-    // SPEEDSYNC-TWEAK: s_xPressed = the legacy X path (cycles the panel THEN
-    // applies).  s_syncSpeedToAnchor = vanilla cycle_run_speed already cycled
-    // the panel (orig ran in processKeys), so only APPLY to the anchor — no
-    // second speedNext (that would skip a step).  Both end at the same apply.
-    if ((s_xPressed || s_syncSpeedToAnchor) && !s_lootUiSuspendActive)
+    // 4. Vanilla walk/jog/run cycle synchronisation. The original
+    // cycle_run_speed command has already updated the OrdersPanel; only mirror
+    // that selection to the directly controlled anchor. X/Z remain exclusively
+    // Kenshi's speed_3/speed_1 game-time commands.
+    if (s_syncSpeedToAnchor && !s_lootUiSuspendActive)
     {
-        bool doCycle = s_xPressed;
-        s_xPressed          = false;
         s_syncSpeedToAnchor = false;
         if (s_mode == MODE_FREE_MOVE && s_freeMoveAnchor && s_freeMoveAnchor->movement)
         {
             OrdersPanel* op = (gui && gui->mainbar) ? gui->mainbar->ordersDataPanel : nullptr;
             if (op)
             {
-                if (doCycle) op->speedNext(nullptr);
                 MoveSpeed ns = MoveSpeed(int((unsigned char)op->speedImageNamesIdx));
                 if (ns < GROUPED)
                 {
@@ -10244,9 +13988,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                 DebugLog("[WASDCombat] loadgame_signal_hard_shutdown");
                 s_loadGuardActive = true;
                 clearAllState();
-                s_vHud.label = nullptr;
-                s_vHud.shown = false;
-                s_hudReady   = false;
                 if (hardLoss)
                     DebugLog("[WASDCombat] dc_loadgame_shutdown_complete");
             }
@@ -10267,6 +14008,21 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     // Skip all DC post-processing if a hard shutdown is in progress.
     if (s_dcShutdownInProgress)
         return;
+
+    // The original world update has now returned, so campaign/awareness state
+    // raised by a neutral attack is visible before the victim receives its one
+    // retaliation task. This closes the first-victim ordering race without
+    // restoring any player-side focused attack task.
+    manualVictimResponseTick(thisptr);
+
+    // The game updates movement and animation inside mainLoop. Reconcile the
+    // direct native state, then apply no-target clips so the update cannot
+    // replace them this frame.
+    // Reactions own the body over attacks. Service a missing native reaction
+    // transition before reconciling the outgoing attack bookkeeping.
+    manualHitReactionLifecycleTick(thisptr, time);
+    manualAttackLifecycleTick(thisptr, time);
+    manualFreeActionTick();
 
 
     // 7b. Auto-off when the controlled character is knocked out (or dead) and
@@ -10489,7 +14245,13 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     {
         s_rmbPressedEdge = false;
         VerbLog("[WASDCombat] dc_click_input_seen");
-        if (s_wasdHoldActive)
+        // In directional V combat the same physical RMB is the guard key.
+        // Treating it as a ground click cleared the post-WASD hold, handing a
+        // queued path or the defensive-combat order control of the feet.
+        if (s_directionalCombat && s_manualAttackOn && s_settingManualBlock
+            && !s_interactionMenuByE)
+            VerbLog("[Ironwind] guard_input_keeps_wasd_hold");
+        else if (s_wasdHoldActive)
         {
             s_wasdHoldActive         = false;
             s_playerPointClickActive = true;
@@ -11199,6 +14961,7 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     // Native settings tab: detect UI-driven setting changes → unit
     // conversions, FP camera re-apply, immediate INI persistence.  Touches
     // only our own statics (no GUI calls, no character state).
+    manualRuntimeInvariantTick();
     dcOptionsWatch();
 }
 
@@ -11223,6 +14986,25 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
     }
     if (s_mode == MODE_FREE_MOVE && !s_lootUiSuspendActive)
     {
+        if (s_interactionMenuByE && thisptr->contextMenu.isVisible())
+        {
+            // Native hold-menu normally expects RMB to remain down. Keep only
+            // that latch alive; MyGUI receives the user's real pointer/buttons
+            // and executes its own option callbacks.
+            k.mRight = k.lastMRight = true;
+            k.mRDown = k.mRUp = false;
+        }
+        else if (s_interactionMenuByE)
+        {
+            s_interactionMenuByE = false;
+        }
+        if (mouseCombatContext())
+        {
+            // Let the poller own mouse combat without issuing vanilla click
+            // orders or opening the right-click context menu during a guard.
+            k.mLeft = k.mRight = k.lastMLeft = k.lastMRight = false;
+            k.mLDown = k.mRDown = k.mLUp = k.mRUp = false;
+        }
         bool wasdHeld = s_wHeld || s_aHeld || s_sHeld || s_dHeld;
         bool atTurret = isUsingStationaryTurret(s_freeMoveAnchor);
 
@@ -11283,6 +15065,7 @@ static const char* taskTypeName(TaskType t)
     {
         case MELEE_ATTACK:               return "MELEE_ATTACK";
         case FOCUSED_MELEE_ATTACK:       return "FOCUSED_MELEE_ATTACK";
+        case UNPROVOKED_FOCUSED_MELEE_ATTACK: return "UNPROVOKED_FOCUSED_MELEE_ATTACK";
         case CHOOSE_ENEMY_AND_ATTACK:    return "CHOOSE_ENEMY_AND_ATTACK";
         case CHOOSE_ATTACKER_OF_ALLY:    return "CHOOSE_ATTACKER_OF_ALLY";
         case ATTACK_CHARACTERS_ATTACKER: return "ATTACK_CHARACTERS_ATTACKER";
@@ -11491,6 +15274,7 @@ static void addJob_hook(Character* thisptr, TaskType t, RootObject* subject,
         }
 
         bool isAttackJob  = (t == MELEE_ATTACK            || t == FOCUSED_MELEE_ATTACK      ||
+                              t == UNPROVOKED_FOCUSED_MELEE_ATTACK ||
                               t == CHOOSE_ENEMY_AND_ATTACK || t == ATTACK_CHARACTERS_ATTACKER ||
                               t == ATTACK_ENEMIES);
         bool isMedicalJob = (t == JOB_MEDIC        || t == FIRST_AID_ORDER  ||
@@ -11706,7 +15490,7 @@ static void applyNativeBindsFromIni(InputHandler* self)
     // Migration guard: only apply stored binds written by the CURRENT format.
     // A v1 file (no "version=" key, or < current) stored Command::bound garbage
     // (e.g. "=1"); applying it would bind the command to key 1.  Ignore those,
-    // leave the addCommand defaults (V / X) in place, and re-stamp the file so it
+    // leave the addCommand default (V) in place, and re-stamp the file so it
     // self-heals to v2 going forward.
     int ver = (int)GetPrivateProfileIntA("NativeBinds", "version", 0, path);
     if (ver < DC_NATIVE_BIND_FORMAT_VERSION)
@@ -11727,7 +15511,7 @@ static void applyNativeBindsFromIni(InputHandler* self)
         if (v > 0)
         {
             // bind() ADDS a key, it does not replace — so the addCommand default
-            // (V / X) would remain ALONGSIDE the saved key and BOTH would fire
+            // (V) would remain ALONGSIDE the saved key and BOTH would fire
             // (field 2026-06-20: default + new bind both activated after restart).
             // Unbind the command first so exactly the saved key remains.  This
             // also cleans up any leftover double-binding from the old format.
@@ -11752,9 +15536,9 @@ static void applyNativeBindsFromIni(InputHandler* self)
 // iniSavedNativeBind — the keycode a dc_ command was rebound to in the v2
 // [NativeBinds] INI, or -1 if the user never rebound it (no file, pre-v2
 // format, or value absent).  Mirrors applyNativeBindsFromIni's version gate
-// exactly.  Used at registration to decide whether to claim the V/X default
+// exactly.  Used at registration to decide whether to claim the V default
 // at all: if the user already moved the command (e.g. to Ctrl+V), registering
-// plain V/X would let Kenshi's one-command-per-key rule STEAL V/X from any
+// plain V would let Kenshi's one-command-per-key rule steal V from any
 // vanilla command (camera tilt, zoom-out) the player bound there, wiping it
 // every session (field report 2026-06-23).
 static int iniSavedNativeBind(const char* name)
@@ -11767,27 +15551,27 @@ static int iniSavedNativeBind(const char* name)
     return (v > 0) ? v : -1;
 }
 
-// registerNativeCommands — register dc_toggle / dc_speed_cycle and apply
+// registerNativeCommands — register dc_toggle and apply
 // INI-persisted bindings.  FIELD FINDING (2026-06-10 log): the game runs
 // InputHandler::loadConfig BEFORE RE_Kenshi loads plugins, so a loadConfig
 // hook alone never fires.  This is therefore called from the first
 // mainLoop pass (key global valid, main thread) — the loadConfig hook
 // remains only as a re-registration path if the game ever reloads its
-// keyboard config.  Toggle + speed ONLY: movement keys must never be
+// keyboard config. Only the V toggle is plugin-owned; movement keys must never be
 // registered (one command per key; vanilla camera owns W/S/A/D).
 static void registerNativeCommands(InputHandler* self)
 {
     if (s_nativeCommandsRegistered || !self) return;
     if (!s_processKeysHookOk)
     {
-        // Without the event reader, toggle/speed presses would be lost —
+        // Without the event reader, toggle presses would be lost —
         // stay on the INI/poll fallback entirely.
         DebugLog("[WASDCombat] dc_native_keybinds_skipped_no_event_reader");
         return;
     }
-    // Claim the V/X default ONLY when the user has not rebound the command.
+    // Claim the V default ONLY when the user has not rebound the command.
     // If a saved rebind exists (e.g. Ctrl+V), register with NO physical key so
-    // loadConfig never steals plain V/X from a vanilla camera binding; the
+    // loadConfig never steals plain V from a vanilla binding; the
     // saved key is restored by applyNativeBindsFromIni immediately below.
     const int savedToggle = iniSavedNativeBind("dc_toggle");
     self->addCommand("dc_toggle",        0,
@@ -11801,7 +15585,7 @@ static void registerNativeCommands(InputHandler* self)
         (savedToggle > 0) ? "deferred(rebound)" : "V");
     DebugLog(rnbuf);
     applyNativeBindsFromIni(self);       // our INI is the real persistence
-    s_nativeCommandsRegistered = true;   // poll-thread toggle/speed stand down
+    s_nativeCommandsRegistered = true;   // poll-thread toggle stands down
     DebugLog("[WASDCombat] dc_native_keybinds_registered");
 }
 
@@ -11835,41 +15619,46 @@ static void optionsCreate_hook(OptionsWindow* self)
 
     // v1.5: ALL Direct Control rows now live on the mod's own settings page
     // (sliders + checkboxes + keybinds) — see the NATIVE SETTINGS TAB block.
-    // The dc_toggle/dc_speed_cycle KeyConfig rows moved there from the
+    // The dc_toggle and vanilla cycle_run_speed rows moved there from the
     // Controls tab (user request 2026-09-02); their registration and
     // saveOptions persistence are unchanged.
     dcInjectSettingsTab(self);
 }
 
-// GameWorld::processKeys — toggle/speed press events arrive in key->events
+// GameWorld::processKeys — toggle and observed vanilla speed-cycle events arrive in key->events
 // for exactly one processKeys cycle; consume them here on the main thread.
 // No pause gate: the V toggle has always worked while paused (poll-thread
 // behavior preserved).  Loading screens are skipped.
 static void (*s_processKeysOrig)(GameWorld* thisptr);
 static void processKeys_hook(GameWorld* thisptr)
 {
-    // MANUAL BLOCK: while DC is on, our Block key must not also flip vanilla's
-    // orders-panel block MODE.  Orig never clears key->events, so erasing the
-    // command BEFORE orig reliably stops the dispatch (v1.9.2 pattern).
-    if (s_settingManualBlock && s_mode == MODE_FREE_MOVE && !s_dcShutdownInProgress && key)
+    if (key && mouseCombatContext())
+    {
+        key->mLeft = key->mRight = key->lastMLeft = key->lastMRight = false;
+        key->mLDown = key->mRDown = key->mLUp = key->mRUp = false;
+    }
+    // While DC is on, a physical mod key must not also dispatch the vanilla
+    // command bound to the same key. Orig never clears key->events, so erasing
+    // the matching command BEFORE orig reliably stops the double action.
+    if (s_mode == MODE_FREE_MOVE && !s_dcShutdownInProgress && key)
     {
         // Build 53 (user 2026-09-23: "F2 stops working"): these vanilla commands
         // are dropped ONLY while the mod key that collides with them is physically
         // down.  The old rule dropped every speed_1 / speed_3 / toggle_block event
         // by NAME, so F2 (speed_1 in controls.cfg), F4 (speed_3) and NUM0 (block
         // toggle) were eaten for the whole time DC was on, not just for Q / E / G.
-        bool dodgeDown  = (GetAsyncKeyState(s_bindVk[KR_DODGE])  & 0x8000) != 0;
-        bool attackDown = (GetAsyncKeyState(s_bindVk[KR_ATTACK]) & 0x8000) != 0;
-        bool blockDown  = (GetAsyncKeyState(s_bindVk[KR_BLOCK])  & 0x8000) != 0;
+        bool viewDown   = (GetAsyncKeyState(s_bindVk[KR_FP]) & 0x8000) != 0;
+        bool attackDown = s_settingManualBlock && !s_directionalCombat
+                       && (GetAsyncKeyState(s_bindVk[KR_ATTACK]) & 0x8000) != 0;
+        bool blockDown  = s_settingManualBlock && !s_directionalCombat
+                       && (GetAsyncKeyState(s_bindVk[KR_BLOCK])  & 0x8000) != 0;
         for (auto it = key->events.begin(); it != key->events.end(); )
         {
             const std::string& en = (*it)->name;
-            // v1.5: Block sits on F = vanilla focus_char (camera re-center) -
-            // a block press in a fight must not also snap the camera.  Only
-            // while manual combat is on; F is plain vanilla focus otherwise.
-            bool drop = (en == "toggle_block" && blockDown)
-                     || (en == "focus_char"   && blockDown && s_manualAttackOn)
-                     || (en == "speed_1"      && dodgeDown)
+            // v117: FirstPerson sits on F = vanilla focus_char. Consume that
+            // one collision only in V mode; outside V the original F survives.
+            bool drop = (en == "focus_char"   && viewDown)
+                     || (en == "toggle_block" && blockDown)
                      || (en == "speed_3"      && attackDown);
             if (drop) it = key->events.erase(it);
             else ++it;
@@ -11889,7 +15678,7 @@ static void processKeys_hook(GameWorld* thisptr)
         // do NOT cycle again — just flag the anchor's desired speed to be
         // re-synced to the panel in mainLoop (the DC anchor runs under
         // MOVE_DIRECTION, where the panel change doesn't reach its movement
-        // on its own — the same reason the old X path set it explicitly).
+        // on its own).
         else if (n == "cycle_run_speed" && s_mode == MODE_FREE_MOVE)
             s_syncSpeedToAnchor = true;
     }
@@ -11959,7 +15748,24 @@ __declspec(dllexport) void startPlugin()
         }
         // (handle intentionally kept for the life of the process)
     }
-    DebugLog("WASDCombatPlugin v1.5.0 — Direct Control: manual combat, aim focus, weapon glint, realistic first person");
+    DebugLog("Ironwind Combat v" IRONWIND_VERSION " (Direct Control base v" DIRECT_CONTROL_BASE_VERSION ") — manual combat, aim focus, weapon glint, realistic first person");
+
+    // Resolve the non-virtual CombatClass base update explicitly. Calling
+    // cc->update() would dispatch to CombatClassAI::update and restore the AI
+    // ownership v67 removed. The qualified base implementation dispatches a
+    // CHOP only to CombatClass::attackState.
+    s_combatBaseUpdateNative = (void (*)(CombatClass*, float))
+        KenshiLib::GetRealAddress(&CombatClass::_NV_update);
+    if (!s_combatBaseUpdateNative)
+        ErrorLog("WASDCombatPlugin: CombatClass base update resolve FAILED — direct native attacks disabled");
+    else
+    {
+        char ub[112];
+        sprintf_s(ub, sizeof(ub), "[Ironwind] combat_base_update_resolved rva=%llX",
+            (unsigned long long)((intptr_t)s_combatBaseUpdateNative
+                - (intptr_t)GetModuleHandleA(NULL)));
+        DebugLog(ub);
+    }
 
     // INI keybinds remain the FALLBACK: loaded unconditionally so the poll
     // thread works from frame one and keeps working if the native command
@@ -12034,6 +15840,13 @@ __declspec(dllexport) void startPlugin()
     else
         DebugLog("WASDCombatPlugin: charMovUpdate hook OK");
 
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharacterHuman::_NV_sheatheWeapon),
+            &sheatheWeapon_hook, &s_sheatheWeaponOrig))
+        ErrorLog("WASDCombatPlugin: sheatheWeapon hook FAILED — V mode weapon hold unavailable");
+    else
+        DebugLog("WASDCombatPlugin: sheatheWeapon hook OK");
+
     // OTS action camera — drive (runs after the game's camera update, before
     // render) and the RTS-clamp bypass.  If either fails, OTS is unavailable
     // but the rest of DC is unaffected.
@@ -12043,6 +15856,31 @@ __declspec(dllexport) void startPlugin()
         ErrorLog("WASDCombatPlugin: CameraClass::update hook FAILED — OTS camera unavailable");
     else
         DebugLog("WASDCombatPlugin: cameraUpdate hook OK");
+
+    // Keep all V-mode 3D audio centred on the controlled character even when
+    // the visual camera is detached or pulled far away.  Failure is isolated:
+    // vanilla camera-listener audio remains active and the rest of V mode works.
+    {
+        intptr_t audioSubmit = dcResolveAudioListenerSubmit();
+        if (!audioSubmit)
+            ErrorLog("WASDCombatPlugin: audio listener anchor unavailable — updateAudio signature changed");
+        else if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+                     audioSubmit, &audioListenerSubmit_hook, &s_audioListenerSubmitOrig))
+            ErrorLog("WASDCombatPlugin: audio listener anchor hook FAILED");
+        else
+            DebugLog("WASDCombatPlugin: audio listener anchor hook OK");
+    }
+
+    // The native character emitter rejects ranged events against the visual
+    // camera before Wwise sees them.  Override that range only for the actively
+    // controlled V-mode character; this complements (and does not replace) the
+    // listener-position hook above.
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&Character::audioEvent),
+            &characterAudioEvent_hook, &s_characterAudioEventOrig))
+        ErrorLog("WASDCombatPlugin: character audio range hook FAILED — distant V-mode character sounds may be culled");
+    else
+        DebugLog("WASDCombatPlugin: character audio range hook OK");
 
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&CameraClass::getFacingDirection),
@@ -12115,16 +15953,25 @@ __declspec(dllexport) void startPlugin()
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&CombatClass::_iHitYouAreYouHit),
             &iHitYouAreYouHit_hook, &s_iHitOrig))
-        ErrorLog("WASDCombatPlugin: iHitYouAreYouHit hook FAILED - perfect block inactive");
+        ErrorLog("WASDCombatPlugin: iHitYouAreYouHit hook FAILED - directional guard verdict inactive");
     else
         DebugLog("WASDCombatPlugin: iHitYouAreYouHit hook OK");
 
+    // Native reaction authority.  The original `stumble` argument and the
+    // resulting STUMBLE/REACTION_BLOCK states define control ownership.
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
-            KenshiLib::GetRealAddress(&CharStats::getDodge),
-            &getDodge_hook, &s_getDodgeOrig))
-        ErrorLog("WASDCombatPlugin: getDodge hook FAILED - dodge skill bonus inactive");
+            KenshiLib::GetRealAddress(&CombatClass::_getHit),
+            &getHit_hook, &s_getHitOrig))
+        ErrorLog("WASDCombatPlugin: _getHit hook FAILED - native reaction timing unavailable");
     else
-        DebugLog("WASDCombatPlugin: getDodge hook OK");
+        DebugLog("WASDCombatPlugin: _getHit hook OK");
+
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CombatClassAI::_NV_update),
+            &combatAiUpdate_hook, &s_combatAiUpdateOrig))
+        ErrorLog("WASDCombatPlugin: CombatClassAI update hook FAILED - direct attacks may lose state ownership");
+    else
+        DebugLog("WASDCombatPlugin: CombatClassAI update hook OK");
 
     // AttackState::_NV_initialise - manual-attack mode denies the AI's own swings.
     {
@@ -12158,6 +16005,12 @@ __declspec(dllexport) void startPlugin()
         ErrorLog("WASDCombatPlugin: chooseBlock hook FAILED - manual attack mode cannot silence AI blocks");
     else
         DebugLog("WASDCombatPlugin: chooseBlock hook OK");
+    if (KenshiLib::SUCCESS != KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&CharStats::chooseAttack),
+            &chooseAttack_hook, &s_chooseAttackOrig))
+        ErrorLog("WASDCombatPlugin: chooseAttack hook FAILED - directional attacks inactive");
+    else
+        DebugLog("WASDCombatPlugin: chooseAttack hook OK");
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(DcRobResult<DcSetCombatStateTag>::ptr),
             &setCombatState_hook, &s_setCombatStateOrig))

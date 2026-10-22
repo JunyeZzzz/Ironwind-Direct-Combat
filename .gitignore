@@ -427,3 +427,11 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Ironwind local build, deployment, reports and reverse-engineering dependencies
+/build/
+/package/
+/backup/
+/reports/
+/analysis_deps/
+/tools_py/

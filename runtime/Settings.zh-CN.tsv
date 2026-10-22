@@ -1,0 +1,167 @@
+# UTF-8；左列为代码中的原文标识，右列为游戏内显示的简体中文。不要翻译 INI 键名。
+Direct Control	铁风执刃
+DIRECT CONTROL KEYS	控制按键
+Direct Control on / off	开启／关闭直接控制
+MOVEMENT KEYS	移动按键
+Move forward	向前移动
+Walk, jog or run in the direction the camera faces.	沿镜头朝向步行、慢跑或奔跑。
+Move left	向左移动
+Move backward	向后移动
+Move right	向右移动
+Control hovered character	控制鼠标所指角色
+Press with the mouse over one of your characters to control them instead.	鼠标指向己方角色时按下此键，切换控制对象。
+CAMERA KEYS	镜头按键
+First person (toggle)	切换第一人称
+Puts the camera in your character's eyes. Press again to return to the shoulder camera started by V.	切换到角色视线，再按一次返回 V 模式越肩镜头。
+Swap camera shoulder	切换越肩侧
+Moves the third-person camera to the other shoulder.	将越肩镜头切换到另一侧。
+Sneak (SHIFT + key)	潜行（Shift＋按键）
+Hold SHIFT and press this key to toggle sneaking in first person or the third-person camera.	在第一人称或越肩视角中，按住 Shift 再按此键切换潜行。
+MANUAL COMBAT KEYS	手动战斗按键
+Interact / keyboard attack	交互模式／键盘攻击
+Directional mode: interacts with the nearby automatically selected target. Keyboard mode uses this key to attack.	方向模式下与附近自动选中的目标交互；键盘模式下使用此键攻击。
+Block / guard	格挡
+Manual combat only. Hold to guard; in directional mode the incoming direction must match.	仅手动战斗使用；方向模式下按住并选择匹配来袭的方向。
+MOVEMENT	移动
+Movement speed multiplier	移动速度倍率
+Scales how fast your character moves with the movement keys. 1.0 = the game's normal speed.	调整按移动键时的速度；1.0 为游戏正常速度。
+Cap speed at the character's real max	按角色真实速度限制
+On: injuries, heavy loads and shackles slow you down exactly as they would in normal play.	开启后，受伤、负重和镣铐会按原版规则降低速度。
+Enemies chase and hit a moving player	敌人可追击移动中的玩家
+On: enemies run you down and attack a moving character. Off: the old behaviour, where enemies stall against a moving player.	开启后，敌人可追上并攻击正在移动的角色。
+Camera faces character in inventory	背包打开时镜头转向角色
+Off: the camera stays put and you can keep moving with the movement keys while looting or trading.	关闭后，搜刮或交易时镜头保持原位，并可继续用移动键控制角色；V 手动模式另有背包控制规则。
+MANUAL COMBAT - ATTACK	手动战斗：攻击
+B	血
+H	头
+C	胸
+S	腹
+LA	左臂
+RA	右臂
+LL	左腿
+RL	右腿
+Attack press kept for (ms)	攻击输入保留时间（毫秒）
+If your character cannot swing the instant you press (still turning, just stopped moving), the press is kept for this long.	角色转身或刚停下而无法立即攻击时，在这段时间内保留攻击输入。
+Pause after a swing (ms)	攻击结束后间隔（毫秒）
+After a swing ends, a buffered next attack waits this long before it starts, so the follow-through remains visible.	挥刀结束后，已缓存的下一击会等待这段时间再开始，使收招保持可见。
+MANUAL COMBAT - BLOCK	手动战斗：格挡
+Enable manual combat actions	启用手动战斗动作
+On: V enables player-controlled attacks and guards. Off: combat returns to the game's AI.	开启后，V 模式由玩家控制攻击和格挡；关闭则交还游戏战斗 AI。
+Mouse directional combat in FP/OTS	第一人称／越肩鼠标方向战斗
+Hold left mouse and move to choose a direction; release to attack. Right mouse cancels the pending attack into guard.	按住左键并移动鼠标选择方向，松开后攻击；右键取消待发攻击并转入格挡。
+Automatic block (AI chooses direction)	自动格挡（AI 决定方向）
+Off: hold right mouse and choose the matching direction. On: hold right mouse to request a guard while Kenshi's combat AI chooses the direction; releasing it stops the request.	关闭：按住右键并选择匹配来袭的方向；开启：按住右键发出格挡请求，由 Kenshi 原版战斗 AI 选择方向；松开即停止请求。
+Guard: AI	格挡：AI 选向
+Keyboard block hold limit (ms)	键盘格挡最长时间（毫秒）
+Applies when DirectionalCombat is off. Mouse right-button guard lasts until you release it.	仅关闭方向战斗时适用；鼠标右键格挡会持续到松开。
+Block cooldown (ms)	格挡冷却（毫秒）
+Counted from the moment a guard ends. Letting go and pressing again right away keeps the same guard instead of starting this wait.	从格挡结束时开始计算；刚松开就再次按下，会延续原有格挡。
+MANUAL COMBAT - TARGETING & FEEL	手动战斗：瞄准与手感
+Crosshair target cone (degrees)	准星选取夹角（度）
+In first person and the third-person camera, the enemy nearest the crosshair within this cone is the one your character fights.	第一人称和越肩视角下，在此角度范围内选取最接近准星的目标。
+Cursor target radius (pixels)	鼠标选取半径（像素）
+In the normal camera, an enemy this close to the mouse cursor on screen becomes the one your character fights. Right-click an enemy to pick one at any distance.	普通镜头下，屏幕上靠近鼠标的敌人可成为目标；右键点击敌人也可指定目标。
+Ignore double-presses within (ms)	重复按键忽略时间（毫秒）
+A second press of the same combat key this soon after the first is ignored, so a nervous double-tap never restarts a move.	同一战斗键在这段时间内再次按下会被忽略，避免误触连按重启动作。
+MANUAL COMBAT - ON-SCREEN CUES	手动战斗：画面提示
+Show target's name and health	显示目标名称与生命状态
+The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head.	在目标头顶显示名称，以及血量、头部、胸部和腹部状态条。
+Glint on weapons swinging at you	来袭武器闪光提示
+An enemy's weapon lights up while their attack is coming at you, brightest just before it lands - your cue to guard or counter.	敌人挥刀时武器会发光，命中前最亮，可据此格挡或反击。
+Glint peaks after swing start (ms)	武器闪光达到峰值时间（毫秒）
+The glint reaches full brightness this long after the enemy starts their swing. Most swings land around 850 ms, so 700 peaks just before the hit.	敌人开始挥刀后，经过这段时间闪光达到最亮；多数攻击约在 850 毫秒命中。
+Glint size (pixels)	武器闪光大小（像素）
+Colour glints by defence (experimental)	按应对方式区分闪光颜色（实验）
+Off: every glint is white. On: white = a Block tap stops it (front arc), orange = a side or rear threat, red = a heavy-weapon threat.	关闭时全部显示白光；开启后白色提示可格挡，橙色提示侧后方威胁，红色提示重武器威胁。
+THIRD PERSON CAMERA (V)	越肩镜头（V）
+Distance behind your character	镜头与角色距离
+How far back the shoulder camera sits. The mouse wheel zooms while it is active.	越肩镜头距离角色多远；在该视角中可用滚轮缩放。
+Camera focus height	镜头注视点高度
+Height of the point the camera looks at. Higher looks over the shoulder; lower looks at the back.	镜头注视点的高度；调高更接近越肩视角，调低则看向后背。
+Shoulder offset	越肩水平偏移
+Positive = over the right shoulder, negative = over the left. The swap-shoulder key flips it in play.	正值偏向右肩，负值偏向左肩；游戏中可用切换越肩侧按键翻转。
+Close-up clipping distance	近距离裁剪距离
+Used when a wall pushes the camera in close. Lower keeps your character's body intact at point-blank range; higher sees through nearby walls sooner.	墙壁把镜头推近时使用；数值较低可保留更多角色身体，较高则更早透过近处墙面。
+FIRST PERSON	第一人称
+Mouse look sensitivity	鼠标视角灵敏度
+How fast the view turns with the mouse.	鼠标移动时镜头转动的速度。
+Field of view (degrees)	视野角度（度）
+Wider shows more of your surroundings. Applies instantly.	数值越大，画面左右和上下能看到的范围越广；调整后立即生效。
+Free-look range (degrees)	自由转头范围（度）
+How far you can look to each side of your body before the body turns to follow the view.	视线可向身体两侧转动的角度；超过后身体会跟随转向。
+Look smoothing	视角平滑
+Softens mouse look. 0 = raw and snappy, higher = smoother but slightly delayed.	降低鼠标视角抖动；0 最灵敏，数值越高越平滑，但略有延迟。
+Hide your own head	隐藏自己的头部
+Erases your head so it never blocks the view. Leave on unless a modded race looks wrong.	隐藏自身头部，避免遮挡视野；若模组种族显示异常可关闭。
+Hide head (legacy shrink)	隐藏头部（旧式缩小）
+Only for modded races that render wrong with the normal hide. Takes effect the next time you enter first person.	仅供普通隐藏方式不适用的模组种族使用；下次进入第一人称时生效。
+Hide hats and beard	隐藏帽子与胡须
+Headgear and beards would otherwise sit in front of the lens.	防止帽子和胡须挡住第一人称镜头。
+Hide hair	隐藏头发
+Hide hand-to-wound poses	隐藏受伤捂伤口动作
+Stops the hand-on-head and hand-on-wound animations covering the view when hurt.	受伤时不让捂头和捂伤口动作遮住镜头。
+Show floors below you in buildings	显示建筑内下方楼层
+Inside buildings, keeps the storeys below you drawn so stairs and balconies do not open onto nothing.	在建筑内保留下方楼层画面，避免楼梯和阳台下方变为空白。
+FIRST PERSON - EYE POSITION	第一人称：眼睛位置
+Eye drop below head bone	眼位低于头骨
+Fine-tunes eye level. Negative raises the eye slightly.	微调眼睛高度；负值会略微抬高视点。
+Extra eye raise	额外抬高眼位
+Added on top of the drop above, for races with unusual heads.	在眼位微调基础上进一步抬高，适用于头部比例特殊的种族。
+Eye forward of the head	眼位向前偏移
+Keeps the view out of the inside of the skull. Raise if you see your own face.	避免镜头进入头骨内部；若看见自己的面部，可适当调高。
+Forward push while jogging	慢跑时镜头前移
+The jog animation leans the body into the view; this pushes the eye ahead of it.	慢跑动作会让身体向镜头倾斜；此项将视点向前推。
+Forward push while running	奔跑时镜头前移
+Same as above for the run animation.	与慢跑前移相同，但用于奔跑动作。
+Forward push when looking sideways	侧看时镜头前移
+Keeps the shoulder out of view when you look to the side.	侧看时让肩膀远离镜头，减少遮挡。
+Forward push during attacks	攻击时镜头前移
+Clears the arms and weapon from the view while swinging.	挥刀时把镜头向前推，减少手臂与武器遮挡。
+Clipping distance	裁剪距离
+Anything closer than this to the eye is not drawn. Lower shows more of your own body but makes distant grass shimmer when you turn; higher is the reverse. 1.0 is the balance.	比此距离更靠近镜头的物体不会显示；调低可看到更多自身身体，但远处草地转头时可能闪烁。1.0 为折中值。
+Clipping distance while down	倒地时裁剪距离
+Used while knocked down, ragdolled or getting up, when the horizon does not matter: low enough that your own body stays solid in front of the lens.	倒地、布娃娃状态或起身时使用；较低数值可让镜头前的身体保持完整。
+Body is solid from the inside	从内部显示身体表面
+Draws your own body double-sided in first person, so a head pressed into the chest sees cloth and skin instead of a hollow shell.	第一人称中双面绘制自己的身体，避免镜头贴近胸口时看到空壳。
+TROUBLESHOOTING	故障排查
+Detailed log for bug reports	记录详细日志
+Writes every combat and movement event to RE_Kenshi_log.txt. Leave off normally; turn on when asked for a log, reproduce the problem, then send the file.	将战斗和移动事件写入 RE_Kenshi_log.txt；平时可关闭，排查问题时开启并复现。
+Reset visible settings to defaults	恢复本页默认设置
+Reset	重置
+Space	空格
+Tab	制表键（Tab）
+Enter	回车
+Backspace	退格
+Caps Lock	大写锁定
+Up	方向上
+Down	方向下
+Left	左
+Right	右
+Home	行首键（Home）
+End	行尾键（End）
+Page Up	上翻页
+Page Down	下翻页
+Insert	插入
+Delete	删除
+Numpad 0	小键盘 0
+Numpad 1	小键盘 1
+Numpad 2	小键盘 2
+Numpad 3	小键盘 3
+Numpad 4	小键盘 4
+Numpad 5	小键盘 5
+Numpad 6	小键盘 6
+Numpad 7	小键盘 7
+Numpad 8	小键盘 8
+Numpad 9	小键盘 9
+Manual Attack	手动战斗
+Interact: 	交互：
+Guard: 	格挡：
+Direction: 	方向：
+Release to attack: 	松开攻击：
+Queued: 	已缓存：
+No matching move: 	无对应招式：
+Direct Control Enabled	直接控制已开启
+Direct Control Disabled	直接控制已关闭
+Overhead	上劈
+Thrust	突刺
+Choose direction	选择方向
