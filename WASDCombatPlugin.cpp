@@ -49,7 +49,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "133"
+#define IRONWIND_VERSION "134"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -10111,13 +10111,45 @@ static bool manualInteractionBuildingEligible(Building* b)
         || b->getDefaultTask() != NULL_TASK;
 }
 
-// Single-purpose building interactions should feel like Kenshi's normal
-// right-click default, not a pause followed by a redundant one-choice menu.
-// Locked/broken/special doors deliberately fall through to the native menu so
-// pick-lock, bash and other contextual choices remain available.
-static bool manualInteractionTryDirectBuilding(RootObject* target)
+static bool manualInteractionLooseItemEligible(RootObject* root)
 {
-    if (!target || target->getDataType() != BUILDING) return false;
+    if (!root || !root->isValid() || !root->typeIsAnItem()) return false;
+    Item* item = static_cast<Item*>(root);
+    return item->onGround() && !item->isInInventory
+        && item->getVisible() && !item->isDisabled();
+}
+
+static void manualInteractionYieldToNativeOrder()
+{
+    s_wasdHoldActive = false;
+    s_playerPointClickActive = true;
+    s_holdPosValid = false;
+    s_idleHoldEngaged = false;
+}
+
+// One capability router owns every non-character E action. Kenshi exposes
+// different native primitives for immediate doors, inventory windows and
+// world tasks, so unification here means one policy/ownership boundary rather
+// than pretending those engine operations are the same call. Characters stay
+// on the menu path because talk, carry, loot, trade and mod-added choices are
+// genuinely plural. Locked/broken doors do too (pick lock vs bash, etc.).
+static bool manualInteractionTryDirectWorldObject(RootObject* target)
+{
+    if (!target || !target->isValid() || !s_freeMoveAnchor) return false;
+
+    if (manualInteractionLooseItemEligible(target))
+    {
+        manualInteractionYieldToNativeOrder();
+        s_freeMoveAnchor->playerMoveOrderDefault(nullptr, target, target->getPosition());
+        char logLine[144];
+        sprintf_s(logLine, sizeof(logLine),
+            "[Ironwind] interact_direct_world action=item_default type=%d",
+            (int)target->getDataType());
+        VerbLog(logLine);
+        return true;
+    }
+
+    if (target->getDataType() != BUILDING) return false;
     Building* b = static_cast<Building*>(target);
     if (!manualInteractionBuildingEligible(b)) return false;
 
@@ -10132,61 +10164,45 @@ static bool manualInteractionTryDirectBuilding(RootObject* target)
         if (!recognised) return false;
         bool success = (task == OPEN_DOOR || task == OPEN_DOOR_HERE)
             ? door->openDoor() : door->closeDoor();
-        char logLine[144];
+        char logLine[160];
         sprintf_s(logLine, sizeof(logLine),
-            "[Ironwind] interact_direct_building action=door task=%d success=%d",
+            "[Ironwind] interact_direct_world action=door task=%d success=%d",
             (int)task, success ? 1 : 0);
         VerbLog(logLine);
-        // The recognised one-step door action is consumed even if the engine
-        // declines it while the door is already transitioning. Do not replace
-        // one harmless failed toggle with the very menu this path removes.
         return true;
     }
 
-    // Kenshi storage furniture is not consistently a StorageBuilding subclass:
-    // the field-tested container exposed LOOT_TARGET but getFunctionStuff()==0.
-    // The virtual inventory pointer is the actual capability used by every
-    // building container. Use the same public GUI entry as vanilla; transfers,
-    // ownership and theft still belong to the original Inventory code.
+    // A real Inventory is a capability, not a concrete StorageBuilding class.
+    // Opening the original window keeps transfer, ownership and theft native.
     if (b->getInventory() && gui)
     {
         InventoryGUI* window = gui->showInventoryBuilding(b->getHandle());
         bool success = window != nullptr || gui->hasInventoryWindowOpen(b->getHandle());
         char logLine[144];
         sprintf_s(logLine, sizeof(logLine),
-            "[Ironwind] interact_direct_building action=storage success=%d",
+            "[Ironwind] interact_direct_world action=inventory success=%d",
             success ? 1 : 0);
         VerbLog(logLine);
-        return success;
+        if (success) return true;
+    }
+
+    // Beds, chairs, turrets, workbenches, machines and mod-added facilities
+    // advertise their primary action through this virtual. Submit that action
+    // through Character's vanilla right-click dispatcher; do not reproduce its
+    // task mapping, range, pathing or ownership rules in Ironwind.
+    TaskType task = b->getDefaultTask();
+    if (task != NULL_TASK)
+    {
+        manualInteractionYieldToNativeOrder();
+        s_freeMoveAnchor->playerMoveOrderDefault(b, nullptr, b->getPosition());
+        char logLine[160];
+        sprintf_s(logLine, sizeof(logLine),
+            "[Ironwind] interact_direct_world action=building_default task=%d",
+            (int)task);
+        VerbLog(logLine);
+        return true;
     }
     return false;
-}
-
-static bool manualInteractionLooseItemEligible(RootObject* root)
-{
-    if (!root || !root->isValid() || !root->typeIsAnItem()) return false;
-    Item* item = static_cast<Item*>(root);
-    return item->onGround() && !item->isInInventory
-        && item->getVisible() && !item->isDisabled();
-}
-
-// A loose item's normal right-click is already exactly the desired one-step E
-// action. Let Character::playerMoveOrderDefault choose PICKUP/steal/pathing and
-// all failure feedback instead of manufacturing an inventory transfer here.
-static bool manualInteractionTryDirectLooseItem(RootObject* target)
-{
-    if (!manualInteractionLooseItemEligible(target) || !s_freeMoveAnchor) return false;
-    s_wasdHoldActive = false;
-    s_playerPointClickActive = true;
-    s_holdPosValid = false;
-    s_idleHoldEngaged = false;
-    s_freeMoveAnchor->playerMoveOrderDefault(nullptr, target, target->getPosition());
-    char logLine[144];
-    sprintf_s(logLine, sizeof(logLine),
-        "[Ironwind] interact_direct_item action=vanilla_default type=%d",
-        (int)target->getDataType());
-    VerbLog(logLine);
-    return true;
 }
 
 static bool manualInteractionRootValid(RootObject* target, Character* me)
@@ -15373,12 +15389,11 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
             s_interactionPendingHandle.setNull();
             if (manualInteractionRootValid(target, s_freeMoveAnchor))
             {
-                if (manualInteractionTryDirectBuilding(target)
-                    || manualInteractionTryDirectLooseItem(target))
+                if (manualInteractionTryDirectWorldObject(target))
                 {
-                    // Direct doors, building inventories and loose-item default
-                    // orders own no context-menu latch and no Ironwind pause.
-                    // The native object/task/UI accepted the action here.
+                    // The unified world-object router accepted the action via
+                    // the appropriate native door, inventory or default-task
+                    // capability. It owns no menu latch or Ironwind pause.
                     interactionOpenedThisFrame = false;
                 }
                 else

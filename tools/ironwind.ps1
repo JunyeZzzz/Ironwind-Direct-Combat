@@ -344,7 +344,8 @@ function Invoke-IwCheck {
         'cam->getCameraToViewportRay(0.5f, 0.5f)',
         'UtilityT::rayTrace(aimHit, aimRay',
         'manualInteractionLooseItemEligible',
-        'manualInteractionTryDirectLooseItem',
+        'manualInteractionTryDirectWorldObject',
+        'manualInteractionYieldToNativeOrder',
         'playerMoveOrderDefault(nullptr, target, target->getPosition())',
         '"ironwind_interaction_hint"',
         '"ironwind_interaction_hint_bg"',
@@ -357,16 +358,19 @@ function Invoke-IwCheck {
         }
     }
     foreach ($required in @(
-        'manualInteractionTryDirectBuilding',
+        'manualInteractionTryDirectWorldObject',
         'b->isDoor()',
         'door->getDefaultTask()',
         'gui->showInventoryBuilding(b->getHandle())',
-        'interact_direct_building action=door',
-        'interact_direct_building action=storage',
-        'b->getInventory() != nullptr'
+        'interact_direct_world action=door',
+        'interact_direct_world action=inventory',
+        'interact_direct_world action=item_default',
+        'interact_direct_world action=building_default',
+        'b->getInventory() != nullptr',
+        's_freeMoveAnchor->playerMoveOrderDefault(b, nullptr, b->getPosition())'
     )) {
         if ($sourceText -notmatch [regex]::Escape($required)) {
-            throw "v133 direct interaction contract is incomplete: $required"
+            throw "v134 unified interaction contract is incomplete: $required"
         }
     }
     if ($sourceText -match 'b->isDoor\(\)\s*\|\|\s*b->isFurniture\(\)') {

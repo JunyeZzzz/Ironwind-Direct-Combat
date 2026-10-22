@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v133**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v134**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,12 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v134
+
+- 将 v132/v133 分散的门、储具和地面物品直接交互收束到一个能力路由器 `manualInteractionTryDirectWorldObject`。统一规则是：人物和确实需要选择的特殊对象走原版菜单；其余非人物世界对象按自己暴露的原版主要能力直接执行，不再按“储具、床、炮台……”逐个扩展物件名称表。
+- 保留实机已确认的普通门开／关与建筑 `Inventory` 直开路径；地面 Item 继续提交原版默认右键任务。新增通用建筑默认任务路径：床、椅、炮台、工作台、机器及 Mod 设施只要暴露 `getDefaultTask()`，就交给角色自己的 `playerMoveOrderDefault` 处理任务映射、距离和寻路。
+- 所有需要角色移动的直接任务先经过同一 `manualInteractionYieldToNativeOrder`，释放 V 模式 WASD 停位但不退出 V；锁门／破门仍回退菜单。v133 本次日志已确认库存直开 7 次、普通门直开 1 次；物品与通用设施路径尚待 v134 实机验证。
 
 ## v133
 
