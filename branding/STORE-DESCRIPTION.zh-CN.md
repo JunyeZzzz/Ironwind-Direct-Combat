@@ -106,4 +106,3 @@
 铁风执刃由 **cjy233** 维护。历史代码基础来自 smokefoolius 的 Direct Control for Kenshi v1.5.0；项目遵循 GNU GPL v3，并保留上游原有著作权。`WASDCombatPlugin.dll/.ini` 等名称仅作为现有安装兼容接口保留，不代表当前项目品牌。
 
 项目仓库：<https://github.com/JunyeZzzz/Ironwind-Direct-Combat>
-

@@ -57,4 +57,3 @@ Heavy hit reactions lock Ironwind input until Kenshi's native stagger/reaction s
 Ironwind: Hands-On Combat is maintained by **cjy233**. It is based historically on Direct Control for Kenshi v1.5.0 by smokefoolius and remains licensed under GNU GPL v3. Legacy `WASDCombatPlugin.dll/.ini` names are retained only for installation compatibility.
 
 Repository: <https://github.com/JunyeZzzz/Ironwind-Direct-Combat>
-
