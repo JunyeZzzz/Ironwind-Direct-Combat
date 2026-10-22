@@ -395,6 +395,17 @@ function Invoke-IwCheck {
             throw "v131 overhead manual-guard guarantee is incomplete: $required"
         }
     }
+    foreach ($required in @(
+        'manualAttackValidateNativeClip',
+        'attack_native_clip_orphaned',
+        's_attackNativeClipStallUpdates',
+        's_attackNativeClipInvalidated ? "native_clip_orphaned_main"',
+        'frameTime <= 0.0f || s_menuSuspendActive || (ou && ou->isPaused())'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v135 native attack-clip liveness recovery is incomplete: $required"
+        }
+    }
     foreach ($removed in @('s_interactionAutoTarget', 'dc_manual_interaction_hud')) {
         if ($sourceText -match [regex]::Escape($removed)) {
             throw "Removed character-only interaction HUD path returned: $removed"

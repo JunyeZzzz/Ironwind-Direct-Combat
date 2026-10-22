@@ -146,7 +146,7 @@ v79 将 `combatAiUpdate_hook` 作为玩家授权 CHOP 的最外层所有权入�
 
 v81 对提前 DECISION 只做“事实型恢复”：`manualAttackTrack` 和 `manualAttackLifecycleTick` 在任何收权前都调用同一个 `manualAttackStillSwingingOrRecover`。它必须同时看到本刀 technique 未完成、同一 Ogre clip 仍存在且真实进度小于 0.98，才允许把 CHOP 恢复一次。看不到活片段便立即收权并记录诊断；不按毫秒猜测，也不重复播放动画。v80 只在后一个入口检查，实机中前一个入口先结束了 0/234/329 ms 的三刀，因此恢复从未执行。姓名和血条继续只跟随一个显示焦点，与 AttackState 载体和原版攻击区可命中的对象分离。
 
-v82 把一次 CHOP 内部再分为 `IMPACT_ACTIVE → VISUAL_RECOVERY → DECISION`。`currentTechniqueHasFinished` 只结束 `IMPACT_ACTIVE`：此后不再调用原版 attackState，因此攻击区、verdict 和伤害不可能重复；同一 Ogre clip 继续由正常动画更新推进。实际 clip 达到 0.98 或已移除后才转 DECISION。真实受击反应在两阶段都可抢占身体。该模型使用原版时间轴，不使用攻击总时长估计。
+v82 把一次 CHOP 内部再分为 `IMPACT_ACTIVE → VISUAL_RECOVERY → DECISION`。`currentTechniqueHasFinished` 只结束 `IMPACT_ACTIVE`：此后不再调用原版 attackState，因此攻击区、verdict 和伤害不可能重复；同一 Ogre clip 继续由正常动画更新推进。实际 clip 达到 0.98 或已移除后才转 DECISION。真实受击反应在两阶段都可抢占身体。该模型使用原版时间轴，不使用攻击总时长估计。v135 为 `IMPACT_ACTIVE` 增加片段活性不变量：每次真正执行原版 base update 后，当前 technique 必须对应一个有效并推进的 Ogre 时间轴；暂停、菜单和零帧长不采样，任何进度变化都重置异常计数。连续有效更新仍无片段、只找到已结束片段或时间轴完全不动时，说明 `initialiseAttack` 的成功没有形成真实动作，插件只退出这次虚挂 CHOP 并释放输入，不制造 impact、不补伤害，也不把正常慢动作换成时长猜测。
 
 v83 为 `VISUAL_RECOVERY → FREE_BLOCK` 增加排他交接。右键在 impact 前只登记等待；impact 后先调用原版状态转换离开 CHOP，并结束本帧自由动作处理。`s_attackGuardHandoffPending` 阻止活片段恢复门把这次主动退出重新拉回 CHOP；只有下一主循环确认攻击所有权释放后，格挡动画才可启动。任何帧都不得同时存在 `s_attackActive` 与新建 `s_freeBlockTech`。
 

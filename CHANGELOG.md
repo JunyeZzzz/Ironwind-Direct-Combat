@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v134**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v135**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,13 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v135
+
+- 修复原版 `AttackState::initialiseAttack()` 返回成功，却留下 technique/target 而没有可推进攻击片段时的永久控制锁。v134 实机日志中一刀在 `CHOP_WEAPON` 停留至少 18 秒，37 次原版更新始终 `finished=0`、零 impact；其后 28 次左键全部被缓存，3 次右键全部等待不存在的 impact，而 WASD 仍可移动。
+- 新增 `manualAttackValidateNativeClip`：只检查真实 Ogre 片段在连续有效世界更新中是否存在并推进。暂停、菜单和零帧长不计；任何正常时间轴推进都会立即清零异常计数；不使用武器动画总时长、固定毫秒超时、手工 impact 或伤害替代。连续更新仍无片段、复用已结束片段、时间轴无效或完全停止时，记录 `attack_native_clip_orphaned`，退出虚挂 CHOP 并释放攻击／格挡输入。
+- 虚挂退出不计作完成挥刀，也不施加攻击恢复期；已经观察到的正常动画仍沿用原版 impact 与真实片尾。动态日志规则将该自动恢复列为警告，以便继续定位原版假成功的上游触发条件。
+- 已通过静态回归门、Visual C++ 2010 x64 编译、开发通道部署及构建／暂存／安装一致性验证；DLL SHA256 为 `A8FF5BFC18BC34DEE0028B013B9F259025AF72D6DA56F17DDAF3F737A11B5AB4`，PDB SHA256 为 `1537679F476B304BBFAEAE3A6380FBCFF148EFB0D5BB308BDDDB84E81FE8BC76`。正常攻击片段与虚挂恢复仍待 v135 实机确认。
 
 ## v134
 

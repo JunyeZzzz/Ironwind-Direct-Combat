@@ -102,6 +102,12 @@
       "description": "原版攻击推进入口无效"
     },
     {
+      "id": "native_clip_orphaned",
+      "severity": "warning",
+      "pattern": "attack_native_clip_orphaned",
+      "description": "原版返回攻击成功但实际动画片段缺失或停止，铁风已释放虚挂控制权"
+    },
+    {
       "id": "missing_technique",
       "severity": "info",
       "pattern": "(free_attack_no_technique|free_block_no_technique)",

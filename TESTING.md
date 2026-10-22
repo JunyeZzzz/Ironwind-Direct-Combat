@@ -94,6 +94,7 @@
 | 格挡中移动 | 约正常速度 20% | `combat_move block=1` |
 | 格挡时松键 | 原地不走 | `guard_stationary_hold` |
 | 攻击结束静止 | 自动恢复正确站姿，不需再按 WASD | `free_action_idle_pose_restored` 加画面确认 |
+| 原版启动成功但攻击片段缺失／停止 | 不得永久停在 CHOP；连续有效更新确认无真实时间轴后自动回到可攻击、可格挡状态，WASD 不中断；不得伪造命中或伤害 | `attack_native_clip_orphaned reason=no_clip/not_started/completed_clip_reused/invalid_timeline/timeline_stalled` 后紧跟 `attack_done ... reason=native_clip_orphaned[_main]` 和 `attack_direct_control_restored`；同一条不得有假 `attack_native_gethit`／红 X |
 
 ### B2. 手动／自动格挡模式
 

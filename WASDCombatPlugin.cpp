@@ -49,7 +49,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "134"
+#define IRONWIND_VERSION "135"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -666,6 +666,10 @@ static bool              s_attackSawChop       = false;  // the swing actually s
 static bool              s_attackObservedUnfinished = false; // this swing, not the previous technique, owns the finish edge
 static bool              s_attackStateRecovered = false; // one live unfinished clip may reclaim CHOP after an external early exit
 static bool              s_attackNativeImpactFinished = false; // native damage phase ended; let its real clip play the recovery frames
+static bool              s_attackNativeClipSampled = false; // at least one valid pre-impact Ogre timeline sample belongs to this swing
+static float             s_attackNativeClipProgress = -1.0f;
+static unsigned int      s_attackNativeClipStallUpdates = 0; // consecutive unpaused native updates without timeline progress
+static bool              s_attackNativeClipInvalidated = false; // an orphaned CHOP was deliberately released
 static bool              s_attackGuardHandoffPending = false; // intentional post-impact CHOP exit; never recover it as an accidental state steal
 static bool              s_attackDirectInitialising = false; // exact scope: one player-requested native initializer
 // A directly initialised CHOP has no combat task to keep CombatClassAI::go alive.
@@ -909,6 +913,10 @@ static void manualAttackClearActiveRuntime()
     s_attackObservedUnfinished = false;
     s_attackStateRecovered = false;
     s_attackNativeImpactFinished = false;
+    s_attackNativeClipSampled = false;
+    s_attackNativeClipProgress = -1.0f;
+    s_attackNativeClipStallUpdates = 0;
+    s_attackNativeClipInvalidated = false;
     s_attackGuardHandoffPending = false;
     s_attackDirectInitialising = false;
     s_attackAdvancedFrameSerial = 0;
@@ -11766,6 +11774,10 @@ static bool manualAttackStartDirect(CombatClass* cc, Character* foe, ULONGLONG p
     s_attackObservedUnfinished = false;
     s_attackStateRecovered = false;
     s_attackNativeImpactFinished = false;
+    s_attackNativeClipSampled = false;
+    s_attackNativeClipProgress = -1.0f;
+    s_attackNativeClipStallUpdates = 0;
+    s_attackNativeClipInvalidated = false;
     s_attackGuardHandoffPending = false;
     s_attackActiveSinceMs = GetTickCount64();
     s_attackAdvancedFrameSerial = 0;
@@ -11844,7 +11856,7 @@ static void manualAttackFinish(CombatClass* cc, bool playerMoving, const char* r
         s_attackNativeBlocks, s_attackNativeDodges,
         reason ? reason : "state_exit");
     VerbLog(b);
-    bool completedChop = s_attackSawChop;
+    bool completedChop = s_attackSawChop && !s_attackNativeClipInvalidated;
     manualAttackClearActiveRuntime();
     s_attackCommitUntilMs = 0;      // movement is yours the frame the native attempt ends
     if (completedChop)
@@ -11873,6 +11885,7 @@ static bool manualAttackStillSwingingOrRecover(CombatClass* cc,
     // attack waited for STARTUP to finish while the queued STUMBLE waited for
     // the attack owner to yield.
     if (manualHitReactionLive(cc->me)) return false;
+    if (s_attackNativeClipInvalidated) return false;
     if (s_attackGuardHandoffPending
         && st != STARTUP_STATE && st != CHOP_WEAPON)
         return false;
@@ -11930,11 +11943,78 @@ static void manualAttackTrack(CombatClass* cc, bool playerMoving)
     if (!manualAttackStillSwingingOrRecover(cc, "combat_track"))
     {
         st = cc->getCombatState();
-        const char* reason = manualHitReactionLive(cc->me) ? "hit_reaction"
+        const char* reason = s_attackNativeClipInvalidated ? "native_clip_orphaned"
+                           : manualHitReactionLive(cc->me) ? "hit_reaction"
                            : (st == TARGET_PATHFINDING || st == TARGET_PATHFINDING_STARTUP)
                            ? "unexpected_pathfinding" : "state_exit";
         manualAttackFinish(cc, playerMoving, reason);
     }
+}
+
+// A native initializer can rarely return success while leaving CHOP with a
+// technique/target but no advancing Ogre action. State alone cannot distinguish
+// that orphan from a real swing, which used to leave LMB queued and RMB waiting
+// for an impact forever. Validate only observable animation ownership: normal
+// clips reset this counter on any timeline advance; paused/menu frames do not
+// count; weapon speed and total animation duration are never estimated.
+static bool manualAttackValidateNativeClip(CombatClass* cc, float frameTime,
+                                           const char* source)
+{
+    if (!cc || s_attackNativeImpactFinished || s_attackNativeClipInvalidated)
+        return !s_attackNativeClipInvalidated;
+    if (frameTime <= 0.0f || s_menuSuspendActive || (ou && ou->isPaused()))
+        return true;
+
+    AnimationClassBase::SingleAnimation* clip =
+        manualPlayingTechnique(cc->animation, cc->currentTechnique);
+    float clipLength = 0.0f;
+    float progress = manualClipTimeline(clip, &clipLength);
+    bool usable = clip && !clip->notStartedYet()
+        && progress >= 0.0f && progress < 0.98f;
+    bool advanced = usable && s_attackNativeClipSampled
+        && (progress > s_attackNativeClipProgress + 0.00001f
+            || progress + 0.05f < s_attackNativeClipProgress);
+
+    if (usable && (!s_attackNativeClipSampled || advanced))
+    {
+        s_attackNativeClipSampled = true;
+        s_attackNativeClipProgress = progress;
+        s_attackNativeClipStallUpdates = 0;
+        return true;
+    }
+
+    if (usable) s_attackNativeClipProgress = progress;
+    ++s_attackNativeClipStallUpdates;
+    // This is an update-liveness check, not an animation timeout. A legitimate
+    // slow clip still advances every world update; twelve samples merely absorb
+    // blend/start ordering without assigning a duration to the attack.
+    const unsigned int kStallUpdateLimit = 12;
+    if (s_attackNativeClipStallUpdates < kStallUpdateLimit) return true;
+
+    const char* reason = !clip ? "no_clip"
+        : clip->notStartedYet() ? "not_started"
+        : progress >= 0.98f ? "completed_clip_reused"
+        : progress < 0.0f ? "invalid_timeline" : "timeline_stalled";
+    swordStateEnum stateBefore = cc->getCombatState();
+    s_attackNativeClipInvalidated = true;
+    // Complete only the invalid bookkeeping edge. No impact, verdict or damage
+    // is emitted; this prevents a stale unfinished flag poisoning the next
+    // player-authorised initializer after DECISION takes ownership.
+    cc->currentTechniqueHasFinished = true;
+    if (s_setCombatStateOrig)
+    {
+        cc->nextMove = DECISION;
+        s_setCombatStateOrig(cc, DECISION);
+    }
+    char b[320];
+    sprintf_s(b, sizeof(b),
+        "[Ironwind] attack_native_clip_orphaned source=%s reason=%s updates=%u progress=%.4f length=%.3f tech=%d target=%d state=%d->%d",
+        source ? source : "unknown", reason, s_attackNativeClipStallUpdates,
+        progress, clipLength, cc->currentTechnique ? 1 : 0,
+        cc->currentTarget ? 1 : 0, (int)stateBefore,
+        (int)cc->getCombatState());
+    ErrorLog(b);
+    return false;
 }
 
 // Execute one frame of the native combat base state without executing
@@ -12062,6 +12142,10 @@ static bool manualAttackAdvanceNativeState(CombatClass* cc, float frameTime,
             VerbLog(fb);
         }
     }
+
+    if (after == CHOP_WEAPON && !cc->currentTechniqueHasFinished
+        && !manualAttackValidateNativeClip(cc, frameTime, source))
+        after = cc->getCombatState();
 
     ULONGLONG now = GetTickCount64();
     if (after != before || now - s_attackAdvanceLogMs >= 500)
@@ -12788,7 +12872,8 @@ static void manualAttackLifecycleTick(GameWorld* gw, float frameTime)
     {
         st = cc->getCombatState();
         manualAttackFinish(cc, playerMoving,
-            manualHitReactionLive(cc->me) ? "hit_reaction_main"
+            s_attackNativeClipInvalidated ? "native_clip_orphaned_main"
+            : manualHitReactionLive(cc->me) ? "hit_reaction_main"
             : (st == TARGET_PATHFINDING || st == TARGET_PATHFINDING_STARTUP)
                 ? "unexpected_pathfinding_main" : "state_exit_main");
     }
