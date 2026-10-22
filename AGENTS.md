@@ -45,7 +45,7 @@
 ## 流程
 
 1. 开始前运行 `./tools/ironwind.ps1 Status`，改动后运行 `Check`。
-2. 仅文档或工具说明改动不重编 DLL。代码改动日常验证用 `DevFinish`；正式发布用 `Finish`。`DevFinish` 安装并启用开发通道；`Finish` 只产出正式包，绝不覆盖 Workshop 订阅目录。
+2. 仅文档或工具说明改动不重编 DLL。代码改动日常验证用 `DevFinish`；只生成正式包用 `Finish`。更新既有 Workshop 条目时依次使用 `WorkshopPrepare`、FCS Upload、`WorkshopStatus`、`WorkshopFinalize`；脚本绝不直接写入 Workshop 订阅目录。
 3. 实机前运行 `SessionStart -Label <语义名>`；退出后用 `AnalyzeLog`。
 4. 玩家确认值得长期保留的版本才运行 `Snapshot`。
 5. `Housekeeping` 只报告归档占用和可清理候选，不自动删除。

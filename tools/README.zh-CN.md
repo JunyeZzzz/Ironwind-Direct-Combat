@@ -22,6 +22,11 @@
 .\tools\ironwind.ps1 Finish
 .\tools\ironwind.ps1 Finish -ReplaceArchive  # 已核实同版本重打包时显式替换归档
 
+# 更新既有 Steam Workshop 条目 3824431439
+.\tools\ironwind.ps1 WorkshopPrepare   # 生成正式包并建立 FCS 临时上传目录
+.\tools\ironwind.ps1 WorkshopStatus    # 上传前后只读核验三个副本
+.\tools\ironwind.ps1 WorkshopFinalize  # Steam 同步后清理临时目录并启用正式版
+
 # 只读查看构建、归档、符号、备份和报告占用
 .\tools\ironwind.ps1 Housekeeping
 
@@ -53,6 +58,16 @@
 它不会自动把版本号加一，也不会自动声称画面或完整回归已经验证。同版本 ZIP 中若已有不同 DLL，部署会在安装前停止；应正常增加 `VERSION`，不能用覆盖掩盖版本差异。`-ReplaceArchive` 只用于维护者明确核实后的特殊恢复操作。
 
 底层 `Deploy` 接受 `-Channel Development|Release`；默认是 Development。Release 通道强制要求 `-SkipInstall`，`Finish` 会自动带上，避免把未发布代码伪装成 Steam 正式版。`Deploy` 和 `Finish` 也接受 `-SkipArchive` 与 `-SkipSymbols`。
+
+## Steam Workshop 更新
+
+更新既有条目时使用三段式流程，不再手工复制目录：
+
+1. 退出 Kenshi 和 FCS，运行 `WorkshopPrepare`。它先执行完整 `Finish`，再从正式包建立临时 `mods/IronwindCombat/`，并只从当前订阅版复制 `_IronwindCombat.info` 与 `_IronwindCombat.img`。工具会强制核对 `<id>3824431439</id>`、`<mod>IronwindCombat</mod>`、版本和 DLL 哈希。
+2. 在 FCS 中只打开临时目录的 `IronwindCombat.mod`。进入 Steam Workshop 窗口后先用圆形按钮从 Steam 同步现有标题、说明、标签和预览图；再次确认 ID 是 `3824431439`，再点 Upload。圆形按钮只拉取页面资料，不上传文件。
+3. 关闭 FCS，等待 Steam 将订阅目录更新到当前版本，运行 `WorkshopStatus`。只有 `PublishedToWorkshop=True` 后才运行 `WorkshopFinalize`；它会再次比较正式包与订阅版版本及 DLL 哈希，写入 `reports/workshop-publish/` 事实报告，删除工具生成的临时目录并切到 `UseStable`。
+
+`WorkshopPrepare` 期间本地正式身份会临时遮蔽订阅版，因此不要从该状态启动 Kenshi。`WorkshopFinalize` 只删除带工具标记且已由 Steam 同步验证的临时目录；不符合条件时保留现场并停止。Steam 订阅目录始终由 Steam 管理，脚本不会直接写入。
 
 ## 双通道约束
 

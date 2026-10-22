@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Status', 'Check', 'Build', 'Deploy', 'DevFinish', 'Finish', 'Verify', 'UseDev', 'UseStable', 'Housekeeping', 'SessionStart', 'AnalyzeLog', 'Snapshot', 'Help')]
+    [ValidateSet('Status', 'Check', 'Build', 'Deploy', 'DevFinish', 'Finish', 'WorkshopPrepare', 'WorkshopStatus', 'WorkshopFinalize', 'Verify', 'UseDev', 'UseStable', 'Housekeeping', 'SessionStart', 'AnalyzeLog', 'Snapshot', 'Help')]
     [string]$Task = 'Status',
     [ValidateSet('Development', 'Release')]
     [string]$Channel = 'Development',
@@ -40,6 +40,10 @@ $releasePackageDll = Join-Path $releasePackageDir 'WASDCombatPlugin.dll'
 $devPackageDll = Join-Path $devPackageDir 'WASDCombatPlugin.dll'
 $devInstallDll = Join-Path $devInstallDir 'WASDCombatPlugin.dll'
 $workshopStableDll = Join-Path $workshopStableDir 'WASDCombatPlugin.dll'
+$workshopId = '3824431439'
+$workshopInfoName = '_IronwindCombat.info'
+$workshopImageName = '_IronwindCombat.img'
+$workshopStageMarker = Join-Path $localStableDir '.ironwind-workshop-staging.json'
 $modsConfig = Join-Path $gameDir 'data\mods.cfg'
 $defaultLog = Join-Path $gameDir 'RE_Kenshi_log.txt'
 $sessionStateDir = Join-Path $projectDir 'reports\session-state'
@@ -52,6 +56,44 @@ function Get-IwHash([string]$Path) {
 
 function Assert-IwFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing required file: $Path" }
+}
+
+function Assert-IwPublishingAppsClosed {
+    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessName -eq 'kenshi_x64' -or
+        $_.ProcessName -eq 'forgotten construction set' -or
+        $_.MainWindowTitle -like 'Forgotten Construction Set*'
+    })
+    if ($running.Count -gt 0) {
+        $names = ($running | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '
+        throw "Exit Kenshi and FCS before changing Workshop staging: $names"
+    }
+}
+
+function Get-IwWorkshopInfo([string]$Directory) {
+    $path = Join-Path $Directory $workshopInfoName
+    Assert-IwFile $path
+    try { [xml]$document = Get-Content -LiteralPath $path -Raw }
+    catch { throw "Invalid Workshop info XML: $path" }
+    $id = [string]$document.ModData.id
+    $mod = [string]$document.ModData.mod
+    return [pscustomobject]@{
+        Path = $path
+        Id = $id
+        Mod = $mod
+        Title = [string]$document.ModData.title
+    }
+}
+
+function Assert-IwWorkshopIdentity([string]$Directory) {
+    $info = Get-IwWorkshopInfo $Directory
+    if ($info.Id -ne $workshopId) {
+        throw "Workshop item ID mismatch in $($info.Path): expected $workshopId, got '$($info.Id)'."
+    }
+    if ($info.Mod -ne 'IronwindCombat') {
+        throw "Workshop mod identity mismatch in $($info.Path): expected IronwindCombat, got '$($info.Mod)'."
+    }
+    return $info
 }
 
 function Get-IwEnabledMods {
@@ -588,7 +630,169 @@ function Write-IwReleaseReport($Verification) {
         '> 这是自动化构建与部署证据，不代表游戏画面或完整回归已经验证。'
     )
     $content | Set-Content -LiteralPath $path -Encoding UTF8
-    Write-Output "Release facts: $path"
+    Write-Host "Release facts: $path"
+}
+
+function Invoke-IwFinish {
+    Invoke-IwCheck | Out-Null
+    $arguments = @{ Channel = 'Release'; SkipInstall = $true }
+    if ($SkipBuild) { $arguments.SkipBuild = $true }
+    if ($SkipArchive) { $arguments.SkipArchive = $true }
+    if ($SkipSymbols) { $arguments.SkipSymbols = $true }
+    if ($ReplaceArchive) { $arguments.ReplaceArchive = $true }
+    & (Join-Path $projectDir 'deploy-local.ps1') @arguments
+    $verified = Invoke-IwVerify -VerifyChannel Release
+    Write-IwReleaseReport $verified
+    return $verified
+}
+
+function Get-IwWorkshopPublishState {
+    $version = Get-IwVersion
+    $releaseVersionPath = Join-Path $releasePackageDir 'VERSION'
+    $workshopVersionPath = Join-Path $workshopStableDir 'VERSION'
+    $stageVersionPath = Join-Path $localStableDir 'VERSION'
+    $releaseVersion = if (Test-Path -LiteralPath $releaseVersionPath -PathType Leaf) { (Get-Content -LiteralPath $releaseVersionPath -Raw).Trim() } else { $null }
+    $workshopVersion = if (Test-Path -LiteralPath $workshopVersionPath -PathType Leaf) { (Get-Content -LiteralPath $workshopVersionPath -Raw).Trim() } else { $null }
+    $stageVersion = if (Test-Path -LiteralPath $stageVersionPath -PathType Leaf) { (Get-Content -LiteralPath $stageVersionPath -Raw).Trim() } else { $null }
+    $releaseHash = Get-IwHash $releasePackageDll
+    $workshopHash = Get-IwHash $workshopStableDll
+    $stageHash = Get-IwHash (Join-Path $localStableDir 'WASDCombatPlugin.dll')
+    $stageInfo = $null
+    $stageIdentityValid = $false
+    if (Test-Path -LiteralPath (Join-Path $localStableDir $workshopInfoName) -PathType Leaf) {
+        try {
+            $stageInfo = Get-IwWorkshopInfo $localStableDir
+            $stageIdentityValid = $stageInfo.Id -eq $workshopId -and $stageInfo.Mod -eq 'IronwindCombat'
+        } catch {
+            $stageIdentityValid = $false
+        }
+    }
+    $stageGenerated = Test-Path -LiteralPath $workshopStageMarker -PathType Leaf
+    $stageReady =
+        (Test-Path -LiteralPath $localStableDir -PathType Container) -and
+        $stageGenerated -and
+        $stageIdentityValid -and
+        $stageVersion -eq $version -and
+        $releaseVersion -eq $version -and
+        $stageHash -and
+        $stageHash -eq $releaseHash -and
+        (Test-Path -LiteralPath (Join-Path $localStableDir 'IronwindCombat.mod') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $localStableDir $workshopImageName) -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $localStableDir 'IronwindCombatDev.mod') -PathType Leaf)
+    $published =
+        $releaseVersion -eq $version -and
+        $workshopVersion -eq $version -and
+        $releaseHash -and
+        $workshopHash -eq $releaseHash
+    return [pscustomobject]@{
+        ProjectVersion = $version
+        ReleasePackageVersion = $releaseVersion
+        WorkshopVersion = $workshopVersion
+        StagePresent = Test-Path -LiteralPath $localStableDir -PathType Container
+        StageGeneratedByTool = $stageGenerated
+        StageVersion = $stageVersion
+        WorkshopId = if ($stageInfo) { $stageInfo.Id } else { $null }
+        WorkshopMod = if ($stageInfo) { $stageInfo.Mod } else { $null }
+        StageDllSha256 = $stageHash
+        ReleaseDllSha256 = $releaseHash
+        WorkshopDllSha256 = $workshopHash
+        ReadyToUpload = [bool]$stageReady
+        PublishedToWorkshop = [bool]$published
+        StagePath = $localStableDir
+        WorkshopPath = $workshopStableDir
+    }
+}
+
+function New-IwWorkshopStage {
+    Assert-IwPublishingAppsClosed
+    if (Test-Path -LiteralPath $localStableDir -PathType Container) {
+        $markerHint = if (Test-Path -LiteralPath $workshopStageMarker -PathType Leaf) {
+            'It is an existing generated upload stage; finish or inspect that upload before preparing another.'
+        } else {
+            'It was not generated by this tool and will not be overwritten.'
+        }
+        throw "Workshop staging already exists: $localStableDir. $markerHint"
+    }
+
+    $sourceInfo = Assert-IwWorkshopIdentity $workshopStableDir
+    Assert-IwFile (Join-Path $workshopStableDir $workshopImageName)
+    $verification = Invoke-IwFinish
+    $version = $verification.Version
+    $tempStage = Join-Path $projectDir "package\.workshop-stage-$version-$PID"
+    if (Test-Path -LiteralPath $tempStage) { throw "Unexpected temporary staging path already exists: $tempStage" }
+    New-Item -ItemType Directory -Path $tempStage | Out-Null
+    try {
+        Get-ChildItem -LiteralPath $releasePackageDir -Force | Copy-Item -Destination $tempStage -Recurse -Force
+        Copy-Item -LiteralPath $sourceInfo.Path -Destination (Join-Path $tempStage $workshopInfoName) -Force
+        Copy-Item -LiteralPath (Join-Path $workshopStableDir $workshopImageName) -Destination (Join-Path $tempStage $workshopImageName) -Force
+        $marker = [ordered]@{
+            schemaVersion = 1
+            generatedAt = (Get-Date).ToString('o')
+            ironwindVersion = $version
+            workshopId = $workshopId
+            modFile = 'IronwindCombat.mod'
+            releaseDllSha256 = $verification.DllSha256
+            sourceWorkshopInfoSha256 = Get-IwHash $sourceInfo.Path
+            sourceWorkshopImageSha256 = Get-IwHash (Join-Path $workshopStableDir $workshopImageName)
+        }
+        $marker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $tempStage '.ironwind-workshop-staging.json') -Encoding UTF8
+        Move-Item -LiteralPath $tempStage -Destination $localStableDir
+    } catch {
+        if (Test-Path -LiteralPath $tempStage -PathType Container) {
+            Remove-Item -LiteralPath $tempStage -Recurse -Force
+        }
+        throw
+    }
+
+    $state = Get-IwWorkshopPublishState
+    if (-not $state.ReadyToUpload) { throw 'Workshop staging verification failed after creation.' }
+    Write-Host "Workshop upload staging is ready for Ironwind v$version."
+    Write-Host "FCS active mod: $localStableDir\IronwindCombat.mod"
+    Write-Host "Existing Workshop item: $workshopId"
+    Write-Warning 'The local stable identity intentionally shadows the subscription until WorkshopFinalize succeeds. Do not launch Kenshi from this staging state.'
+    return $state
+}
+
+function Complete-IwWorkshopPublish {
+    Assert-IwPublishingAppsClosed
+    $state = Get-IwWorkshopPublishState
+    if (-not $state.StagePresent) { throw "Workshop staging does not exist: $localStableDir" }
+    if (-not $state.StageGeneratedByTool) { throw 'Refusing to remove a local stable directory that was not generated by WorkshopPrepare.' }
+    if (-not $state.PublishedToWorkshop) {
+        throw "Steam Workshop has not synchronized Ironwind v$($state.ProjectVersion) with the release DLL yet. Keep staging and retry WorkshopFinalize after Steam finishes downloading the update."
+    }
+
+    $resolvedStage = (Resolve-Path -LiteralPath $localStableDir).Path.TrimEnd('\')
+    $expectedStage = [System.IO.Path]::GetFullPath($localStableDir).TrimEnd('\')
+    if (-not [string]::Equals($resolvedStage, $expectedStage, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Resolved staging path is not the expected directory: $resolvedStage"
+    }
+    $marker = Get-Content -LiteralPath $workshopStageMarker -Raw | ConvertFrom-Json
+    if ($marker.schemaVersion -ne 1 -or $marker.workshopId -ne $workshopId -or $marker.modFile -ne 'IronwindCombat.mod') {
+        throw 'Workshop staging marker is invalid; refusing cleanup.'
+    }
+
+    $reportDir = Join-Path $projectDir 'reports\workshop-publish'
+    New-Item -ItemType Directory -Path $reportDir -Force | Out-Null
+    $reportPath = Join-Path $reportDir ("Ironwind-v{0}-{1}.json" -f $state.ProjectVersion, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $report = [ordered]@{
+        schemaVersion = 1
+        finalizedAt = (Get-Date).ToString('o')
+        ironwindVersion = $state.ProjectVersion
+        workshopId = $workshopId
+        releaseDllSha256 = $state.ReleaseDllSha256
+        workshopDllSha256 = $state.WorkshopDllSha256
+        stagedDllSha256 = $state.StageDllSha256
+        sourceStage = $localStableDir
+        publishedWorkshop = $workshopStableDir
+    }
+    $report | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    Remove-Item -LiteralPath $localStableDir -Recurse -Force
+    Set-IwChannel -TargetChannel Release
+    Write-Host "Removed generated Workshop staging after verified Steam synchronization: $localStableDir"
+    Write-Host 'The staging copy is not recoverable in place; the verified release package and Steam Workshop copy remain available.'
+    Write-Host "Workshop publication facts: $reportPath"
+    return Get-IwWorkshopPublishState
 }
 
 function Start-IwSession {
@@ -690,6 +894,9 @@ function Show-IwHelp {
   Deploy [-Channel ...]          指定 Development/Release 流水线（默认 Development）
   DevFinish                      Check → 开发安装 → UseDev → Verify，不新增 ZIP/永久符号
   Finish                         Check → 正式包/ZIP → Verify → 发布事实；不覆盖订阅版
+  WorkshopPrepare                Finish → 临时正式身份目录 → 恢复原 Workshop ID → 上传前核验
+  WorkshopStatus                 只读核对正式包、临时上传目录与 Steam 订阅版
+  WorkshopFinalize               Steam 同步核验 → 清理临时目录 → UseStable → 发布事实
   Verify [-Channel ...]          核对指定通道（默认 Development）
   UseDev                         只启用本地 IronwindCombatDev.mod
   UseStable                      只启用 Workshop IronwindCombat.mod
@@ -701,6 +908,9 @@ function Show-IwHelp {
 常用：
   .\tools\ironwind.ps1 DevFinish
   .\tools\ironwind.ps1 Finish   # 确定正式发布时
+  .\tools\ironwind.ps1 WorkshopPrepare
+  .\tools\ironwind.ps1 WorkshopStatus
+  .\tools\ironwind.ps1 WorkshopFinalize
   .\tools\ironwind.ps1 UseStable
   .\tools\ironwind.ps1 UseDev
   .\tools\ironwind.ps1 SessionStart -Label v85-melee
@@ -761,17 +971,10 @@ switch ($Task) {
         Set-IwChannel -TargetChannel Development
         Invoke-IwVerify -VerifyChannel Development | Format-List
     }
-    'Finish' {
-        Invoke-IwCheck | Out-Null
-        $arguments = @{ Channel = 'Release'; SkipInstall = $true }
-        if ($SkipBuild) { $arguments.SkipBuild = $true }
-        if ($SkipArchive) { $arguments.SkipArchive = $true }
-        if ($SkipSymbols) { $arguments.SkipSymbols = $true }
-        if ($ReplaceArchive) { $arguments.ReplaceArchive = $true }
-        & (Join-Path $projectDir 'deploy-local.ps1') @arguments
-        $verified = Invoke-IwVerify -VerifyChannel Release
-        Write-IwReleaseReport $verified
-    }
+    'Finish' { Invoke-IwFinish | Format-List }
+    'WorkshopPrepare' { New-IwWorkshopStage | Format-List }
+    'WorkshopStatus' { Get-IwWorkshopPublishState | Format-List }
+    'WorkshopFinalize' { Complete-IwWorkshopPublish | Format-List }
     'Verify' { Invoke-IwVerify -VerifyChannel $Channel | Format-List }
     'UseDev' { Set-IwChannel -TargetChannel Development }
     'UseStable' { Set-IwChannel -TargetChannel Release }
