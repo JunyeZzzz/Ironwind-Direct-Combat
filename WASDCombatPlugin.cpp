@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "121"
+#define IRONWIND_VERSION "122"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -753,6 +753,7 @@ static volatile ULONGLONG s_rmbAimPressMs      = 0;      // poll thread: RMB pre
 static ULONGLONG         s_rmbAimSeenMs        = 0;
 static bool              s_aimClicked          = false;  // the current focus came from a click
 static bool              s_settingAimName      = true;   // [Settings] AimNameTag
+static bool              s_settingFriendlyHealth = true; // [Settings] ShowFriendlyHealth
 // Aim-focus marker (user 2026-09-22): the enemy's NAME above their head, in the
 // game's own small text skin with a shadow - like the vanilla name tag.
 static MyGUI::TextBox*   s_nameTag             = nullptr;
@@ -1640,6 +1641,8 @@ static void writeDefaultConfig(const char* path)
         "AimHoverPx             = 70\r\n"
         "; Aim focus marker: the name of the enemy you are pointing at, above their head.\r\n"
         "AimNameTag             = true\r\n"
+        "; Also show the same detailed panel when the crosshair is directly over an ally or squad member.\r\n"
+        "ShowFriendlyHealth     = true\r\n"
         "; Detailed log for bug reports (writes every combat/movement event).\r\n"
         "VerboseLog             = false\r\n"
         "; V-mode third-person camera: distance / height / shoulder offset.\r\n"
@@ -1968,6 +1971,8 @@ static void loadKeybinds()
             s_blockCooldownMs = bc;
             GetPrivateProfileStringA("Settings", "AimNameTag", "true", pbuf, sizeof(pbuf), path);
             s_settingAimName = parseBool(pbuf, true);
+            GetPrivateProfileStringA("Settings", "ShowFriendlyHealth", "true", pbuf, sizeof(pbuf), path);
+            s_settingFriendlyHealth = parseBool(pbuf, true);
             GetPrivateProfileStringA("Settings", "AimConeDeg", "35", pbuf, sizeof(pbuf), path);
             float ac = (float)atof(pbuf);
             if (ac < 5.0f) ac = 5.0f;      if (ac > 90.0f) ac = 90.0f;
@@ -2103,6 +2108,9 @@ static DcOptRow s_dcOptRows[] =
     { "Settings", "AimNameTag", &s_settingAimName, NULL, 0, 0, 0, 1,
       "Show target's name and health",
       "The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head." },
+    { "Settings", "ShowFriendlyHealth", &s_settingFriendlyHealth, NULL, 0, 0, 0, 1,
+      "Show friendly and squad health",
+      "Also shows the full detailed panel when the crosshair is directly over an allied NPC or one of your squad members." },
 
     { NULL, NULL, NULL, NULL, 0, 0, 0, 0, "THIRD PERSON CAMERA (V)", NULL },
     { "Settings", "OtsHeight", NULL, &s_otsCamHeight, -5.0f, 28.0f, 1, 18.0f,
@@ -5901,6 +5909,8 @@ static void manualAttackHudUpdate()
 
 static bool focusTargetLoaded(Character* t);   // fwd decl (manual combat, below)
 static bool focusTargetValid(Character* t);    // fwd decl (manual combat, below)
+static bool manualVPlayerTeamMember(Character* target);
+static Character* focusFriendlyTargetUnderCrosshair();
 
 // Whose name + health bars to show: the aim focus, else (manual combat, in a
 // fight) whoever the character's AI is fighting - user 2026-10-08: the bars
@@ -5911,8 +5921,18 @@ static bool focusTargetValid(Character* t);    // fwd decl (manual combat, below
 // foe with (AI target, biggest threat, attack target), no combat-flag gate,
 // within twice the aim range.
 static Character* s_barsFoeLogged = nullptr;
+static Character* s_barsFriendlyLogged = nullptr;
 static Character* focusDisplayTarget()
 {
+    Character* friendly = s_settingFriendlyHealth
+        ? focusFriendlyTargetUnderCrosshair() : nullptr;
+    if (friendly != s_barsFriendlyLogged)
+    {
+        s_barsFriendlyLogged = friendly;
+        VerbLog(friendly ? "[WASDCombat] bars_friendly_target set"
+                         : "[WASDCombat] bars_friendly_target none");
+    }
+    if (friendly) return friendly;
     if (s_lockTarget && focusTargetLoaded(s_lockTarget)) return s_lockTarget;
     Character* found = nullptr;
     if (s_manualAttackOn && s_freeMoveAnchor && s_freeMoveAnchor->movement)
@@ -5971,6 +5991,75 @@ static bool focusBonePos(Character* t, const char* bone, float fallbackUp, Ogre:
     if (!t->movement) return false;
     out = t->movement->pos + Ogre::Vector3(0.0f, fallbackUp, 0.0f);
     return true;
+}
+
+// Optional observation-only friendly panel. It never assigns combat focus or
+// an interaction target: the crosshair must directly overlap the projected
+// body, and only one closest allied/squad character can win.
+static Character* focusFriendlyTargetUnderCrosshair()
+{
+    Character* me = s_freeMoveAnchor;
+    if (!me || !me->movement || !s_gwFrame || !ou || !ou->player
+        || !ou->player->camera || !ou->player->camera->camera) return nullptr;
+    Ogre::Camera* cam = ou->player->camera->camera;
+    MyGUI::IntSize view = MyGUI::RenderManager::getInstance().getViewSize();
+    if (view.width <= 0 || view.height <= 0) return nullptr;
+    const float aimX = view.width * 0.5f, aimY = view.height * 0.5f;
+    const Ogre::Vector3 mp = me->movement->pos;
+    const float maxRange = s_aimRange * 2.0f;
+    const float maxR2 = maxRange * maxRange;
+    Character* best = nullptr;
+    float bestD2 = maxR2;
+    auto& chars = s_gwFrame->getCharacterUpdateList();
+    for (auto it = chars.begin(); it != chars.end(); ++it)
+    {
+        Character* c = *it;
+        if (!c || c == me || !c->movement) continue;
+        bool friendly = manualVPlayerTeamMember(c) || c->isAlly(me, true);
+        if (!friendly || c->isEnemy(me, true) || me->isEnemy(c, true)) continue;
+        Ogre::Vector3 delta = c->movement->pos - mp;
+        delta.y = 0.0f;
+        float d2 = delta.squaredLength();
+        if (d2 < 1e-4f || d2 >= bestD2) continue;
+
+        Ogre::Vector3 head, chest, hips;
+        int hx, hy, cx, cy, px, py, feetX, feetY;
+        if (!focusBonePos(c, "Bip01 Head", 18.0f, head)
+            || !focusBonePos(c, "Bip01 Spine1", 11.0f, chest)
+            || !focusBonePos(c, "Bip01 Pelvis", 5.0f, hips)
+            || !focusProject(cam, head, 0.0f, hx, hy)
+            || !focusProject(cam, chest, 0.0f, cx, cy)
+            || !focusProject(cam, hips, 0.0f, px, py)
+            || !focusProject(cam, c->movement->pos + Ogre::Vector3(0.0f, 1.0f, 0.0f),
+                             0.0f, feetX, feetY)) continue;
+
+        int topPx = hy;
+        if (cy < topPx) topPx = cy;
+        if (py < topPx) topPx = py;
+        if (feetY < topPx) topPx = feetY;
+        int bottomPx = hy;
+        if (cy > bottomPx) bottomPx = cy;
+        if (py > bottomPx) bottomPx = py;
+        if (feetY > bottomPx) bottomPx = feetY;
+        float top = (float)topPx - 14.0f;
+        float bottom = (float)bottomPx + 18.0f;
+        float halfWidth = (bottom - top) * 0.16f + 8.0f;
+        if (halfWidth < 24.0f) halfWidth = 24.0f;
+        if (halfWidth > 65.0f) halfWidth = 65.0f;
+        float centerX = (cx + px) * 0.5f;
+        if (aimY > (float)py && feetY != py)
+        {
+            float t = (aimY - py) / (float)(feetY - py);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            centerX = px + (feetX - px) * t;
+        }
+        if (fabsf(aimX - centerX) > halfWidth || aimY < top || aimY > bottom)
+            continue;
+        best = c;
+        bestD2 = d2;
+    }
+    return best;
 }
 
 static bool focusHealthBarsCreate()

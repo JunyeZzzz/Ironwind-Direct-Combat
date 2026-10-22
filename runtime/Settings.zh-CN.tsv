@@ -66,6 +66,8 @@ A second press of the same combat key this soon after the first is ignored, so a
 MANUAL COMBAT - ON-SCREEN CUES	手动战斗：画面提示
 Show target's name and health	显示目标名称与生命状态
 The enemy your character will fight gets their name and thin blood / head / chest / stomach bars above their head.	在目标头顶显示名称，以及血量、头部、胸部和腹部状态条。
+Show friendly and squad health	显示友军与队友生命状态
+Also shows the full detailed panel when the crosshair is directly over an allied NPC or one of your squad members.	准星直接覆盖友军 NPC 或玩家队友身体时，也显示同一套完整的姓名与两行八部位状态面板。
 THIRD PERSON CAMERA (V)	越肩镜头（V）
 Distance behind your character	镜头与角色距离
 How far back the shoulder camera sits. The mouse wheel zooms while it is active.	越肩镜头距离角色多远；在该视角中可用滚轮缩放。

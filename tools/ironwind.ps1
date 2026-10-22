@@ -296,8 +296,20 @@ function Invoke-IwCheck {
     $visibleSettingCount = [regex]::Matches(
         $visibleOptions, '\{\s*"(?:Settings|FirstPerson)"\s*,'
     ).Count
-    if ($visibleSettingCount -gt 11) {
-        throw "Ironwind options page regrew beyond the v121 compact limit: $visibleSettingCount visible settings."
+    if ($visibleSettingCount -gt 12) {
+        throw "Ironwind options page regrew beyond the v122 compact limit: $visibleSettingCount visible settings."
+    }
+    if ($defaultIniText -notmatch '(?m)^\s*AiBlocksInManual\s*=\s*false\s*$') {
+        throw 'Automatic block must ship disabled so the initial guard mode is manual directional.'
+    }
+    if ($visibleOptions -notmatch '\{\s*"Settings"\s*,\s*"AiBlocksInManual"[^\r\n]*,\s*0\s*,') {
+        throw 'The settings-page reset default for automatic block must remain off.'
+    }
+    if ($defaultIniText -notmatch '(?m)^\s*ShowFriendlyHealth\s*=\s*true\s*$') {
+        throw 'Friendly/squad detailed health display must ship enabled.'
+    }
+    if ($visibleOptions -notmatch '\{\s*"Settings"\s*,\s*"ShowFriendlyHealth"[^\r\n]*,\s*1\s*,') {
+        throw 'The settings-page reset default for friendly/squad health must remain on.'
     }
     foreach ($symbol in @('s_settingGlint', 's_glint', 's_glowTex', 'focusGlowTexCreate',
                            'focusGlowBox', 'focusGlintCreate', 'glintTier', 'dc_glow_tex',
