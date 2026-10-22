@@ -105,7 +105,7 @@
 | 自动格挡空地按压 | 当前自然姿势完全不变，不因按压进入防御站姿／combat idle；仍保持原地且等待真实来袭 | `ai_guard_request armed=1 pose=unchanged`；不得出现 `ai_guard_ready_pose` 或 `block_hold vanilla_order=applied` |
 | 自动模式不按右键 | 即使敌人来袭也不得自主格挡；受击和僵直仍走原版 | 可见 `manual_ai_block_denied` 或普通 `hit_on_me`，不得有 `ai_block_choice` |
 | 自动格挡时移动／绕圈 | 仅“右键按住＋真实来袭”时 AI 可作原版防御；无请求时 WASD 仍归玩家，AI 不追击、不自动挥刀、不连击 | 可见原版 block/dodge verdict；不得出现未授权攻击提交或自动 CHOP |
-| 任一格挡模式按住右键再按 WASD | 整个已接受格挡请求期间角色位置不变；原版格挡／失败受击动作继续推进；松开右键后移动立即恢复 | 按住期间有节流后的 `guard_wasd_blocked`，不得有 `combat_move block=1`；松开后下一次 WASD 正常注入 |
+| 跑步中按住右键格挡并继续按 WASD | 整个已接受格挡请求期间角色、镜头锚点与碰撞位置一起停住；可视人物不得沿原跑步方向脱离镜头；原版格挡／失败受击动作继续推进；松开右键后移动立即恢复 | 按住期间有节流后的 `guard_wasd_blocked` 与 `guard_stationary_hold`，不得有 `combat_move block=1`；不得出现镜头停住而人物继续跑；松开后下一次 WASD 正常注入 |
 | BLOCK 被破／防御反应结束后仍按住右键 | 原版 REACTION_BLOCK/STUMBLE 完整；结束后回到普通持械防御待机，不停在格挡尾帧或怪姿势 | 反应期间输入仍按原版锁定；随后 `ai_guard_ready_pose neutral_combat_idle`，不得固定毫秒强退 |
 | 自动格挡按住右键并 WASD（无真实 BLOCK） | 仍保持原地防御待机，不因 WASD 清掉下次自动格挡资格 | 有 `guard_wasd_blocked`；下一次来袭仍至多一次 `ai_block_attempt` |
 | 自动格挡且敌人攻击 | 敌人手部／武器上不出现铁风自制发光；按住右键后的自动防御仍工作 | `attackingYou_hook` 仍建立独立来袭事件，可见 `incoming_attack_impact`、`ai_block_attempt` 或原版失败受击；不得出现 `dc_glow_tex`、`dc_glint`、`glint_created`、`glint_impact`。原版 `HIT_SWORD` 碰撞火花不属于本条删除范围 |
@@ -187,17 +187,17 @@
 | 中立目标近身 | v64 由原版 unprovoked STARTUP/CHOP 决定命中；铁风不记录或判断 `native_zone` |
 | 中立目标位于原版攻击区外 | 不得隔空命中，也不得由任务接管移动自动靠近；本次尝试结束后立即恢复直接控制 |
 | 攻击途中持续右键 | 只按命中前后规则请求格挡，绝不打开交互/对话；不得出现 `interact_menu_open` |
-| 受击硬直期间 | 不允许取消硬直进入格挡 |
+| 受击硬直期间新按或持续按住某方向右键 | 僵直期间不允许进入格挡；保存一次仍在物理按住的方向，原版 STUMBLE/REACTION_BLOCK 结束第一帧立即恢复格挡，不需要松开重按。期间若松开，恢复后不得补发旧格挡 | 依次出现 `reaction_guard_hold_preserved`、原版 `stagger_end`、`reaction_guard_rearmed` 和正常 `block_press_accepted`／`block_hold`；松开分支出现 `reaction_guard_hold_cancelled`，之后不得 rearmed |
 | 空闲时被真实命中 | 日志依次出现 `hit_on_me`、`hit_confirmed_pre_gethit`、`hit_native_reaction`；`stumble=0` 只保留原版轻受击，`stumble=1` 才允许进入 STUMBLE |
 | WASD 移动中被真实命中 | `stumble=1` 时立即停止直接移动并完整播放原版僵直；原版状态结束当帧恢复。`stumble=0` 不得出现固定 750 ms 锁脚 |
 | 自由攻击中被真实命中 | 当前挥刀在原版受击动作安装前立即结束；即使命中前 `combatModeActive=0`，也应先见 `hit_reaction_combat_restored`，随后出现 `hit_confirmed_pre_gethit ... yielded=1` 和 `hit_native_reaction` |
-| 原版反应中敌人持续施压 | 玩家 AI 不自行走位、不自动出刀、不连击；按键只记 `hit_reaction_input_dropped`，不得在恢复后补发 `attack_release_commit/free_attack_start` |
+| 原版反应中敌人持续施压 | 玩家 AI 不自行走位、不自动出刀、不连击；攻击键只记 `hit_reaction_input_dropped`，不得在恢复后补发 `attack_release_commit/free_attack_start`；只有仍按住的 RMB 可按上一行恢复 |
 | 与切磋／第三方战斗控制器共同受击 | 若第三方没有继续调度玩家 `go()`，应只出现一次 `hit_reaction_fallback_advance`，随后进入原版 STUMBLE/REACTION_BLOCK 并按真实状态结束；正常原版调度应只有 `hit_reaction_go ... source=engine`，不得出现兜底、AI 走位或自动攻击 |
 | 切磋中进入并退出 V | V 内受控角色只响应铁风手动输入，自动攻击保持抑制；退出 V 后由切磋插件在一次 `true → false` 边沿恢复自己的聚焦任务，角色重新自动切磋。铁风不恢复未知外部任务，整场不得出现周期性补单 |
 | 受击倒地导致 V 自动退出后重新进入 | 退出只清铁风自己的 pending/输入锁，不截断原版倒地；角色可控后重新按 V，若已离开 STUMBLE/REACTION_BLOCK，首次左键必须正常进入 `attack_aim_begin`，不得继续 `hit_reaction_input_dropped` | `hit_reaction_lock_cleared_v_exit`；已恢复时可有 `hit_reaction_stale_lock_cleared_v_enter`，但不得残留丢键 |
 | 格挡或闪避成功 | 不出现 `hit_confirmed_pre_gethit`，不产生假 `stagger_start` |
 
-日志核对 `free_block_play`、`free_block_clip`、`directional_guard_block`、`attack_guard_cancel`、`hit_free_action_interrupted`、`hit_reaction_combat_restored`、`hit_confirmed_pre_gethit`、`hit_native_reaction`、`hit_reaction_fallback_advance`、`hit_reaction_input_dropped`、`stagger_start` 和 `stagger_end`。新会话不得再出现 `perfect_block`、`block_press_reward` 或奖励蓝光。`stumble=1` 的 `after=3/8` 之后不得再立刻出现 `hit_native_reaction_not_entered`；应进入稳定 STUMBLE。`stumble=0` 时不得由铁风制造固定时长的输入锁。无第三方调度异常的普通战斗不得出现 fallback；同一 serial／同一帧不得补推进两次。
+日志核对 `free_block_play`、`free_block_clip`、`directional_guard_block`、`attack_guard_cancel`、`hit_free_action_interrupted`、`hit_reaction_combat_restored`、`hit_confirmed_pre_gethit`、`hit_native_reaction`、`hit_reaction_fallback_advance`、`hit_reaction_input_dropped`、`reaction_guard_hold_preserved`、`reaction_guard_hold_cancelled`、`reaction_guard_rearmed`、`stagger_start` 和 `stagger_end`。新会话不得再出现 `perfect_block`、`block_press_reward` 或奖励蓝光。`stumble=1` 的 `after=3/8` 之后不得再立刻出现 `hit_native_reaction_not_entered`；应进入稳定 STUMBLE。`stumble=0` 时不得由铁风制造固定时长的输入锁。无第三方调度异常的普通战斗不得出现 fallback；同一 serial／同一帧不得补推进两次。
 
 ### D2. 动画冻结保护
 

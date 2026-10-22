@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v126**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v127**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,12 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v127
+
+- 修正跑步中按住格挡后镜头停住、可视人物却继续向前跑的问题。旧实现先运行原版移动更新，再只倒带 `CharMovement::pos.x/z`，把镜头使用的逻辑锚点与已经推进的可视根节点拆开；现在格挡直接把 WASD 当作未按下，走统一的 `halt + MOVE_DIRECTION + 零速度` 静止入口，并禁止格挡路径事后单独回写逻辑坐标。格挡动作仍由原版时间轴推进，松开右键立即恢复移动。
+- 修正受击时持续按住方向格挡必须松开重按的问题。原版 `STUMBLE/REACTION_BLOCK` 期间攻击输入仍丢弃、格挡也不能提前生效；只保存物理上仍按住的 RMB 及首次选定方向，松开即取消。原版反应结束的第一游戏帧才建立新格挡请求并复用该方向，不使用固定僵直时长，也不会补发已经松开的旧点击。
+- 增加上述两条所有权的静态回归门和日志事件：`reaction_guard_hold_preserved`、`reaction_guard_hold_cancelled`、`reaction_guard_rearmed`。本版本尚待游戏内画面与日志确认。
 
 ## v126
 

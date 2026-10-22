@@ -32,7 +32,7 @@
     {
       "id": "reaction",
       "label": "玩家受击反应",
-      "patterns": ["^hit_on_me$", "^stagger_", "^hit_reaction_", "^knockdown_or_stagger_started$", "^getup_animation_started$"]
+      "patterns": ["^hit_on_me$", "^stagger_", "^hit_reaction_", "^reaction_guard_", "^knockdown_or_stagger_started$", "^getup_animation_started$"]
     },
     {
       "id": "control",

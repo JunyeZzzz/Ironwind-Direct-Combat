@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "126"
+#define IRONWIND_VERSION "127"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -553,6 +553,14 @@ static volatile int      s_lastAttackDirection = CUT_DOWNWARD;
 static volatile bool     s_blockGestureSeen    = false;  // guard direction came from the mouse
 static volatile ULONGLONG s_rmbCombatEdgeMs    = 0;      // poll: RMB press, classified on the game thread
 static ULONGLONG         s_rmbCombatEdgeSeenMs = 0;
+// A real native hit reaction temporarily owns the body, but it must not turn a
+// continuously held RMB into a release/re-press requirement. The poll thread
+// captures one guard direction while the reaction is live; the game thread
+// re-arms that same request only after STUMBLE/REACTION_BLOCK actually ends.
+// Releasing RMB clears this latch immediately, so no stale press can survive.
+static volatile bool     s_reactionGuardHeld = false;
+static volatile LONG     s_reactionGuardDesired = CUT_DEFAULT;
+static volatile bool     s_reactionGuardGestureSeen = false;
 // Directional combat gives LMB/RMB exclusively to attack/guard. E targets one
 // nearby original RootObject (character, door, furniture, machine, etc.). The
 // native context menu owns the cursor and an Ironwind-owned pause only while
@@ -913,6 +921,9 @@ static void manualHitReactionClearRuntime()
 {
     s_hitReactionPending = false;
     s_hitReactionAdvancedFrameSerial = 0;
+    s_reactionGuardHeld = false;
+    s_reactionGuardDesired = CUT_DEFAULT;
+    s_reactionGuardGestureSeen = false;
     InterlockedExchange(&s_hitReactionInputLock, 0);
 }
 
@@ -2708,10 +2719,50 @@ static DWORD WINAPI PollThread(LPVOID)
                 &s_hitReactionInputLock, 0, 0) != 0;
             if (hitReactionLocked)
             {
-                // Original Kenshi reaction owns the body.  Mouse edges during
-                // it are dropped, not buffered for the first recovery frame.
-                if (lmbPressed || lmbReleased || rmbPressed)
+                // Original Kenshi reaction owns the body. Attacks still die at
+                // this boundary. A physically held RMB is different: preserve
+                // exactly one direction and re-arm it only after the native
+                // reaction ends. Releasing during the reaction cancels it, so
+                // this is live hold intent rather than a buffered old click.
+                if (lmbPressed || lmbReleased)
                     VerbLog("[Ironwind] hit_reaction_input_dropped");
+                if (rmbDown)
+                {
+                    if (!s_reactionGuardHeld)
+                    {
+                        CutDirection guard = CUT_DEFAULT;
+                        bool gestureSeen = false;
+                        if (!s_settingAiBlocks)
+                        {
+                            if (s_mouseBlockHeld && s_blockHeld
+                                && s_blockDesired != CUT_DEFAULT)
+                            {
+                                guard = (CutDirection)s_blockDesired;
+                                gestureSeen = s_blockGestureSeen;
+                            }
+                            else
+                            {
+                                CutDirection gesture = recent;
+                                if (gesture == CUT_DEFAULT)
+                                    gesture = (CutDirection)s_lastAttackDirection;
+                                if (gesture == CUT_DEFAULT) gesture = CUT_DOWNWARD;
+                                guard = combatGuardDirectionFromGesture(gesture);
+                                gestureSeen = recent != CUT_DEFAULT;
+                            }
+                        }
+                        s_reactionGuardDesired = guard;
+                        s_reactionGuardGestureSeen = gestureSeen;
+                        s_reactionGuardHeld = true;
+                        VerbLog("[Ironwind] reaction_guard_hold_preserved");
+                    }
+                }
+                else if (s_reactionGuardHeld)
+                {
+                    s_reactionGuardHeld = false;
+                    s_reactionGuardDesired = CUT_DEFAULT;
+                    s_reactionGuardGestureSeen = false;
+                    VerbLog("[Ironwind] reaction_guard_hold_cancelled");
+                }
                 s_attackAimHeld = false;
                 s_attackAimCancelled = true;
                 s_attackAimGestureSeen = false;
@@ -2724,6 +2775,14 @@ static DWORD WINAPI PollThread(LPVOID)
             }
             else
             {
+                // A release always invalidates a reaction-held request even if
+                // the game thread has not yet observed the native end frame.
+                if (!rmbDown)
+                {
+                    s_reactionGuardHeld = false;
+                    s_reactionGuardDesired = CUT_DEFAULT;
+                    s_reactionGuardGestureSeen = false;
+                }
                 if (lmbPressed)
                 {
                     s_attackAimHeld = true;
@@ -2813,6 +2872,9 @@ static DWORD WINAPI PollThread(LPVOID)
         }
         else
         {
+            s_reactionGuardHeld = false;
+            s_reactionGuardDesired = CUT_DEFAULT;
+            s_reactionGuardGestureSeen = false;
             if (s_mouseBlockHeld) s_blockHeld = false;
             s_mouseBlockHeld = false;
             s_blockGestureSeen = false;
@@ -8114,30 +8176,15 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
     bool inVMode     = (s_frameMode == MODE_FREE_MOVE);
     bool lootSuspend = s_frameLootSuspend;
 
-    // v97 stable fallback: a held guard owns the body and WASD is ignored.
-    // Kenshi's native normal-block animation is not discoverable through the
-    // Animation lookup used by free actions, so moving and then trying to infer
-    // its visual lifetime produced repeated pose cuts in v95/v96. Keep the
-    // anchor stationary for the whole accepted RMB request, let the original
-    // movement update advance combat animation, then remove any AI/root-motion
-    // displacement. No timer and no combat-state write is involved.
+    // A held guard owns the body and WASD is ignored. Treat the physical key as
+    // absent before entering the ordinary stationary path below. The old path
+    // ran the native movement update and then rewound only CharMovement::pos;
+    // the rendered/root-motion body had already advanced, so the camera stayed
+    // on the rewound anchor while the visible character ran away. One coherent
+    // stationary owner is safer than repairing only one coordinate layer.
     if (inVMode && !lootSuspend && wasdHeld && manualBlockMovementSlow())
     {
-        Ogre::Vector3 guardPos = thisptr->pos;
-        thisptr->halt();
-        thisptr->desiredMotion = Ogre::Vector3::ZERO;
-        thisptr->moveLimit = 0.0f;
-        thisptr->currentMotion = Ogre::Vector3::ZERO;
-        s_wasdMovementApplied = false;
-        s_prevWasdDir = Ogre::Vector3::ZERO;
-        s_charMovUpdateOrig(thisptr, time);
-        thisptr->pos.x = guardPos.x;
-        thisptr->pos.z = guardPos.z;
-        thisptr->desiredMotion.x = 0.0f;
-        thisptr->desiredMotion.z = 0.0f;
-        thisptr->currentMotion.x = 0.0f;
-        thisptr->currentMotion.z = 0.0f;
-        thisptr->currentSpeed = 0.0f;
+        wasdHeld = false;
         static ULONGLONG lastGuardWasdBlockedMs = 0;
         ULONGLONG guardNow = GetTickCount64();
         if (guardNow - lastGuardWasdBlockedMs >= 1000)
@@ -8145,7 +8192,6 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
             lastGuardWasdBlockedMs = guardNow;
             VerbLog("[Ironwind] guard_wasd_blocked");
         }
-        return;
     }
 
     // Combat WASD transition bridge: if we were just driving and a real key was
@@ -8281,8 +8327,20 @@ static void charMovUpdate_hook(CharMovement* thisptr, float time)
                 }
                 if (guardCC && s_freeGuardUpperIdle && s_freeBlockTech)
                     guardCC->combatModeActive = true;
-                thisptr->pos.x         = s_holdPos.x;
-                thisptr->pos.z         = s_holdPos.z;
+                if (manualBlockMovementSlow())
+                {
+                    // The guard path already halted the native controller
+                    // before update. Keep the post-update position as the one
+                    // authoritative body position; rewinding only this raw
+                    // field split the camera anchor from the rendered root.
+                    s_holdPos.x = thisptr->pos.x;
+                    s_holdPos.z = thisptr->pos.z;
+                }
+                else
+                {
+                    thisptr->pos.x = s_holdPos.x;
+                    thisptr->pos.z = s_holdPos.z;
+                }
                 thisptr->currentMotion = Ogre::Vector3::ZERO;
                 return;
             }
@@ -8848,8 +8906,9 @@ static bool manualStaggered(Character* ch)
     CombatClass* cc = ch->getCombatClass();
     return cc && cc->combatModeActive && cc->getCombatState() == STUMBLE;
 }
-// Once per frame (from manualBlockTick): stagger edges.  Start = pending
-// presses die (nothing buffers across a stagger). End = inputs count again.
+// Once per frame (from manualBlockTick): stagger edges. Attack presses die;
+// a physically continuous RMB hold is preserved separately and becomes a new
+// guard request only on the native end edge. End = inputs count again.
 static void manualStaggerTick()
 {
     bool stag = s_mode == MODE_FREE_MOVE && s_freeMoveAnchor && !s_dcShutdownInProgress
@@ -10399,6 +10458,51 @@ static void manualInteractionActionTick()
 // duration can never reinterpret the press as a menu or dialogue request.
 static void manualConsumeCombatRmb()
 {
+    // A held guard survives only as physical intent while vanilla owns a hit
+    // reaction. Recreate one fresh accepted press on the exact first game
+    // frame where the native state is no longer STUMBLE/REACTION_BLOCK. The
+    // captured direction is reused; no new mouse gesture is required.
+    if (s_reactionGuardHeld)
+    {
+        bool physicalHeld = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (!physicalHeld)
+        {
+            s_reactionGuardHeld = false;
+            s_reactionGuardDesired = CUT_DEFAULT;
+            s_reactionGuardGestureSeen = false;
+        }
+        else if (ou && ou->player && !ou->isLoadingFromASaveGame()
+            && !s_dcPtrLossActive && !s_dcShutdownInProgress && !s_loadGuardActive
+            && mouseCombatContext() && s_freeMoveAnchor && !dcUiWantsCursor()
+            && !manualHitReactionLive(s_freeMoveAnchor))
+        {
+            ULONGLONG rearm = GetTickCount64();
+            if (!s_settingAiBlocks)
+            {
+                CutDirection guard = (CutDirection)s_reactionGuardDesired;
+                if (guard == CUT_DEFAULT)
+                    guard = combatGuardDirectionFromGesture((CutDirection)s_lastAttackDirection);
+                if (guard == CUT_DEFAULT) guard = CUT_DOWNWARD;
+                s_blockDesired = guard;
+                s_blockGestureSeen = s_reactionGuardGestureSeen;
+            }
+            else
+                s_blockGestureSeen = false;
+            s_mouseBlockHeld = true;
+            s_blockHeld = true;
+            s_blockPressMs = rearm;
+            s_reactionGuardHeld = false;
+            s_reactionGuardDesired = CUT_DEFAULT;
+            s_reactionGuardGestureSeen = false;
+            char rb[144];
+            sprintf_s(rb, sizeof(rb),
+                "[Ironwind] reaction_guard_rearmed mode=%s dir=%d",
+                s_settingAiBlocks ? "automatic_ai" : "manual_directional",
+                s_settingAiBlocks ? (int)CUT_DEFAULT : (int)s_blockDesired);
+            VerbLog(rb);
+        }
+    }
+
     ULONGLONG edge = s_rmbCombatEdgeMs;
     if (edge && edge != s_rmbCombatEdgeSeenMs)
     {
@@ -14880,8 +14984,18 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
                     s_holdPos      = mvFC->pos;
                     s_holdPosValid = true;
                 }
-                mvFC->pos.x         = s_holdPos.x;
-                mvFC->pos.z         = s_holdPos.z;
+                if (manualBlockMovementSlow())
+                {
+                    // See the movement-hook guard branch: never rewind only
+                    // CharMovement::pos after the rendered body has updated.
+                    s_holdPos.x = mvFC->pos.x;
+                    s_holdPos.z = mvFC->pos.z;
+                }
+                else
+                {
+                    mvFC->pos.x = s_holdPos.x;
+                    mvFC->pos.z = s_holdPos.z;
+                }
                 mvFC->desiredMotion = Ogre::Vector3::ZERO;
                 mvFC->currentMotion = Ogre::Vector3::ZERO;
                 mvFC->moveLimit     = 0.0f;

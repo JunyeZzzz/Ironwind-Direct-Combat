@@ -374,6 +374,26 @@ function Invoke-IwCheck {
             throw "v126 camera/target regression contract is incomplete: $required"
         }
     }
+    foreach ($required in @(
+        'static volatile bool     s_reactionGuardHeld',
+        '[Ironwind] reaction_guard_hold_preserved',
+        '[Ironwind] reaction_guard_hold_cancelled',
+        '[Ironwind] reaction_guard_rearmed',
+        'wasdHeld = false;'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v127 guard ownership contract is incomplete: $required"
+        }
+    }
+    foreach ($removed in @(
+        'Ogre::Vector3 guardPos = thisptr->pos;',
+        'thisptr->pos.x = guardPos.x;',
+        'thisptr->pos.z = guardPos.z;'
+    )) {
+        if ($sourceText -match [regex]::Escape($removed)) {
+            throw "Split camera/body guard rewind returned: $removed"
+        }
+    }
     $stateOwners = @(
         'manualAttackClearCapturedTarget',
         'manualAttackClearAimInput',

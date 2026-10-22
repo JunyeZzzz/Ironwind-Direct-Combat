@@ -167,7 +167,7 @@ v83 为 `VISUAL_RECOVERY → FREE_BLOCK` 增加排他交接。右键在 impact �
 
 v98 进一步删除自动模式按压时的防守订单和主动 combat-idle 写入：RMB 只建立权限并由格挡锁位门禁止移动。`manualAutoBlockInject` 仅在真实来袭且原版 chooser 返回具体 technique 后开启战斗动画层并进入 BLOCK，因此无来袭按压保持原姿势。手动模式仍保留即时姿势和 DEFENSIVE_COMBAT 订单。
 
-v96 试图查询原版选择出的普通 BLOCK technique 动画实例，但实机中成功 `HIT_SWORD` 的全部样本都返回 `clip_progress=-1.00`，不能建立可靠片尾边界。v97 不再猜测片段时长，也不再每帧强行恢复待机：每次 RMB 按压只准备一次防御层；请求存活期间 `charMovUpdate_hook` 让原版更新推进动画，随后钳住 X/Z 位置并清横向速度。该静止所有权覆盖手动与自动格挡。
+v96 试图查询原版选择出的普通 BLOCK technique 动画实例，但实机中成功 `HIT_SWORD` 的全部样本都返回 `clip_progress=-1.00`，不能建立可靠片尾边界。v97 不再猜测片段时长，也不再每帧强行恢复待机：每次 RMB 按压只准备一次防御层；请求存活期间静止所有权覆盖手动与自动格挡。v127 修正静止所有权的坐标层：格挡时把物理 WASD 当作未按下，先 `halt`、切 `MOVE_DIRECTION` 并清速度，再让原版推进格挡动画；不再在更新后只回写 `CharMovement::pos` 的 X/Z，因此镜头锚点、碰撞与可视根节点不会被拆成两个位置。
 
 v116 删除铁风主动闪避子系统，不再存在闪避按键、输入窗口、状态、招式副本、动画注入、位移、冷却、技能加成或自由闪避诊断。原版边界仍保留：敌人和其他角色照常由 Kenshi 产生 `HIT_MISSED`；自动格挡已获 RMB 授权后，原版 `chooseBlock` 若返回 `isDodge` technique，铁风只调用经字节校验的原生防御播放入口完成该次原版选择。手动方向格挡的招式池明确排除 `isDodge`。这条兼容桥不是玩家主动闪避系统，后续重设计不得在其上堆输入状态。
 
@@ -186,6 +186,8 @@ v116 删除铁风主动闪避子系统，不再存在闪避按键、输入窗口
 v109 处理第三方战斗控制器改变调度的兼容边界。正常情况下 `combatGo_hook` 记录本帧已经获得原版 `go()`；若 `_getHit` 已明确留下 `STARTUP + nextMove=STUMBLE/REACTION_BLOCK`，原版世界循环返回后该角色却从未得到本帧 `go()`，`manualHitReactionLifecycleTick` 才补调用一次原版实现。该兜底按主循环帧去重，限定当前 V 锚点、实时更新列表和精确受害者入场形状；普通 DECISION、攻击 CHOP、格挡、移动和已经进入反应的状态均不进入。补调用只推动原版状态机，反应是否进入以及何时结束仍由原版决定。
 
 V 模式退出是铁风输入所有权的硬边界：离开 V 时清除 `s_hitReactionPending` 与原子输入锁，但不写原版 combat state；重新进入时读取角色当前 `STUMBLE/REACTION_BLOCK`，仍在原版反应中则继续封锁，否则以干净状态接受输入。这样 KO 自动退出后不会把上一场反应锁带入新的 V 会话，也不会用固定时间提前解除仍在播放的原版动作。
+
+v127 将攻击输入与持续格挡意图分开处理。原版反应期间 LMB 仍直接丢弃；RMB 只有在物理按钮持续按下时才保存一次本次请求的原生格挡方向。松开会立即清除该状态；`manualConsumeCombatRmb` 只在 `manualHitReactionLive` 第一次返回 false 的游戏帧生成一个新接受时间，并复用保存方向。因而不会提前打断原版僵直，也不会把已松开的旧点击补发到恢复帧。
 
 v110 将这个所有权边界以只读 C ABI `IronwindCombat_IsManualControlActive(Character*)` 暴露给同进程插件。返回值只在传入角色正是当前 V 锚点、非读档保护且非硬关闭时为真；接口不修改引擎对象，也不接收回调。第三方任务的保存与恢复仍由任务所有者负责，铁风不猜测任务类型。
 
