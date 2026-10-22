@@ -47,7 +47,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "125"
+#define IRONWIND_VERSION "126"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -1142,7 +1142,6 @@ static int combatDirectionSlot(CutDirection d)
 // re-entered after the scene rebuilds; cleared only on P-off, DC-off (V), new game, or
 // hard teardown.  Fixes "FP disables when loading between chunks" (user 2026-07-29).
 static bool  s_userWantsFP         = false;
-static bool  s_wheelFirstPersonActive = false; // FP was entered by V-mode wheel, not F
 static volatile bool s_fpToggleRequested = false;  // F-key edge -> consumed on game thread
 static bool  s_fpSuspendedForInv   = false;  // FP paused while the inventory face-cam runs
 static float s_fpSensitivityFP     = 1.0f;   // [FirstPerson] Sensitivity (mouse-look scale)
@@ -2533,7 +2532,6 @@ static void handleTogglePress()
     {
         s_userWantsDC = false;
         s_userWantsFP = false;   // FP requires DC; leaving DC clears the FP intent too
-        s_wheelFirstPersonActive = false;
         s_otsResumeZoomPending = false;
         manualAttackClearAimInput(false, true);
         manualAttackClearQueuedInput(true);
@@ -3279,7 +3277,6 @@ static void clearAllState()
         s_fpOptRangeSaved     = false;
     }
     s_firstPersonActive           = false;
-    s_wheelFirstPersonActive      = false;
     s_otsResumeZoomPending       = false;
     s_fpToggleRequested           = false;
     s_sneakToggleRequested        = false;
@@ -6931,7 +6928,6 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
             s_fpSmValid = false;
             s_fpLastMouseMoveMs = GetTickCount64();
             s_userWantsFP = true; // retain this view through ordinary streaming
-            s_wheelFirstPersonActive = true;
             DebugLog("[Ironwind] ots_zoom_enter_first_person");
             return;
         }
@@ -7018,8 +7014,17 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
     bool ownRoofHit = hit.hit && indoors && hit.normal.y < -0.55f
                    && ((ownBuilding && hit.getBuilding() == ownBuilding)
                        || hit.distance <= 0.5f);
+    // A floor-facing surface inside the camera's own minimum-distance bubble
+    // cannot be represented usefully by pulling the lens inward: the minimum
+    // remains 4.5 units, so the old path snapped a long orbit onto the character
+    // for one frame and immediately released it. This is easiest to trigger when
+    // a running character stops into guard/reaction while the view is pitched
+    // slightly upward. Ignore only that near-pivot upward-facing contact; a
+    // floor/slope farther down the orbit and every wall still clamp normally.
+    bool nearFloorHit = hit.hit && hit.normal.y > 0.55f
+                     && (OTS_CAM_START + hit.distance) <= (OTS_CAM_MIN + 0.25f);
     float targetDist = desiredDist;
-    if (hit.hit && !ownRoofHit)
+    if (hit.hit && !ownRoofHit && !nearFloorHit)
     {
         targetDist = OTS_CAM_START + hit.distance;      // total from the pivot
         if (targetDist < OTS_CAM_MIN) targetDist = OTS_CAM_MIN;
@@ -7034,12 +7039,13 @@ static void otsCamDrive(CameraClass* thisptr, bool uiOpen, int wheelPre)
         if (nowTrace - s_lastOtsTraceMs >= 1000)
         {
             s_lastOtsTraceMs = nowTrace;
-            char tb[320];
-            sprintf_s(tb, sizeof(tb), "[IronwindTrace] camera height=%.2f scale=%.2f root_y=%.2f pivot_above=%.2f lens_above=%.2f dist=%.2f target=%.2f zoom=%.2f indoor=%d hit=%d roof=%d hit_dist=%.2f normal_y=%.2f pitch=%.2f ui=%d",
+            char tb[352];
+            sprintf_s(tb, sizeof(tb), "[IronwindTrace] camera height=%.2f scale=%.2f root_y=%.2f pivot_above=%.2f lens_above=%.2f dist=%.2f target=%.2f zoom=%.2f indoor=%d hit=%d roof=%d floor_near=%d hit_dist=%.2f normal_y=%.2f pitch=%.2f ui=%d",
                       s_otsCamHeight, hScale, root.y, pivot.y - root.y,
                       camPos.y - root.y, s_otsCollDistSm, targetDist,
                       s_otsZoomCur, indoors ? 1 : 0, hit.hit ? 1 : 0,
-                      ownRoofHit ? 1 : 0, hit.hit ? hit.distance : -1.0f,
+                      ownRoofHit ? 1 : 0, nearFloorHit ? 1 : 0,
+                      hit.hit ? hit.distance : -1.0f,
                       hit.hit ? hit.normal.y : 0.0f, s_otsPitch, uiOpen ? 1 : 0);
             VerbLog(tb);
         }
@@ -7324,11 +7330,12 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
     // its own suspend (wantRotate / fpDriveFrame) independently.
     dcUpdateCrosshair((s_firstPersonActive || s_otsCamActive) && !uiOpenNow);
 
-    // A wheel-entered first-person view is the near end of the same V-camera
-    // zoom range.  One outward notch crosses the hysteresis gap back to OTS.
+    // First person is the near end of the same V-camera zoom range regardless
+    // of whether it was entered by F or by scrolling inward. One outward notch
+    // crosses the hysteresis gap back to OTS.
     // Always drain raw Z here so scrolling an open menu cannot trigger a view
     // switch when the menu closes.
-    if (s_wheelFirstPersonActive && s_firstPersonActive)
+    if (s_firstPersonActive)
     {
         int rawWheel = (int)InterlockedExchange(&s_diAccZ, 0);
         int wheel = rawWheel != 0 ? rawWheel : otsWheelPre;
@@ -7340,7 +7347,6 @@ static void cameraUpdate_hook(CameraClass* thisptr, bool controlEnabled)
             if (s_otsZoomCur < OTS_ZOOM_FP_EXIT) s_otsZoomCur = OTS_ZOOM_FP_EXIT;
             if (s_otsZoomCur > OTS_ZOOM_MAX) s_otsZoomCur = OTS_ZOOM_MAX;
             s_otsResumeZoomPending = true;
-            s_wheelFirstPersonActive = false;
             s_userWantsFP = false;
             exitFirstPerson(true);
             enterOtsCam();
@@ -9843,7 +9849,13 @@ static Character* manualAttackIntentPick(Character* me)
     // martial-arts contact range and cannot be extended by this selection.
     if (intentReach <= 0.0f && !unarmed) return nativeHostile;
     const float selectionReach = intentReach > 0.0f ? intentReach : s_aimRange;
-    const float maxR2 = selectionReach * selectionReach;
+    // Exact reticle coverage identifies WHO the player deliberately attacked;
+    // it is not a range verdict. Give that actor to native AttackState anywhere
+    // inside the ordinary aim range and let Kenshi decide whether the technique
+    // actually reaches. The approximate neutral arc remains weapon-reach bound
+    // so an off-centre bystander cannot become a distant execution carrier.
+    const float preciseMaxR2 = s_aimRange * s_aimRange;
+    const float neutralArcMaxR2 = selectionReach * selectionReach;
     const float fx = -sinf(yaw), fz = -cosf(yaw);
     const float cosNeutralArc = cosf(25.0f * 0.0174533f);
     Ogre::Camera* cam = ou && ou->player && ou->player->camera
@@ -9880,13 +9892,13 @@ static Character* manualAttackIntentPick(Character* me)
             if (nearestCharacter < 0.0f || distance < nearestCharacter)
                 nearestCharacter = distance;
         }
-        if (d2 < 1e-4f || d2 >= maxR2) continue;
+        if (d2 < 1e-4f) continue;
         float d = sqrtf(d2), cosA = (dx * fx + dz * fz) / d;
         bool enemy = c->isEnemy(me, true);
         // The neutral helper requires the reticle to overlap the projected body,
         // not merely lie near its chest. Hostile contact is never decided here.
         // chest. A height-scaled width also works for large close characters.
-        if (!enemy && cam && view.width > 0 && view.height > 0)
+        if (!enemy && d2 < preciseMaxR2 && cam && view.width > 0 && view.height > 0)
         {
             Ogre::Vector3 head, chest, hips;
             int hx, hy, cx, cy, px, py, feetX, feetY;
@@ -9943,7 +9955,8 @@ static Character* manualAttackIntentPick(Character* me)
         // The approximate neutral arc depends on a verified weapon reach.
         // Empty hands require explicit body coverage to avoid selecting a
         // bystander at an arbitrary plugin-defined martial-arts distance.
-        if (!enemy && intentReach > 0.0f && cosA >= cosNeutralArc)
+        if (!enemy && d2 < neutralArcMaxR2
+            && intentReach > 0.0f && cosA >= cosNeutralArc)
         {
             ++neutralArcCandidates;
             // Angle first, then distance. This stays narrow so an off-centre
@@ -13456,7 +13469,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
             // while the anchor is still valid), then restore vanilla camera.
             if (s_fpActive) exitOTS(true);
             if (s_firstPersonActive) exitFirstPerson(true);
-            s_wheelFirstPersonActive = false;
             s_otsResumeZoomPending = false;
             // The DETACHED third-person camera too (2026-09-06 rebuild has its
             // own flag; user 2026-09-14: new game started in OTS showed no
@@ -13584,7 +13596,6 @@ static void mainLoop_hook(GameWorld* thisptr, float time)
     if (s_fpToggleRequested)
     {
         s_fpToggleRequested = false;
-            s_wheelFirstPersonActive = false; // F remains an explicit independent toggle
         s_otsResumeZoomPending = false;
         if (s_firstPersonActive)
         {

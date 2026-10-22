@@ -362,6 +362,18 @@ function Invoke-IwCheck {
     if ($sourceText -notmatch 'en\s*==\s*"focus_char"\s*&&\s*viewDown') {
         throw 'V-mode FirstPerson=F must suppress the colliding vanilla focus_char event.'
     }
+    if ($sourceText -match 's_wheelFirstPersonActive') {
+        throw 'First-person wheel exit must not depend on how first person was entered.'
+    }
+    foreach ($required in @(
+        'const float preciseMaxR2 = s_aimRange * s_aimRange;',
+        'const float neutralArcMaxR2 = selectionReach * selectionReach;',
+        'floor_near=%d'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v126 camera/target regression contract is incomplete: $required"
+        }
+    }
     $stateOwners = @(
         'manualAttackClearCapturedTarget',
         'manualAttackClearAimInput',

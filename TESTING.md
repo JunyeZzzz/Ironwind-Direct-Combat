@@ -164,7 +164,7 @@
 | 空手中立目标 | 只有准星覆盖身体才可建立意图并尝试直接原版 AttackState；近处真实命中才触发红 X/敌对，超距必须由原版判空且不触发敌对。不得用 25° 中立扇区或自定义武术距离 |
 | 敌人普通格挡 | 有敌对目标的挥击记录 `attack_direct_native started=1`；敌人按原版 AttackState 通知、技能、方向和时机决定格挡，不得自定义必挡 |
 | 防御回归 | 连续攻击高低技能敌人，确认既有成功格挡也有正常命中；攻击通知不得导致玩家自动走位、自动连击或目标切换 |
-| 越肩近距中立目标 | LMB 按下时身体投影精确覆盖用 `neutral_reticle`，受肩位视差影响但在正前 25°、原版 reach 内用 `neutral_arc`；方向划动后仍应见 `attack_press_target captured=1`、提交 `captured_target=1`，随后出现 `aimed_neutral` 命中 |
+| 越肩／第一人称精确瞄准中立目标 | 40 单位 AimRange 内准星覆盖身体时必须用 `neutral_reticle` 并见 `attack_press_target captured=1`，即使距离超过插件读取的 weapon reach；方向划动后提交 `captured_target=1` 并进入 `attack_direct_native`。是否接触、格挡、闪避或伤害仍只看后续原版 verdict；未覆盖身体时，正前 25° 的 `neutral_arc` 仍受选择 reach 限制 |
 | 中立起手反应 | 记录 `neutral_precontact_notice_deferred` 与 `attack_direct_native started=1 enemy=0`；起手不得改变敌对关系。犯罪、敌对转换和目标反应只由 confirmed `_getHit` 后的完整世界提交产生，不得出现 focused 任务、手工 `free_attack_neutral_notice` 或 direct impact |
 | 中立兜底安全边界 | 侧面超过 25°、超出原版 reach、倒地/死亡角色和玩家小队不得被中立扇区选中；不得因附近 NPC 多而误伤旁观者 |
 | 原版多人命中 | 结果完全服从原版招式；每个真实未格挡 verdict 可刷新 X，但不得同时出现自由路径的第二次伤害 |
@@ -222,8 +222,8 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | H 换肩 | 横向偏移换侧，不改变距离 |
 | 滚轮 3～120 | 距离正确保存 |
 | 滚到最近 | 自动进入第一人称 |
-| 第一人称向外滚 | 返回至少 6 的 OTS |
-| F 切换 | OTS／第一人称可来回切换且不触发原版 `focus_char` 回中；P 不产生铁风输入，Q 仍可在键盘战斗配置下格挡；退出 V 后原版 F 恢复 |
+| 第一人称向外滚 | 无论此前由滚轮还是 F 进入第一人称，都返回至少 6 的 OTS，并记录 `ots_zoom_exit_first_person` |
+| F 切换 | OTS／第一人称可来回切换且不触发原版 `focus_char` 回中；F 进入后向外滚也能返回 OTS；P 不产生铁风输入，Q 仍可在键盘战斗配置下格挡；退出 V 后原版 F 恢复 |
 | V 模式按 Ctrl | 不改变镜头、准星、WASD 锚点或战斗状态；不得退回原版俯视镜头。菜单中的 Ctrl+点击仍由原版处理 |
 | 室内 | 目标距离最多 35，真实墙体仍阻挡 |
 | 隐藏屋顶 | 不把镜头压到人物身边 |
@@ -231,6 +231,7 @@ v116 的预期是“不存在铁风主动闪避路径”：
 | OTS 近／中／最远三档声音 | 同一角色脚步、挥刀、命中不应随视觉镜头拉远而消失；近处环境声仍按原版，不应被整体拉近；左右／前后仍按当前视角定位 | 启动同时出现 `audio listener anchor hook OK` 与 `character audio range hook OK`；V 开启有 `dc_audio_listener_anchor_on source=character_audio`，角色事件低频出现 `dc_audio_source_range_bypass` |
 | 第一人称／普通 V 音频 | 两种 V 视角都以受控角色为听觉位置，切换角色后只跟随新角色，不产生爆音、旧位置残留或把旁人声音强行拉近 | 每次有效重新进入可见新的 listener 坐标；bypass 只来自当前受控角色 |
 | 退出 V／读档／角色失效 | 下一次原版提交立即恢复镜头监听，菜单和读档期间不访问旧角色 | `dc_audio_listener_anchor_off`；无崩溃、无持续角色锚定 |
+| 跑步切长按格挡／同时受击 | 远距镜头不得单帧拉到 4.5 再弹回。角色身边最小镜头泡内的向上表面接触可见 `camera ... floor_near=1`，但 `target` 应保持用户距离；真实墙体仍必须拉近 |
 | 极端向下看 | 不应异常贴到头顶或让角色／准星关系突变；用 `camera ... dist/target/zoom/hit/normal_y/pitch` 区分轨道几何与碰撞拉近 |
 | 第一人称身体 | 无头部遮挡，身体内侧可见，头盔／头发恢复正确 |
 | 倒地／硬直 | 近裁剪不造成严重穿模或黑屏 |
