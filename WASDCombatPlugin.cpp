@@ -43,12 +43,13 @@
 #include <kenshi/Appearance.h>              // AppearanceBase (head/hair hide, skeleton)
 #include <kenshi/Town.h>                    // TownBase::withinBordersRange (slave camp bounds)
 #include <kenshi/Building/Building.h>      // Building::hasInterior (FP floor cutaway gate)
+#include <kenshi/Building/DoorStuff.h>     // direct native E open/close for ordinary doors
 #include <core/Functions.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #define DIRECTINPUT_VERSION 0x0800
-#define IRONWIND_VERSION "131"
+#define IRONWIND_VERSION "132"
 #define DIRECT_CONTROL_BASE_VERSION "1.5.0"
 #include <dinput.h>                          // first-person 1kHz raw mouse-look (KenshiFP method)
 #include <mmsystem.h>                        // timeBeginPeriod (1ms Sleep granularity for the poll thread)
@@ -10104,9 +10105,62 @@ static lektor<RootObject*> s_interactionArmourScratch;
 static bool manualInteractionBuildingEligible(Building* b)
 {
     if (!b || !b->isValid() || !b->getVisible() || b->isDestroyed()) return false;
-    return b->isDoor() || b->isFurniture()
+    // `isFurniture()` alone is not interaction evidence: decorative furniture
+    // produced an E prompt but then an empty native menu. Storage, doors and
+    // furniture with a real cursor/default task remain eligible.
+    return b->isDoor() || b->getFunctionStuff() != nullptr
         || b->getMouseCursor() != DEFAULT_CURSOR
         || b->getDefaultTask() != NULL_TASK;
+}
+
+// Single-purpose building interactions should feel like Kenshi's normal
+// right-click default, not a pause followed by a redundant one-choice menu.
+// Locked/broken/special doors deliberately fall through to the native menu so
+// pick-lock, bash and other contextual choices remain available.
+static bool manualInteractionTryDirectBuilding(RootObject* target)
+{
+    if (!target || target->getDataType() != BUILDING) return false;
+    Building* b = static_cast<Building*>(target);
+    if (!manualInteractionBuildingEligible(b)) return false;
+
+    if (b->isDoor())
+    {
+        DoorStuff* door = b->doorStuff();
+        if (!door) door = b->getDoor();
+        if (!door || door->isLocked() || door->isBroken()) return false;
+        TaskType task = door->getDefaultTask();
+        bool recognised = task == OPEN_DOOR || task == OPEN_DOOR_HERE
+                       || task == CLOSE_DOOR || task == CLOSE_DOOR_HERE;
+        if (!recognised) return false;
+        bool success = (task == OPEN_DOOR || task == OPEN_DOOR_HERE)
+            ? door->openDoor() : door->closeDoor();
+        char logLine[144];
+        sprintf_s(logLine, sizeof(logLine),
+            "[Ironwind] interact_direct_building action=door task=%d success=%d",
+            (int)task, success ? 1 : 0);
+        VerbLog(logLine);
+        // The recognised one-step door action is consumed even if the engine
+        // declines it while the door is already transitioning. Do not replace
+        // one harmless failed toggle with the very menu this path removes.
+        return true;
+    }
+
+    // StorageBuilding::getFunctionStuff() is the engine's virtual class probe.
+    // Use the same public GUI entry as vanilla; item transfer still belongs to
+    // the original Inventory/ownership/theft code. No artificial pause/menu is
+    // created, so the normal inventory cursor and close behaviour stay intact.
+    if (b->getFunctionStuff() && gui)
+    {
+        InventoryGUI* window = gui->showInventoryBuilding(b->getHandle());
+        bool success = window != nullptr || gui->hasInventoryWindowOpen(b->getHandle());
+        char logLine[144];
+        sprintf_s(logLine, sizeof(logLine),
+            "[Ironwind] interact_direct_building action=storage success=%d",
+            success ? 1 : 0);
+        VerbLog(logLine);
+        return success;
+    }
+    return false;
 }
 
 static bool manualInteractionLooseItemEligible(RootObject* root)
@@ -15339,20 +15393,30 @@ static void playerControl_hook(PlayerInterface* thisptr, InputHandler& k)
             s_interactionPendingHandle.setNull();
             if (manualInteractionRootValid(target, s_freeMoveAnchor))
             {
-                // showContextMenu is the original hold-RMB path.  Set its latch
-                // and the matching InputHandler state before the original
-                // playerControl update, otherwise it observes an immediate
-                // release and executes/closes the default option in one frame.
-                thisptr->contextMenu.rightMouseActivated = true;
-                k.mRight = k.lastMRight = true;
-                k.mRDown = k.mRUp = false;
-                s_interactionMenuByE = true;
-                thisptr->contextMenu.showContextMenu(true, target);
-                interactionOpenedThisFrame = thisptr->contextMenu.isVisible();
-                if (!interactionOpenedThisFrame)
+                if (manualInteractionTryDirectBuilding(target))
                 {
-                    s_interactionMenuByE = false;
-                    VerbLog("[Ironwind] interact_menu_open_failed reason=no_native_options");
+                    // Direct doors and storage own no context-menu latch and no
+                    // Ironwind pause. The native object/UI has already accepted
+                    // the action in the same input phase as normal player use.
+                    interactionOpenedThisFrame = false;
+                }
+                else
+                {
+                    // showContextMenu is the original hold-RMB path. Set its
+                    // latch and matching InputHandler state before the original
+                    // playerControl update, otherwise it observes an immediate
+                    // release and executes/closes the default option in one frame.
+                    thisptr->contextMenu.rightMouseActivated = true;
+                    k.mRight = k.lastMRight = true;
+                    k.mRDown = k.mRUp = false;
+                    s_interactionMenuByE = true;
+                    thisptr->contextMenu.showContextMenu(true, target);
+                    interactionOpenedThisFrame = thisptr->contextMenu.isVisible();
+                    if (!interactionOpenedThisFrame)
+                    {
+                        s_interactionMenuByE = false;
+                        VerbLog("[Ironwind] interact_menu_open_failed reason=no_native_options");
+                    }
                 }
             }
             else VerbLog("[Ironwind] interact_menu_open_failed reason=stale_target");

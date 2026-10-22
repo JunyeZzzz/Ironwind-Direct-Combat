@@ -1,6 +1,6 @@
 # 变更记录
 
-铁风版本号独立于上游。当前铁风版本为 **v131**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
+铁风版本号独立于上游。当前铁风版本为 **v132**，历史代码基础来自 Direct Control for Kenshi **v1.5.0**。下列“已编译”不等同于“已完成游戏内验证”；当前问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，构建和部署事实由生成报告保存。
 
 ## 未发版工程维护（不改运行时）
 
@@ -8,6 +8,12 @@
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。
+
+## v132
+
+- 重做单一用途建筑的 E 体验。普通未锁且未损坏的门根据自身原版默认任务直接调用 `openDoor/closeDoor`，一次 E 完成开／关，不再先暂停、弹出两项菜单，再让关门任务撞上 V 模式旧门抑制。
+- 真正储具通过 `Building::getFunctionStuff()` 识别，一次 E 直接调用 Kenshi 的 `showInventoryBuilding` 打开原版建筑库存；不创建铁风上下文菜单或暂停。物品转移、所有权与偷窃仍由原版 Inventory 处理。
+- 候选不再因为 `isFurniture()` 一个标志就接受所有家具。装饰家具没有原版光标、默认任务或储具功能时不显示 E，消除日志中连续的 `interact_menu_open_failed reason=no_native_options`。锁门、破门、人物和真正多选设施继续回退原版菜单。
 
 ## v131
 

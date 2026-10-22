@@ -356,6 +356,22 @@ function Invoke-IwCheck {
         }
     }
     foreach ($required in @(
+        'manualInteractionTryDirectBuilding',
+        'b->isDoor()',
+        'door->getDefaultTask()',
+        'gui->showInventoryBuilding(b->getHandle())',
+        'interact_direct_building action=door',
+        'interact_direct_building action=storage',
+        'b->getFunctionStuff() != nullptr'
+    )) {
+        if ($sourceText -notmatch [regex]::Escape($required)) {
+            throw "v132 direct building-interaction contract is incomplete: $required"
+        }
+    }
+    if ($sourceText -match 'b->isDoor\(\)\s*\|\|\s*b->isFurniture\(\)') {
+        throw 'Decorative furniture must not regain an empty E interaction prompt.'
+    }
+    foreach ($required in @(
         'HB_LABEL_W = 29, HB_BAR_W = 56, HB_CELL_W = 85',
         'HB_H = 10, HB_GAP = 0, HB_ROW_H = 15',
         'int bx = cellX + HB_LABEL_W;',
