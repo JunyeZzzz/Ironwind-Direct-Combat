@@ -12,18 +12,21 @@ WASDCombatPlugin.cpp + WASDCombatPlugin.ini + VERSION + runtime/
         build/WASDCombatPlugin.dll + PDB + BUILD-STAMP
                          │
                          ├─ deploy-local.ps1
-                         ▼
-              package/IronwindCombat/
+                         ├──────────────────────────────┐
+                         ▼                              ▼
+       package/IronwindCombatDev/          package/IronwindCombat/
+       IronwindCombatDev.mod               IronwindCombat.mod
+                         │                              │
+                         ▼                              ├─ 正式 ZIP / 符号 / 事实报告
+       Kenshi/mods/IronwindCombatDev/                   └─ 不安装、不改 Workshop
                          │
-                         ├─ 哈希验证、生成 BUILD-MANIFEST.json
-                         ├─ package/symbols/ 保存精确 DLL/PDB 对
-                         ├─ 安装到 Kenshi/mods/IronwindCombat/
-                         └─ 生成 package/IronwindCombat-actions-vNN.zip
+                         ▼
+       mods.cfg 互斥启用开发版或 Workshop 正式版 3824431439
 ```
 
-`tools/ironwind.ps1` 是上述步骤的统一编排入口。`Finish` 只生成静态、构建和部署事实；`SessionStart → AnalyzeLog` 才建立单次实机日志证据。日志分析的事件分组和风险正则位于 `tools/log-rules.json`，未知新事件会自动进入报告，不因规则库未更新而被丢弃。
+`tools/ironwind.ps1` 是上述步骤的统一编排入口。`DevFinish` 安装并切换到开发身份；`Finish` 只生成正式发布候选，不接触订阅目录或运行通道；`UseDev`／`UseStable` 互斥改写 `mods.cfg` 并保存备份。两个包都有 `CHANNEL.json`，且各自只能包含一个 `.mod` 身份。`SessionStart → AnalyzeLog` 才建立单次实机日志证据。日志分析的事件分组和风险正则位于 `tools/log-rules.json`，未知新事件会自动进入报告，不因规则库未更新而被丢弃。
 
-`IronwindCombat.mod` 是 0 条 FCS 记录的启动器占位文件。`RE_Kenshi.json` 负责加载 DLL。真正玩法逻辑在 DLL；`materials/deferred/character.hlsl` 为第一人称头部像素隐藏提供 shader 参数；`Settings.zh-CN.tsv` 为设置页和提示提供 UTF-8 中文。
+`runtime/IronwindCombat.mod` 是 0 条 FCS 记录的占位真源；流水线按通道输出为 `IronwindCombatDev.mod` 或 `IronwindCombat.mod`。`RE_Kenshi.json` 负责加载 DLL。真正玩法逻辑在 DLL；`materials/deferred/character.hlsl` 为第一人称头部像素隐藏提供 shader 参数；`Settings.zh-CN.tsv` 为设置页和提示提供 UTF-8 中文，开发包只在生成阶段为标题增加 `[DEV]`。
 
 ## 2. 线程模型
 

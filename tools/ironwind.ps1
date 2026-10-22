@@ -1,8 +1,10 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Status', 'Check', 'Build', 'Deploy', 'DevFinish', 'Finish', 'Verify', 'Housekeeping', 'SessionStart', 'AnalyzeLog', 'Snapshot', 'Help')]
+    [ValidateSet('Status', 'Check', 'Build', 'Deploy', 'DevFinish', 'Finish', 'Verify', 'UseDev', 'UseStable', 'Housekeeping', 'SessionStart', 'AnalyzeLog', 'Snapshot', 'Help')]
     [string]$Task = 'Status',
+    [ValidateSet('Development', 'Release')]
+    [string]$Channel = 'Development',
     [string]$Label,
     [string]$LogPath,
     [switch]$SkipBuild,
@@ -20,17 +22,24 @@ $toolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectDir = Split-Path -Parent $toolsDir
 $moddevDir = Split-Path -Parent $projectDir
 $gameDir = Split-Path -Parent $moddevDir
+$commonDir = Split-Path -Parent $gameDir
+$steamappsDir = Split-Path -Parent $commonDir
 $buildDir = Join-Path $projectDir 'build'
-$packageDir = Join-Path $projectDir 'package\IronwindCombat'
-$installDir = Join-Path $gameDir 'mods\IronwindCombat'
+$releasePackageDir = Join-Path $projectDir 'package\IronwindCombat'
+$devPackageDir = Join-Path $projectDir 'package\IronwindCombatDev'
+$localStableDir = Join-Path $gameDir 'mods\IronwindCombat'
+$devInstallDir = Join-Path $gameDir 'mods\IronwindCombatDev'
+$workshopStableDir = Join-Path $steamappsDir 'workshop\content\233860\3824431439'
 $runtimeDir = Join-Path $projectDir 'runtime'
 $versionFile = Join-Path $projectDir 'VERSION'
 $sourceFile = Join-Path $projectDir 'WASDCombatPlugin.cpp'
 $buildDll = Join-Path $buildDir 'WASDCombatPlugin.dll'
 $buildPdb = Join-Path $buildDir 'WASDCombatPlugin.pdb'
 $buildStamp = Join-Path $buildDir 'BUILD-STAMP.json'
-$packageDll = Join-Path $packageDir 'WASDCombatPlugin.dll'
-$installDll = Join-Path $installDir 'WASDCombatPlugin.dll'
+$releasePackageDll = Join-Path $releasePackageDir 'WASDCombatPlugin.dll'
+$devPackageDll = Join-Path $devPackageDir 'WASDCombatPlugin.dll'
+$devInstallDll = Join-Path $devInstallDir 'WASDCombatPlugin.dll'
+$workshopStableDll = Join-Path $workshopStableDir 'WASDCombatPlugin.dll'
 $modsConfig = Join-Path $gameDir 'data\mods.cfg'
 $defaultLog = Join-Path $gameDir 'RE_Kenshi_log.txt'
 $sessionStateDir = Join-Path $projectDir 'reports\session-state'
@@ -43,6 +52,58 @@ function Get-IwHash([string]$Path) {
 
 function Assert-IwFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing required file: $Path" }
+}
+
+function Get-IwEnabledMods {
+    if (-not (Test-Path -LiteralPath $modsConfig -PathType Leaf)) { return @() }
+    return @(Get-Content -LiteralPath $modsConfig | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Get-IwActiveChannel {
+    $mods = @(Get-IwEnabledMods)
+    $dev = $mods -contains 'IronwindCombatDev.mod'
+    $stable = $mods -contains 'IronwindCombat.mod'
+    if ($dev -and $stable) { return 'Conflict' }
+    if ($dev) { return 'Development' }
+    if ($stable) { return 'Release' }
+    return 'None'
+}
+
+function Set-IwChannel([ValidateSet('Development', 'Release')][string]$TargetChannel) {
+    if (Get-Process -Name kenshi_x64 -ErrorAction SilentlyContinue) {
+        throw 'Exit Kenshi before switching the Ironwind channel.'
+    }
+    Assert-IwFile $modsConfig
+    $targetMod = if ($TargetChannel -eq 'Development') { 'IronwindCombatDev.mod' } else { 'IronwindCombat.mod' }
+    $targetDir = if ($TargetChannel -eq 'Development') { $devInstallDir } else { $workshopStableDir }
+    Assert-IwFile (Join-Path $targetDir $targetMod)
+
+    $original = [System.IO.File]::ReadAllLines($modsConfig)
+    $result = New-Object System.Collections.Generic.List[string]
+    $inserted = $false
+    foreach ($line in $original) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq 'IronwindCombat.mod' -or $trimmed -eq 'IronwindCombatDev.mod') {
+            if (-not $inserted) {
+                $result.Add($targetMod)
+                $inserted = $true
+            }
+            continue
+        }
+        $result.Add($line)
+    }
+    if (-not $inserted) { $result.Add($targetMod) }
+
+    $backupRoot = Join-Path $projectDir 'reports\channel-switch'
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    $backupPath = Join-Path $backupRoot ("mods.cfg-{0}.bak" -f (Get-Date -Format 'yyyyMMdd-HHmmssfff'))
+    Copy-Item -LiteralPath $modsConfig -Destination $backupPath
+    [System.IO.File]::WriteAllLines($modsConfig, $result, (New-Object System.Text.UTF8Encoding($false)))
+
+    $active = Get-IwActiveChannel
+    if ($active -ne $TargetChannel) { throw "Channel switch verification failed: $active" }
+    Write-Output "Ironwind active channel: $TargetChannel ($targetMod)"
+    Write-Output "mods.cfg backup: $backupPath"
 }
 
 function Get-IwVersion {
@@ -81,21 +142,25 @@ function Get-IwBuildState {
 function Invoke-IwStatus {
     $version = Get-IwVersion
     $buildState = Get-IwBuildState
-    $enabledMods = @()
-    if (Test-Path -LiteralPath $modsConfig -PathType Leaf) {
-        $enabledMods = @(Get-Content -LiteralPath $modsConfig | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    }
+    $enabledMods = @(Get-IwEnabledMods)
+    $workshopVersionPath = Join-Path $workshopStableDir 'VERSION'
     [pscustomobject]@{
         Version = $version
         KenshiRunning = [bool](Get-Process -Name kenshi_x64 -ErrorAction SilentlyContinue)
+        ActiveChannel = Get-IwActiveChannel
         BuildFresh = $buildState.fresh
         BuildReason = $buildState.reason
         BuildDllSha256 = $buildState.dllSha256
-        PackageDllSha256 = Get-IwHash $packageDll
-        InstalledDllSha256 = Get-IwHash $installDll
-        IronwindEnabled = $enabledMods -contains 'IronwindCombat.mod'
+        DevPackageDllSha256 = Get-IwHash $devPackageDll
+        DevInstalledDllSha256 = Get-IwHash $devInstallDll
+        ReleasePackageDllSha256 = Get-IwHash $releasePackageDll
+        WorkshopStableDllSha256 = Get-IwHash $workshopStableDll
+        WorkshopStableVersion = if (Test-Path -LiteralPath $workshopVersionPath -PathType Leaf) { (Get-Content -LiteralPath $workshopVersionPath -Raw).Trim() } else { $null }
+        DevEnabled = $enabledMods -contains 'IronwindCombatDev.mod'
+        StableEnabled = $enabledMods -contains 'IronwindCombat.mod'
         LegacyPluginEnabled = $enabledMods -contains 'WASDCombatPlugin.mod'
-        InstalledIniSha256 = Get-IwHash (Join-Path $installDir 'WASDCombatPlugin.ini')
+        LocalStableDuplicatePresent = Test-Path -LiteralPath $localStableDir -PathType Container
+        DevInstalledIniSha256 = Get-IwHash (Join-Path $devInstallDir 'WASDCombatPlugin.ini')
     }
 }
 
@@ -111,6 +176,9 @@ function Invoke-IwCheck {
         'runtime\Settings.zh-CN.tsv', 'runtime\materials\deferred\character.hlsl'
     )
     foreach ($name in $required) { Assert-IwFile (Join-Path $projectDir $name) }
+    if (Test-Path -LiteralPath $localStableDir -PathType Container) {
+        throw 'A local mods\IronwindCombat duplicate shadows the Workshop stable identity. Archive it before development.'
+    }
 
     $publicReadme = Get-Content -LiteralPath (Join-Path $projectDir 'README.md') -Raw
     $noticeText = Get-Content -LiteralPath (Join-Path $projectDir 'NOTICE.md') -Raw
@@ -278,9 +346,12 @@ function Invoke-IwCheck {
     }
 
     if (Test-Path -LiteralPath $modsConfig -PathType Leaf) {
-        $mods = @(Get-Content -LiteralPath $modsConfig | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $mods = @(Get-IwEnabledMods)
         if ($mods -contains 'WASDCombatPlugin.mod') { throw 'Legacy WASDCombatPlugin.mod is enabled.' }
-        if ($mods -notcontains 'IronwindCombat.mod') { Write-Warning 'IronwindCombat.mod is not enabled.' }
+        $devEnabled = $mods -contains 'IronwindCombatDev.mod'
+        $stableEnabled = $mods -contains 'IronwindCombat.mod'
+        if ($devEnabled -and $stableEnabled) { throw 'Development and stable Ironwind channels are both enabled.' }
+        if (-not $devEnabled -and -not $stableEnabled) { Write-Warning 'No Ironwind channel is enabled.' }
     }
 
     if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -294,28 +365,61 @@ function Invoke-IwCheck {
     return $buildState
 }
 
-function Invoke-IwVerify {
+function Invoke-IwVerify([ValidateSet('Development', 'Release')][string]$VerifyChannel = 'Development') {
     $version = Get-IwVersion
-    foreach ($path in @($buildDll, $packageDll, $installDll)) { Assert-IwFile $path }
-    $hashes = @(@((Get-IwHash $buildDll), (Get-IwHash $packageDll), (Get-IwHash $installDll)) | Select-Object -Unique)
-    if ($hashes.Count -ne 1) { throw 'Build, package and installed DLL hashes differ.' }
+    $isDev = $VerifyChannel -eq 'Development'
+    $packageDir = if ($isDev) { $devPackageDir } else { $releasePackageDir }
+    $packageDll = if ($isDev) { $devPackageDll } else { $releasePackageDll }
+    $modFile = if ($isDev) { 'IronwindCombatDev.mod' } else { 'IronwindCombat.mod' }
+    foreach ($path in @($buildDll, $packageDll)) { Assert-IwFile $path }
+    $expectedHash = Get-IwHash $buildDll
+    if ((Get-IwHash $packageDll) -ne $expectedHash) { throw "Build and $VerifyChannel package DLL hashes differ." }
 
     $manifestPath = Join-Path $packageDir 'BUILD-MANIFEST.json'
     Assert-IwFile $manifestPath
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     if ($manifest.ironwindVersion -ne $version) { throw 'Package manifest version mismatch.' }
-    if ($manifest.hashes.dllSha256 -ne $hashes[0]) { throw 'Package manifest DLL hash mismatch.' }
+    if ($manifest.hashes.dllSha256 -ne $expectedHash) { throw 'Package manifest DLL hash mismatch.' }
+    if ($manifest.channel -ne $VerifyChannel) { throw "Package manifest channel mismatch: $($manifest.channel)" }
+    if ($manifest.modFile -ne $modFile) { throw "Package manifest mod identity mismatch: $($manifest.modFile)" }
+    Assert-IwFile (Join-Path $packageDir $modFile)
+    $channelManifestPath = Join-Path $packageDir 'CHANNEL.json'
+    Assert-IwFile $channelManifestPath
+    $channelManifest = Get-Content -LiteralPath $channelManifestPath -Raw | ConvertFrom-Json
+    if ($channelManifest.channel -ne $VerifyChannel -or $channelManifest.modFile -ne $modFile -or $channelManifest.ironwindVersion -ne $version) {
+        throw 'CHANNEL.json does not match the requested channel, mod identity and version.'
+    }
+    $otherMod = if ($isDev) { 'IronwindCombat.mod' } else { 'IronwindCombatDev.mod' }
+    if (Test-Path -LiteralPath (Join-Path $packageDir $otherMod) -PathType Leaf) { throw "$VerifyChannel package contains both channel identities." }
 
-    $mods = @(Get-Content -LiteralPath $modsConfig | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if (@($mods | Where-Object { $_ -eq 'IronwindCombat.mod' }).Count -ne 1) { throw 'IronwindCombat.mod must be enabled exactly once.' }
-    if ($mods -contains 'WASDCombatPlugin.mod') { throw 'Legacy WASDCombatPlugin.mod is enabled.' }
+    $settingsText = Get-Content -LiteralPath (Join-Path $packageDir 'Settings.zh-CN.tsv') -Raw -Encoding UTF8
+    if ($isDev -and $settingsText -notmatch '(?m)^Direct Control\t\[DEV\] 铁风执刃\r?$') { throw 'Development settings page lacks the [DEV] marker.' }
+    if (-not $isDev -and $settingsText -match '(?m)^Direct Control\t\[DEV\]') { throw 'Release settings page contains a development marker.' }
 
-    Write-Output "Verified Ironwind v$version. DLL SHA256: $($hashes[0])"
+    $installedHash = $null
+    if ($isDev) {
+        Assert-IwFile $devInstallDll
+        Assert-IwFile (Join-Path $devInstallDir 'IronwindCombatDev.mod')
+        if (Test-Path -LiteralPath (Join-Path $devInstallDir 'IronwindCombat.mod') -PathType Leaf) {
+            throw 'Development install directory contains the stable mod identity.'
+        }
+        $installedHash = Get-IwHash $devInstallDll
+        if ($installedHash -ne $expectedHash) { throw 'Development package and installed DLL hashes differ.' }
+        $mods = @(Get-IwEnabledMods)
+        if (@($mods | Where-Object { $_ -eq 'IronwindCombatDev.mod' }).Count -ne 1) { throw 'IronwindCombatDev.mod must be enabled exactly once.' }
+        if ($mods -contains 'IronwindCombat.mod') { throw 'Stable and development channels are both enabled.' }
+        if ($mods -contains 'WASDCombatPlugin.mod') { throw 'Legacy WASDCombatPlugin.mod is enabled.' }
+    }
+
+    Write-Host "Verified Ironwind v$version $VerifyChannel. DLL SHA256: $expectedHash"
     return [pscustomobject]@{
         Version = $version
-        DllSha256 = $hashes[0]
+        Channel = $VerifyChannel
+        DllSha256 = $expectedHash
         PdbSha256 = Get-IwHash $buildPdb
         PackageManifest = $manifestPath
+        InstalledDllSha256 = $installedHash
+        WorkshopStableDllSha256 = Get-IwHash $workshopStableDll
     }
 }
 
@@ -330,8 +434,9 @@ function Write-IwReleaseReport($Verification) {
         "- 生成时间：$((Get-Date).ToString('o'))",
         "- DLL SHA256：``$($Verification.DllSha256)``",
         "- PDB SHA256：``$($Verification.PdbSha256)``",
-        "- 构建、暂存、安装 DLL：一致",
-        "- 启用 Mod：仅 ``IronwindCombat.mod``",
+        "- 通道：``$($Verification.Channel)``",
+        "- 构建与正式发布包 DLL：一致",
+        '- 正式包 Mod 身份：``IronwindCombat.mod``；未覆盖 Steam Workshop 订阅目录',
         '',
         '> 这是自动化构建与部署证据，不代表游戏画面或完整回归已经验证。'
     )
@@ -348,6 +453,8 @@ function Start-IwSession {
         $length = (Get-Item -LiteralPath $path).Length
     }
     New-Item -ItemType Directory -Path $sessionStateDir -Force | Out-Null
+    $activeChannel = Get-IwActiveChannel
+    $activeDll = if ($activeChannel -eq 'Development') { $devInstallDll } elseif ($activeChannel -eq 'Release') { $workshopStableDll } else { $null }
     $state = [ordered]@{
         schemaVersion = 1
         startedAt = (Get-Date).ToString('o')
@@ -356,7 +463,8 @@ function Start-IwSession {
         logPath = $path
         startLine = $lineCount + 1
         startByteLength = $length
-        installedDllSha256 = Get-IwHash $installDll
+        activeChannel = $activeChannel
+        activeDllSha256 = if ($activeDll) { Get-IwHash $activeDll } else { $null }
     }
     $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $sessionStatePath -Encoding UTF8
     Write-Output "Session marker saved: $sessionStatePath"
@@ -384,7 +492,7 @@ function Invoke-IwLogAnalysis {
 
 function New-IwSnapshot {
     if (Get-Process -Name kenshi_x64 -ErrorAction SilentlyContinue) { throw 'Exit Kenshi before creating a stable snapshot.' }
-    $verification = Invoke-IwVerify
+    $verification = Invoke-IwVerify -VerifyChannel Release
     $version = $verification.Version
     $safeLabel = if ([string]::IsNullOrWhiteSpace($Label)) { 'snapshot' } else { $Label -replace '[^A-Za-z0-9_-]+', '-' }
     $date = Get-Date -Format 'yyyyMMdd'
@@ -393,11 +501,11 @@ function New-IwSnapshot {
     New-Item -ItemType Directory -Path $snapshotDir -Force | Out-Null
 
     $archive = Join-Path $projectDir "package\IronwindCombat-actions-v$version.zip"
-    foreach ($path in @($archive, $installDll, (Join-Path $installDir 'WASDCombatPlugin.ini'), (Join-Path $packageDir 'BUILD-MANIFEST.json'))) { Assert-IwFile $path }
+    foreach ($path in @($archive, $releasePackageDll, (Join-Path $releasePackageDir 'WASDCombatPlugin.ini'), (Join-Path $releasePackageDir 'BUILD-MANIFEST.json'))) { Assert-IwFile $path }
     Copy-Item -LiteralPath $archive -Destination (Join-Path $snapshotDir "IronwindCombat-v$version-$safeLabel.zip")
-    Copy-Item -LiteralPath $installDll -Destination (Join-Path $snapshotDir "WASDCombatPlugin-v$version.dll")
-    Copy-Item -LiteralPath (Join-Path $installDir 'WASDCombatPlugin.ini') -Destination (Join-Path $snapshotDir "WASDCombatPlugin-v$version-user.ini")
-    Copy-Item -LiteralPath (Join-Path $packageDir 'BUILD-MANIFEST.json') -Destination (Join-Path $snapshotDir "BUILD-MANIFEST-v$version.json")
+    Copy-Item -LiteralPath $releasePackageDll -Destination (Join-Path $snapshotDir "WASDCombatPlugin-v$version.dll")
+    Copy-Item -LiteralPath (Join-Path $releasePackageDir 'WASDCombatPlugin.ini') -Destination (Join-Path $snapshotDir "WASDCombatPlugin-v$version-default.ini")
+    Copy-Item -LiteralPath (Join-Path $releasePackageDir 'BUILD-MANIFEST.json') -Destination (Join-Path $snapshotDir "BUILD-MANIFEST-v$version.json")
     if (Test-Path -LiteralPath $buildPdb -PathType Leaf) { Copy-Item -LiteralPath $buildPdb -Destination (Join-Path $snapshotDir "WASDCombatPlugin-v$version.pdb") }
     if (Test-Path -LiteralPath $buildStamp -PathType Leaf) { Copy-Item -LiteralPath $buildStamp -Destination (Join-Path $snapshotDir "BUILD-STAMP-v$version.json") }
     if (Test-Path -LiteralPath $defaultLog -PathType Leaf) { Copy-Item -LiteralPath $defaultLog -Destination (Join-Path $snapshotDir "RE_Kenshi-v$version.log") }
@@ -410,8 +518,8 @@ function New-IwSnapshot {
         '',
         "生成时间：$((Get-Date).ToString('o'))。",
         '',
-        '包含可安装发布包、实际安装 DLL、个人 INI、构建清单、可用符号、日志及源码。',
-        '恢复前必须退出 Kenshi；启动器只启用 IronwindCombat.mod。',
+        '包含正式发布包、正式包 DLL、默认 INI、构建清单、可用符号、日志及源码。',
+        '恢复前必须退出 Kenshi；正式版由 Steam Workshop 订阅目录提供，启动器只启用 IronwindCombat.mod。',
         '',
         '> 快照证明文件可恢复，不代表完整游戏回归通过。'
     )
@@ -429,13 +537,15 @@ function Show-IwHelp {
     @'
 铁风开发工具：tools\ironwind.ps1
 
-  Status                         查看版本、进程、构建新鲜度和三处 DLL 哈希
+  Status                         查看当前通道及开发包、开发安装、正式包、Workshop 哈希
   Check                          执行静态、配置、脚本和加载顺序检查
   Build                          编译 Release DLL、匹配 PDB 和 BUILD-STAMP
-  Deploy [-SkipBuild]            部署；可用 -SkipArchive / -SkipSymbols 控制归档
-  DevFinish                      Check → Build → 安装 → Verify，不新增 ZIP/永久符号副本
-  Finish                         Check → Build → Deploy → Verify → 发布事实报告
-  Verify                         核对构建、暂存、安装、清单和 mods.cfg
+  Deploy [-Channel ...]          指定 Development/Release 流水线（默认 Development）
+  DevFinish                      Check → 开发安装 → UseDev → Verify，不新增 ZIP/永久符号
+  Finish                         Check → 正式包/ZIP → Verify → 发布事实；不覆盖订阅版
+  Verify [-Channel ...]          核对指定通道（默认 Development）
+  UseDev                         只启用本地 IronwindCombatDev.mod
+  UseStable                      只启用 Workshop IronwindCombat.mod
   Housekeeping                   只读统计 build/package/backup/reports 占用，不删除文件
   SessionStart [-Label 名称]     记录下一次实机日志的起点，不清空日志
   AnalyzeLog [-OpenReport]       分析已标记会话；无标记时分析最新插件会话
@@ -444,6 +554,8 @@ function Show-IwHelp {
 常用：
   .\tools\ironwind.ps1 DevFinish
   .\tools\ironwind.ps1 Finish   # 确定正式发布时
+  .\tools\ironwind.ps1 UseStable
+  .\tools\ironwind.ps1 UseDev
   .\tools\ironwind.ps1 SessionStart -Label v85-melee
   .\tools\ironwind.ps1 AnalyzeLog -OpenReport
 '@ | Write-Output
@@ -483,7 +595,7 @@ switch ($Task) {
     'Check' { Invoke-IwCheck | Format-List }
     'Build' { & (Join-Path $projectDir 'build-local.ps1') }
     'Deploy' {
-        $arguments = @{}
+        $arguments = @{ Channel = $Channel }
         if ($SkipBuild) { $arguments.SkipBuild = $true }
         if ($SkipInstall) { $arguments.SkipInstall = $true }
         if ($SkipArchive) { $arguments.SkipArchive = $true }
@@ -493,28 +605,29 @@ switch ($Task) {
         & (Join-Path $projectDir 'deploy-local.ps1') @arguments
     }
     'DevFinish' {
+        if ($SkipInstall) { throw 'DevFinish must install and verify the development channel; use Deploy -SkipInstall for staging only.' }
         Invoke-IwCheck | Out-Null
-        $arguments = @{ SkipArchive = $true; SkipSymbols = $true }
+        $arguments = @{ Channel = 'Development'; SkipArchive = $true; SkipSymbols = $true }
         if ($SkipBuild) { $arguments.SkipBuild = $true }
-        if ($SkipInstall) { $arguments.SkipInstall = $true }
         if ($ReplaceConfig) { $arguments.ReplaceConfig = $true }
         & (Join-Path $projectDir 'deploy-local.ps1') @arguments
-        Invoke-IwVerify | Format-List
+        Set-IwChannel -TargetChannel Development
+        Invoke-IwVerify -VerifyChannel Development | Format-List
     }
     'Finish' {
         Invoke-IwCheck | Out-Null
-        $arguments = @{}
+        $arguments = @{ Channel = 'Release'; SkipInstall = $true }
         if ($SkipBuild) { $arguments.SkipBuild = $true }
-        if ($SkipInstall) { $arguments.SkipInstall = $true }
         if ($SkipArchive) { $arguments.SkipArchive = $true }
         if ($SkipSymbols) { $arguments.SkipSymbols = $true }
-        if ($ReplaceConfig) { $arguments.ReplaceConfig = $true }
         if ($ReplaceArchive) { $arguments.ReplaceArchive = $true }
         & (Join-Path $projectDir 'deploy-local.ps1') @arguments
-        $verified = Invoke-IwVerify
+        $verified = Invoke-IwVerify -VerifyChannel Release
         Write-IwReleaseReport $verified
     }
-    'Verify' { Invoke-IwVerify | Format-List }
+    'Verify' { Invoke-IwVerify -VerifyChannel $Channel | Format-List }
+    'UseDev' { Set-IwChannel -TargetChannel Development }
+    'UseStable' { Set-IwChannel -TargetChannel Release }
     'Housekeeping' { Invoke-IwHousekeeping | Format-Table -AutoSize }
     'SessionStart' { Start-IwSession }
     'AnalyzeLog' { Invoke-IwLogAnalysis }

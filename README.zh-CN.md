@@ -112,14 +112,18 @@ v118 删除旧 `SpeedCycle=X`、`ManualAttack=Z` 配置及其轮询、状态和�
 .\tools\ironwind.ps1 Check
 .\tools\ironwind.ps1 DevFinish
 .\tools\ironwind.ps1 Finish
+.\tools\ironwind.ps1 UseStable
+.\tools\ironwind.ps1 UseDev
 .\tools\ironwind.ps1 SessionStart -Label vNN-test
 .\tools\ironwind.ps1 AnalyzeLog -OpenReport
 ```
 
 - `tools/ironwind.ps1` 是统一入口；命令说明见 `tools/README.zh-CN.md`。
 - `build-local.ps1` 使用本机 Visual C++ 2010 x64 工具链生成 DLL、匹配 PDB 和 `BUILD-STAMP.json`。
-- `DevFinish` 用于日常代码迭代：同样检查、构建、安装和验证，但不新增版本 ZIP 与永久符号副本；`Finish` 用于正式发布和归档。
-- `deploy-local.ps1` 校验构建指纹，从 `runtime/` 重建打包暂存，备份不同的旧 DLL、生成清单并核对三处 DLL 哈希。
+- `DevFinish` 把本地开发版安装为独立的 `IronwindCombatDev.mod`，自动切到开发通道并显示 `[DEV] 铁风执刃`；Steam 正式版 `IronwindCombat.mod` 保持只读。
+- `Finish` 只生成正式发布包和归档，不安装、不覆盖 Workshop 订阅版，也不改变当前启用通道。
+- `UseStable`／`UseDev` 在两个身份之间互斥切换，保留其他 Mod 的加载顺序并备份 `mods.cfg`。
+- `deploy-local.ps1` 校验构建指纹，按 Development／Release 通道从 `runtime/` 重建不同暂存目录并生成通道清单。
 - `Analyze-IronwindLog.ps1` 自动切分实机会话、发现新事件、配对攻击链并以当前样本动态识别时长离群；报告不替代画面验证。
 - 游戏运行时部署脚本会拒绝替换 DLL。
 - 发布包位于 `package/IronwindCombat-actions-v<版本>.zip`。

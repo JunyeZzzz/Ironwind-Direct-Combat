@@ -5,16 +5,20 @@
 ## 日常命令
 
 ```powershell
-# 查看当前版本、游戏进程、构建是否过期及三处 DLL 哈希
+# 查看当前启用通道、游戏进程、构建新鲜度及开发/正式各处 DLL 哈希
 .\tools\ironwind.ps1 Status
 
 # 只做静态检查，不编译、不安装
 .\tools\ironwind.ps1 Check
 
-# 日常代码验证：检查、编译、安装、核对，不新增版本 ZIP 或永久符号副本
+# 日常代码验证：安装为独立开发 Mod、切到开发通道、核对
 .\tools\ironwind.ps1 DevFinish
 
-# 确认正式发布时：完整部署、归档和事实报告
+# 随时在本地开发版与 Steam Workshop 正式版之间切换；两者不会同时启用
+.\tools\ironwind.ps1 UseDev
+.\tools\ironwind.ps1 UseStable
+
+# 确认正式发布时：只生成正式包、归档和事实报告，不覆盖订阅目录
 .\tools\ironwind.ps1 Finish
 .\tools\ironwind.ps1 Finish -ReplaceArchive  # 已核实同版本重打包时显式替换归档
 
@@ -35,20 +39,28 @@
 
 ## `DevFinish` 与 `Finish`
 
-`DevFinish` 是日常迭代默认入口。它执行静态检查、构建、安装和一致性验证，仍会在安装 DLL 发生变化时保留一个回滚 DLL，但不制作版本 ZIP，也不把同一 PDB 再复制进永久符号目录。当前 `build/WASDCombatPlugin.pdb` 仍可用于本轮调试。
+`DevFinish` 是日常迭代默认入口。它执行静态检查、构建，把产物安装到 `Kenshi/mods/IronwindCombatDev/`，将 `mods.cfg` 原位置切换为 `IronwindCombatDev.mod`，再做一致性验证。开发设置页标题显示 `[DEV] 铁风执刃`。它仍会在安装 DLL 发生变化时保留回滚 DLL，但不制作版本 ZIP，也不把同一 PDB 再复制进永久符号目录。
 
 `Finish` 自动执行：
 
 1. 版本、源码、脚本语法、运行资源、中文 TSV 和 Mod 加载顺序检查。
 2. Visual C++ 2010 x64 Release 编译。
 3. 同时生成与 DLL 精确匹配的 PDB 和 `BUILD-STAMP.json`。
-4. 确认游戏没有运行，保留个人 INI，备份不同的旧 DLL。
-5. 重新生成干净暂存目录，安装并制作版本 ZIP。
-6. 核对构建、暂存和安装 DLL 哈希，生成事实报告。
+4. 重新生成 `package/IronwindCombat/` 正式暂存目录并制作版本 ZIP。
+5. 核对构建与正式包 DLL 哈希，生成事实报告。
+6. 保持 Steam Workshop `3824431439` 和当前 `mods.cfg` 不变；正式包需由维护者随后上传。
 
 它不会自动把版本号加一，也不会自动声称画面或完整回归已经验证。同版本 ZIP 中若已有不同 DLL，部署会在安装前停止；应正常增加 `VERSION`，不能用覆盖掩盖版本差异。`-ReplaceArchive` 只用于维护者明确核实后的特殊恢复操作。
 
-底层 `Deploy` 和 `Finish` 也接受 `-SkipArchive` 与 `-SkipSymbols`。这些参数只减少永久归档，不改变构建、暂存或安装 DLL；正式发布仍应保留默认归档。
+底层 `Deploy` 接受 `-Channel Development|Release`；默认是 Development。Release 通道强制要求 `-SkipInstall`，`Finish` 会自动带上，避免把未发布代码伪装成 Steam 正式版。`Deploy` 和 `Finish` 也接受 `-SkipArchive` 与 `-SkipSymbols`。
+
+## 双通道约束
+
+- 正式版唯一来源：Steam Workshop `3824431439`，启动器身份 `IronwindCombat.mod`。
+- 开发版唯一来源：本地 `mods/IronwindCombatDev/`，启动器身份 `IronwindCombatDev.mod`。
+- `UseDev`／`UseStable` 只改这两个身份，并先保存 `mods.cfg` 备份；其他 Mod 的顺序和内容原样保留。
+- 两个身份同时出现属于配置冲突，`Check`、部署和开发验证都会拒绝继续。
+- 两个通道可保留兼容 DLL 名 `WASDCombatPlugin.dll`，因为它们位于不同 Mod 目录；不得手工把两个 `.mod` 文件放进同一目录。
 
 ## 动态日志分析
 
@@ -67,7 +79,8 @@
 
 - `runtime/`：运行资源真源，包含 `.mod`、RE_Kenshi 清单、中文设置和 shader。
 - `build/`：当前构建输出、PDB 与构建指纹。
-- `package/IronwindCombat/`：部署时重新生成的暂存目录。
+- `package/IronwindCombatDev/`：日常开发暂存；只含 `IronwindCombatDev.mod`。
+- `package/IronwindCombat/`：正式发布暂存；只含 `IronwindCombat.mod`。
 - `package/symbols/`：按版本和 DLL 哈希保存的符号对。
 - `reports/log-analysis/`：动态日志 Markdown/JSON 报告。
 - `reports/releases/`：自动构建与部署事实报告。
@@ -80,6 +93,7 @@
 
 - 游戏运行时拒绝替换 DLL或制作稳定快照。
 - `-SkipBuild` 只有在源码、版本、DLL、PDB 与构建指纹全部匹配时才允许部署。
-- 安装目录的个人 INI 默认保留。
+- 开发安装目录的个人 INI 默认保留。
 - 原 `WASDCombatPlugin.mod` 与铁风同时启用时停止部署。
+- `IronwindCombatDev.mod` 与 `IronwindCombat.mod` 同时启用时停止部署。
 - 快照和发布事实不等于完整游戏回归。

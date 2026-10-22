@@ -28,9 +28,9 @@
 - `WASDCombatPlugin.ini` 中的节名和英文键名未变。
 - `Settings.zh-CN.tsv` 每个非注释行恰有两列，英文键无重复、中文值非空。
 - `RE_Kenshi.json` 只加载 `WASDCombatPlugin.dll`。
-- `IronwindCombat.mod` 仍为无 FCS 记录的启动器占位文件。
-- `data/mods.cfg` 启用了 `IronwindCombat.mod`，未启用 `WASDCombatPlugin.mod`。
-- `mods/` 中不存在第二个 `WASDCombatPlugin.dll` 或第二份覆盖 `character.hlsl`。
+- `runtime/IronwindCombat.mod` 仍为无 FCS 记录的启动器占位真源；开发包只含 `IronwindCombatDev.mod`，正式包只含 `IronwindCombat.mod`。
+- `data/mods.cfg` 只启用一个铁风通道，未启用 `WASDCombatPlugin.mod`；开发设置页标题带 `[DEV]`，正式包不带。
+- `mods/IronwindCombatDev/` 是唯一的本地开发安装；正式版由 Workshop `3824431439` 提供，不保留同身份本地副本。
 - 没有重新安装 `playerMove`、`showTradeWindow` 裸 RVA 钩子。
 - 新增跨帧状态已在 `clearAllState`、V 退出和读档路径中处理。
 - 新增缓存 Character 指针的使用点包含世界存活／更新列表验证。
@@ -38,16 +38,16 @@
 
 ## 3. 构建与部署检查
 
-1. 常规运行 `./tools/ironwind.ps1 Finish`；单项诊断才分别调用底层脚本。
+1. 日常实测运行 `./tools/ironwind.ps1 DevFinish`；准备上传的正式候选才运行 `Finish`。
 2. 编译必须无错误；警告需记录并判断是否新增。
 3. DLL、PDB 和 `BUILD-STAMP.json` 必须同次生成且哈希互相匹配。
-4. 构建、暂存和安装 DLL 的 SHA-256 必须一致。
+4. 开发通道的构建、开发暂存和开发安装 DLL SHA-256 必须一致；正式通道只要求构建与正式包一致。
 5. `BUILD-MANIFEST.json` 必须记录版本、源码、DLL、PDB、构建指纹、Git HEAD 和 dirty 状态。
 6. 同版本发布 ZIP 已含不同 DLL 时应在安装前拒绝覆盖。
-7. `backup/` 中应有被替换 DLL 的回滚副本（相同哈希时可不重复备份）。
+7. 开发安装被替换时，`backup/` 应有不同旧 DLL 的回滚副本（相同哈希时可不重复备份）。
 8. 实机前运行 `SessionStart`，退出后运行 `AnalyzeLog`；确认报告范围确实只覆盖本轮测试。
 9. 动态报告里的“未知事件”不是错误；风险、未闭合链和时长离群必须结合上下文与画面解释。
-7. 版本 ZIP 必须包含 DLL、INI、TSV、shader、RE_Kenshi.json、`.mod` 和文档。
+10. 版本 ZIP 必须包含 DLL、INI、TSV、shader、RE_Kenshi.json、`IronwindCombat.mod`、`CHANNEL.json` 和文档，且不得包含 `IronwindCombatDev.mod`。
 
 ## 4. 启动检查
 

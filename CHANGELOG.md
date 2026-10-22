@@ -4,6 +4,7 @@
 
 ## 未发版工程维护（不改运行时）
 
+- 建立互斥双通道：Steam Workshop `3824431439`／`IronwindCombat.mod` 作为只读正式版，本地 `IronwindCombatDev.mod` 作为开发版；开发设置页带 `[DEV]` 标识。新增 `UseDev`／`UseStable` 安全切换和 `CHANNEL.json`，`DevFinish` 只部署开发目录，`Finish` 只生成正式发布包，不再覆盖订阅版或改变当前通道；未修改 DLL、INI、Hook 或战斗逻辑。
 - 正式采用“铁风执刃 / Ironwind: Hands-On Combat”为项目名称，新增 `NOTICE.md` 区分当前项目归属、上游著作权和兼容旧名；GPL-3.0 与上游署名保持不变。
 - 将 `CODE_STRUCTURE.md`、`NOTES.md`、`PROGRESS.md` 收束为兼容入口，结构导航并入架构文档；`KNOWN_ISSUES.md` 只保留当前事项，停止在多份文档手抄同一状态与哈希。
 - 增加日常 `DevFinish`、只读 `Housekeeping` 和可跳过永久符号归档的部署选项，避免每次开发验证都产生完整发布归档；未修改 DLL、INI、Hook 或战斗逻辑。

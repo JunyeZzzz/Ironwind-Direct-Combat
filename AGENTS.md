@@ -25,7 +25,7 @@
 
 - C++ 真源：`WASDCombatPlugin.cpp`；默认配置：`WASDCombatPlugin.ini`。
 - 版本真源：`VERSION`，并同步源码中的 `IRONWIND_VERSION`。
-- 运行资源真源：`runtime/`；Workshop 原插件只读。
+- 运行资源真源：`runtime/`；Steam Workshop 正式版 `3824431439` 只读。本地开发版必须使用 `IronwindCombatDev.mod`，不得复用正式版身份。
 - 统一入口：`tools/ironwind.ps1`；构建：`build-local.ps1`；部署：`deploy-local.ps1`。
 - `build/`、`package/`、`backup/`、`reports/` 和安装目录都是输出或证据，不是源码真源。
 - 发布事实由 `BUILD-STAMP.json`、`BUILD-MANIFEST.json` 和 `reports/releases/` 生成，不再手抄进度哈希。
@@ -45,7 +45,7 @@
 ## 流程
 
 1. 开始前运行 `./tools/ironwind.ps1 Status`，改动后运行 `Check`。
-2. 仅文档或工具说明改动不重编 DLL。代码改动日常验证用 `DevFinish`；正式发布用 `Finish`。
+2. 仅文档或工具说明改动不重编 DLL。代码改动日常验证用 `DevFinish`；正式发布用 `Finish`。`DevFinish` 安装并启用开发通道；`Finish` 只产出正式包，绝不覆盖 Workshop 订阅目录。
 3. 实机前运行 `SessionStart -Label <语义名>`；退出后用 `AnalyzeLog`。
 4. 玩家确认值得长期保留的版本才运行 `Snapshot`。
 5. `Housekeeping` 只报告归档占用和可清理候选，不自动删除。

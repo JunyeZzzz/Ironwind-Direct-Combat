@@ -1,5 +1,7 @@
 ﻿[CmdletBinding()]
 param(
+    [ValidateSet('Development', 'Release')]
+    [string]$Channel = 'Development',
     [switch]$SkipBuild,
     [switch]$SkipInstall,
     [switch]$SkipArchive,
@@ -16,15 +18,19 @@ $ErrorActionPreference = 'Stop'
 $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $moddevDir = Split-Path -Parent $projectDir
 $gameDir = Split-Path -Parent $moddevDir
+$isDevelopment = $Channel -eq 'Development'
+$stageFolderName = if ($isDevelopment) { 'IronwindCombatDev' } else { 'IronwindCombat' }
+$installFolderName = $stageFolderName
+$modFileName = if ($isDevelopment) { 'IronwindCombatDev.mod' } else { 'IronwindCombat.mod' }
 $stageDir = if ([string]::IsNullOrWhiteSpace($StageDirectory)) {
-    Join-Path $projectDir 'package\IronwindCombat'
+    Join-Path $projectDir "package\$stageFolderName"
 } elseif ([System.IO.Path]::IsPathRooted($StageDirectory)) {
     [System.IO.Path]::GetFullPath($StageDirectory)
 } else {
     [System.IO.Path]::GetFullPath((Join-Path $projectDir $StageDirectory))
 }
 $runtimeDir = Join-Path $projectDir 'runtime'
-$installDir = Join-Path $gameDir 'mods\IronwindCombat'
+$installDir = Join-Path $gameDir "mods\$installFolderName"
 $backupDir = Join-Path $projectDir 'backup'
 $buildDir = if ([string]::IsNullOrWhiteSpace($BuildDirectory)) {
     Join-Path $projectDir 'build'
@@ -84,6 +90,9 @@ $baseVersion = $baseMatch.Matches[0].Groups[1].Value
 if (-not $SkipInstall -and (Get-Process -Name 'kenshi_x64' -ErrorAction SilentlyContinue)) {
     throw 'Kenshi is running. Exit the game before replacing the loaded DLL.'
 }
+if (-not $isDevelopment -and -not $SkipInstall) {
+    throw 'Release is package-only. Use -SkipInstall; the stable runtime must come from Steam Workshop.'
+}
 
 if (-not $SkipBuild) {
     & (Join-Path $projectDir 'build-local.ps1') -OutputDirectory $buildDir
@@ -102,7 +111,7 @@ if (-not $AllowStaleBuild) {
 }
 
 $actualStage = [System.IO.Path]::GetFullPath($stageDir)
-$defaultStage = [System.IO.Path]::GetFullPath((Join-Path $projectDir 'package\IronwindCombat'))
+$defaultStage = [System.IO.Path]::GetFullPath((Join-Path $projectDir "package\$stageFolderName"))
 if ([string]::IsNullOrWhiteSpace($StageDirectory)) {
     if ($actualStage -ne $defaultStage) { throw "Refusing to reset unexpected default stage path: $actualStage" }
 } else {
@@ -142,7 +151,6 @@ if (Test-Path -LiteralPath $buildStamp -PathType Leaf) {
 }
 
 $runtimeFiles = @(
-    'IronwindCombat.mod',
     'RE_Kenshi.json',
     'Settings.zh-CN.tsv',
     'materials\deferred\character.hlsl'
@@ -156,7 +164,27 @@ foreach ($name in $runtimeFiles) {
     Copy-Item -LiteralPath $runtimePath -Destination $targetPath -Force
 }
 
+# Both channels originate from the same deliberately empty FCS placeholder, but
+# the filename is the identity Kenshi writes to mods.cfg. Never ship both names
+# in one directory: that makes the launcher ambiguity we are trying to remove.
+$runtimeMod = Join-Path $runtimeDir 'IronwindCombat.mod'
+Assert-File $runtimeMod
+Copy-Item -LiteralPath $runtimeMod -Destination (Join-Path $stageDir $modFileName) -Force
+
 $tsvPath = Join-Path $stageDir 'Settings.zh-CN.tsv'
+if ($isDevelopment) {
+    $tsvLines = [System.IO.File]::ReadAllLines($tsvPath)
+    $devTitleReplaced = $false
+    for ($i = 0; $i -lt $tsvLines.Count; $i++) {
+        if ($tsvLines[$i] -eq "Direct Control`t铁风执刃") {
+            $tsvLines[$i] = "Direct Control`t[DEV] 铁风执刃"
+            $devTitleReplaced = $true
+            break
+        }
+    }
+    if (-not $devTitleReplaced) { throw 'Unable to apply the [DEV] settings-page marker.' }
+    [System.IO.File]::WriteAllLines($tsvPath, $tsvLines, (New-Object System.Text.UTF8Encoding($false)))
+}
 $seenTsvKeys = @{}
 $tsvLineNumber = 0
 foreach ($line in Get-Content -LiteralPath $tsvPath -Encoding UTF8) {
@@ -175,8 +203,13 @@ if (Test-Path -LiteralPath $modsConfig -PathType Leaf) {
     if ($enabledMods -contains 'WASDCombatPlugin.mod') {
         throw 'WASDCombatPlugin.mod is enabled alongside IronwindCombat; disable the original plugin first.'
     }
-    if ($enabledMods -notcontains 'IronwindCombat.mod') {
-        Write-Warning 'IronwindCombat.mod is not currently listed in data\mods.cfg.'
+    $stableEnabled = $enabledMods -contains 'IronwindCombat.mod'
+    $devEnabled = $enabledMods -contains 'IronwindCombatDev.mod'
+    if ($stableEnabled -and $devEnabled) {
+        throw 'Both IronwindCombat.mod and IronwindCombatDev.mod are enabled. Select exactly one channel.'
+    }
+    if (-not $SkipInstall -and $enabledMods -notcontains $modFileName) {
+        Write-Warning "$modFileName is not currently listed in data\mods.cfg. Use tools\ironwind.ps1 UseDev/UseStable."
     }
 }
 
@@ -190,6 +223,16 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 }
 
 $installedConfig = Join-Path $installDir 'WASDCombatPlugin.ini'
+$installedConfigExisted = Test-Path -LiteralPath $installedConfig -PathType Leaf
+$channelManifest = [ordered]@{
+    schemaVersion = 1
+    channel = $Channel
+    modFile = $modFileName
+    workshopId = if ($isDevelopment) { $null } else { '3824431439' }
+    ironwindVersion = $version
+    generatedAt = (Get-Date).ToString('o')
+}
+$channelManifest | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $stageDir 'CHANNEL.json') -Encoding UTF8
 $manifest = [ordered]@{
     schemaVersion = 1
     project = [ordered]@{
@@ -199,6 +242,9 @@ $manifest = [ordered]@{
     }
     ironwindVersion = $version
     directControlBaseVersion = $baseVersion
+    channel = $Channel
+    modFile = $modFileName
+    workshopId = if ($isDevelopment) { $null } else { '3824431439' }
     target = [ordered]@{
         kenshi = '1.0.65'
         reKenshi = '0.3.5'
@@ -238,7 +284,8 @@ if (-not $SkipSymbols -and (Test-Path -LiteralPath $buildPdb -PathType Leaf)) {
     Copy-Item -LiteralPath $buildStamp -Destination (Join-Path $symbolDir 'BUILD-STAMP.json') -Force
 }
 
-$archivePath = Join-Path (Split-Path -Parent $stageDir) "IronwindCombat-actions-v$version.zip"
+$archiveName = if ($isDevelopment) { "IronwindCombatDev-v$version.zip" } else { "IronwindCombat-actions-v$version.zip" }
+$archivePath = Join-Path (Split-Path -Parent $stageDir) $archiveName
 if (-not $SkipArchive -and (Test-Path -LiteralPath $archivePath -PathType Leaf) -and -not $ReplaceArchive) {
     $archiveDllHash = Get-ArchiveDllHash $archivePath
     if (-not $archiveDllHash) {
@@ -255,7 +302,7 @@ if (-not $SkipInstall) {
     if ((Test-Path -LiteralPath $installDll -PathType Leaf) -and ((Get-Sha256 $installDll) -ne (Get-Sha256 $stageDll))) {
         New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
         $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $backupPath = Join-Path $backupDir "IronwindCombat-pre-deploy-v$version-$timestamp.dll"
+        $backupPath = Join-Path $backupDir "$stageFolderName-pre-deploy-v$version-$timestamp.dll"
         Copy-Item -LiteralPath $installDll -Destination $backupPath -Force
     }
 
@@ -279,7 +326,7 @@ if (-not $SkipInstall) {
     if ($stageHash -ne $installHash) { throw 'Package and installed DLL hashes differ.' }
 }
 
-Write-Output "Ironwind: Hands-On Combat v$version deployment complete."
+Write-Output "Ironwind: Hands-On Combat v$version $Channel pipeline complete."
 Write-Output "DLL SHA256: $stageHash"
 if (Test-Path -LiteralPath $buildPdb -PathType Leaf) { Write-Output "PDB SHA256: $(Get-Sha256 $buildPdb)" }
 Write-Output "Package: $stageDir"
@@ -287,6 +334,6 @@ if (-not $SkipArchive) { Write-Output "Archive: $archivePath" }
 if ($SkipSymbols) { Write-Output 'Permanent symbol copy: skipped (build PDB remains available).' }
 if (-not $SkipInstall) { Write-Output "Installed: $installDir" }
 if ($backupPath) { Write-Output "Previous DLL backup: $backupPath" }
-if (-not $SkipInstall -and (Test-Path -LiteralPath $installedConfig) -and -not $ReplaceConfig) {
+if (-not $SkipInstall -and $installedConfigExisted -and -not $ReplaceConfig) {
     Write-Output 'Installed WASDCombatPlugin.ini was preserved.'
 }
